@@ -19,6 +19,13 @@ class ICEAResult:
     contributions: dict[str, list[float]]
 
 
+@dataclass
+class ICEAExplainResult:
+    predictions: list[float]
+    base_value: float
+    shap_values: pd.DataFrame
+
+
 class ICEAEngine:
     """ICEA computation engine.
 
@@ -58,6 +65,29 @@ class ICEAEngine:
                 out[col] = 0
         return out[features]
 
+    def explain(
+        self,
+        df: pd.DataFrame,
+        *,
+        features: list[str],
+    ) -> ICEAExplainResult:
+        x = self._ensure_columns(df, features)
+        preds = self.model.predict(x)
+
+        # XGBoost + SHAP can show tiny floating-point additivity mismatches on some builds.
+        shap_values = self.explainer.shap_values(x, check_additivity=False)
+        base = self.explainer.expected_value
+        if isinstance(base, (list, tuple, np.ndarray)):
+            base_value = float(base[0])
+        else:
+            base_value = float(base)
+
+        return ICEAExplainResult(
+            predictions=[float(p) for p in preds.tolist()],
+            base_value=base_value,
+            shap_values=pd.DataFrame(shap_values, columns=features),
+        )
+
     def compute(
         self,
         df: pd.DataFrame,
@@ -66,17 +96,8 @@ class ICEAEngine:
         nurse_cols: list[str],
         group_map: dict[str, list[str]] | None = None,
     ) -> ICEAResult:
-        x = self._ensure_columns(df, features)
-        preds = self.model.predict(x)
-
-        shap_values = self.explainer.shap_values(x)
-        # SHAP expected value (baseline) for interpretability.
-        base = self.explainer.expected_value
-        if isinstance(base, (list, tuple, np.ndarray)):
-            base_value = float(base[0])
-        else:
-            base_value = float(base)
-        shap_df = pd.DataFrame(shap_values, columns=features)
+        explained = self.explain(df, features=features)
+        shap_df = explained.shap_values
 
         # Nursing contribution (ICEA)
         missing_nurse = [c for c in nurse_cols if c not in shap_df.columns]
@@ -99,8 +120,8 @@ class ICEAEngine:
             contributions["nursing"] = icea
 
         return ICEAResult(
-            predictions=[float(p) for p in preds.tolist()],
-            base_value=base_value,
+            predictions=explained.predictions,
+            base_value=explained.base_value,
             icea=icea,
             contributions=contributions,
         )
@@ -121,4 +142,4 @@ def compute_basic_summary(values: list[float]) -> dict[str, Any]:
 
 
 def stable_json_dumps(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
