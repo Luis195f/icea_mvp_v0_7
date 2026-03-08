@@ -8,8 +8,10 @@ from django.dispatch import receiver
 from config.request_context import get_actor
 
 
+
 def _model_label(instance) -> str:
     return f"{instance.__class__.__module__.split('.')[0]}.{instance.__class__.__name__}"
+
 
 
 def _pk_str(instance) -> str:
@@ -17,6 +19,7 @@ def _pk_str(instance) -> str:
         return str(getattr(instance, "pk"))
     except Exception:
         return ""
+
 
 
 def _field_names(instance) -> Iterable[str]:
@@ -28,14 +31,26 @@ def _field_names(instance) -> Iterable[str]:
         yield name
 
 
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool, type(None), list, dict)):
+        return value
+    pk = getattr(value, "pk", None)
+    if pk is not None:
+        return str(pk)
+    return str(value)
+
+
+
 def _snapshot(instance) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for name in _field_names(instance):
         try:
-            out[name] = getattr(instance, name)
+            out[name] = _jsonable(getattr(instance, name))
         except Exception:
             continue
     return out
+
 
 
 def _diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
@@ -45,9 +60,7 @@ def _diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
         a = old.get(k)
         b = new.get(k)
         if a != b:
-            # Ensure JSON serializable (best-effort)
-            changes[k] = {"from": a if isinstance(a, (str, int, float, bool, type(None), list, dict)) else str(a),
-                          "to": b if isinstance(b, (str, int, float, bool, type(None), list, dict)) else str(b)}
+            changes[k] = {"from": _jsonable(a), "to": _jsonable(b)}
     return changes
 
 
@@ -58,6 +71,7 @@ TRACKED = {
     ("icea_core", "ModelArtifact"),
     ("icea_pipeline", "CausalSpec"),
 }
+
 
 
 def _is_tracked(instance) -> bool:

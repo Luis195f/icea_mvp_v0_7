@@ -11,6 +11,16 @@ Core principles:
 - **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
 - **Bedside-grade uncertainty**: optional conformal prediction intervals for individual risk.
 
+## ICEA vs ICEA+
+
+- **ICEA** remains the legacy predictive nursing attribution based mainly on SHAP/group nursing.
+- **ICEA+ v1** is the new official mathematical core exposed in this repo through dedicated endpoints and versioned governance.
+- **ICEA+** integrates risk-adjusted benefit, relative nursing attribution, causal effect when defensible, process quality, and explicit uncertainty penalties.
+
+See:
+- `docs/ICEA_PLUS_MATH.md`
+- `docs/ICEA_PLUS_API.md`
+
 ---
 
 ## Quickstart (Docker)
@@ -73,6 +83,30 @@ Services:
 
 ```json
 { "name": "icea-xgb", "version": "v0.7.4", "target": "delta_ri" }
+```
+
+### 4.1) ICEA+ v1 score, explain, aggregate
+
+- `POST /api/v1/icea-plus/score/`
+- `GET /api/v1/icea-plus/explain/`
+- `GET /api/v1/icea-plus/aggregate/`
+- `POST /api/v1/icea-plus/calibrate/` (admin-only)
+
+Example score request:
+
+```json
+{
+  "model_id": "<uuid>",
+  "grain": "episode",
+  "from_db": true,
+  "causal_spec": {
+    "treatment": "nurse_hppd",
+    "outcome": "delta_ri",
+    "confounders": ["ri_initial", "proc_count"],
+    "effect_modifiers": ["ri_initial"],
+    "n_estimators": 200
+  }
+}
 ```
 
 ### 5) Run causal analysis (trial-emulation)
@@ -238,4 +272,7 @@ Este paquete incluye un frontend **Next.js** (en español) en `frontend/icea-nur
 
 - Dev: `docker compose -f docker-compose.dev.yml up --build` (abre `http://localhost:3000`)
 - Base compose: `docker compose --profile ui up --build`
+
+
+
 

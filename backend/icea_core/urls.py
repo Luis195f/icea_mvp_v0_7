@@ -2,6 +2,12 @@ from django.urls import path
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from .icea_plus_views import (
+    ICEAPlusAggregateView,
+    ICEAPlusCalibrateView,
+    ICEAPlusExplainView,
+    ICEAPlusScoreView,
+)
 from .views import HealthView, ICEAComputeView, ModelListView, ModelTrainView
 
 urlpatterns = [
@@ -12,6 +18,10 @@ urlpatterns = [
     path("models/", ModelListView.as_view(), name="models-list"),
     path("models/train/", ModelTrainView.as_view(), name="models-train"),
     path("icea/compute/", ICEAComputeView.as_view(), name="icea-compute"),
+    path("icea-plus/score/", ICEAPlusScoreView.as_view(), name="icea-plus-score"),
+    path("icea-plus/explain/", ICEAPlusExplainView.as_view(), name="icea-plus-explain"),
+    path("icea-plus/aggregate/", ICEAPlusAggregateView.as_view(), name="icea-plus-aggregate"),
+    path("icea-plus/calibrate/", ICEAPlusCalibrateView.as_view(), name="icea-plus-calibrate"),
     path("schema/", SpectacularAPIView.as_view(), name="schema"),
     path("docs/", SpectacularSwaggerView.as_view(url_name="schema"), name="docs"),
 ]
