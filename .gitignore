@@ -1,0 +1,171 @@
+# =========================================================
+# ICEA+ / HANDOVER integration-ready .gitignore
+# =========================================================
+
+# ---------------------------------------------------------
+# Python bytecode / caches
+# ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# ---------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------
+.venv/
+venv/
+ENV/
+env/
+
+# ---------------------------------------------------------
+# Environment / secrets
+# Keep only template/example env files
+# ---------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.dev.example
+!.env.prod.example
+
+# Secrets / certificates / keys
+*.pem
+*.key
+*.pfx
+*.crt
+*.cer
+*.csr
+secrets/
+
+# ---------------------------------------------------------
+# Django / backend runtime
+# ---------------------------------------------------------
+*.log
+logs/
+local_settings.py
+db.sqlite3
+*.sqlite3
+*.db
+media/
+staticfiles/
+uploads/
+tmp/
+temp/
+
+# Django cache / runtime
+celerybeat-schedule
+*.pid
+*.sock
+
+# ---------------------------------------------------------
+# Test / coverage / quality tooling
+# ---------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+
+# ---------------------------------------------------------
+# Build / packaging
+# ---------------------------------------------------------
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ---------------------------------------------------------
+# Node / frontend / dashboard
+# ---------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Generic frontend build artifacts
+.next/
+.nuxt/
+out/
+.vite/
+.vercel/
+.parcel-cache/
+.turbo/
+
+# Frontend coverage / caches
+coverage/
+*.tsbuildinfo
+
+# ---------------------------------------------------------
+# Docker / containers
+# ---------------------------------------------------------
+docker-data/
+*.tar
+*.tar.gz
+
+# ---------------------------------------------------------
+# IDE / editor
+# ---------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+
+# ---------------------------------------------------------
+# OS / filesystem noise
+# ---------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------
+# Data science / notebooks / generated analytics
+# Ignore generated local artifacts, not source datasets intentionally curated
+# ---------------------------------------------------------
+.ipynb_checkpoints/
+mlruns/
+wandb/
+artifacts/
+reports/generated/
+exports/
+*.parquet
+*.feather
+*.h5
+*.joblib
+*.pkl
+*.pickle
+
+# ---------------------------------------------------------
+# Local generated reports / temporary exports
+# ---------------------------------------------------------
+*.tmp
+*.bak
+*.swp
+*.swo
+*.orig
+*.rej
+
+# ---------------------------------------------------------
+# Git / patch leftovers
+# ---------------------------------------------------------
+*.patch
+*.diff
+
+# ---------------------------------------------------------
+# Keep important source-controlled examples
+# ---------------------------------------------------------
+!README.md
+!docker-compose.dev
+!docker-compose.prod
+!docker-compose
+
+docs/*.docx
+docs/*.docx

@@ -1,0 +1,10 @@
+{
+  "tenant": "default",
+  "logoText": "ICEA+",
+  "brandName": "Command Center",
+  "tokens": {
+    "icea-brand": "210 90% 45%",
+    "icea-brand2": "200 85% 40%",
+    "icea-radius": "14px"
+  }
+}

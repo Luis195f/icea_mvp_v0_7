@@ -1,0 +1,241 @@
+# ICEA Platform — Pilot MVP (v0.7.4)
+
+This version is a **pilot-grade + trial-emulation kit** with an **enterprise-ready, feature-flagged** architecture:
+
+**FHIR ingestion (encounter‑centered) → normalization (deterministic nursing labels) → dataset builder (roster‑aware) → scheduled training → causal runs (bootstrap + sensitivity + CONSORT emulation + cohort-flow stages) → policy learning + fairness audit → dashboard → optional FHIR writeback (RiskAssessment)**
+
+Core principles:
+- **Traceability first**: raw FHIR JSON is stored for audit/replay.
+- **Semantic interoperability**: resources are normalized into canonical tables for analytics.
+- **Model governance**: models are versioned artifacts (features + target + metrics).
+- **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
+- **Bedside-grade uncertainty**: optional conformal prediction intervals for individual risk.
+
+---
+
+## Quickstart (Docker)
+
+```bash
+cd icea_mvp_v0_7
+docker compose up --build
+```
+
+Services:
+- Backend API: `http://localhost:8000/api/v1/`
+- Swagger docs: `http://localhost:8000/api/v1/docs/`
+- Dashboard (Streamlit): `http://localhost:8501/`
+
+---
+
+## Endpoints (backwards compatible)
+
+### 1) Ingest FHIR resources (raw)
+
+`POST /api/v1/pipeline/ingest/`
+
+```json
+{
+  "episode_id": 1,
+  "patient_id": "FHIR-PATIENT-ID",
+  "encounter_id": "FHIR-ENCOUNTER-ID",
+  "mode": "encounter",
+  "resources": ["Observation", "Condition", "Procedure"]
+}
+```
+
+### 2) Normalize FHIR → canonical tables
+
+`POST /api/v1/pipeline/normalize/`
+
+```json
+{ "episode_id": 1, "truncate": true }
+```
+
+### 3) Build analytic dataset (episode-grain)
+
+`POST /api/v1/pipeline/build-dataset/`
+
+```json
+{ "truncate": false }
+```
+
+### 3b) Build window-grain dataset (episode-windows)
+
+`POST /api/v1/pipeline/build-windows/`
+
+```json
+{ "truncate": false, "window_hours": 12, "align": "shift" }
+```
+
+### 4) Train model from DB dataset
+
+`POST /api/v1/pipeline/train/`
+
+```json
+{ "name": "icea-xgb", "version": "v0.7.4", "target": "delta_ri" }
+```
+
+### 5) Run causal analysis (trial-emulation)
+
+`POST /api/v1/causal/run/`
+
+```json
+{
+  "spec": {
+    "grain": "window",
+    "treatment": "nurse_hppd",
+    "outcome": "delta_ri",
+    "confounders": ["ri_initial", "proc_count"],
+    "effect_modifiers": ["ri_initial"],
+    "dag_edges": [["ri_initial","nurse_hppd"],["ri_initial","delta_ri"],["nurse_hppd","delta_ri"]],
+    "bootstrap": {"n": 200, "alpha": 0.05},
+    "sensitivity": {"e_value": true}
+  }
+}
+```
+
+### 5.1) Retrieve Trial Protocol Report (CONSORT + Quality Ops Playbook)
+
+`GET /api/v1/causal/report/?run_id=<uuid>`
+
+The report JSON includes:
+- CONSORT-emulated cohort flow (staged eligibility)
+- semantic missingness (LOINC)
+- **quality_ops_playbook** (recommended actions + owner roles)
+- E-values + refuters (when enabled)
+- policy learning + fairness audit
+- human-in-the-loop decisions (linked at read-time)
+
+### 5.2) Causal discovery (optional, best-effort PC)
+
+`POST /api/v1/causal/discover/`
+
+```json
+{
+  "grain": "window",
+  "variables": ["nurse_hppd","delta_ri","ri_initial","proc_count"],
+  "alpha": 0.05,
+  "max_cond_set": 2
+}
+```
+
+### 5.3) Counterfactual Digital Twin simulation (optional)
+
+`POST /api/v1/causal/simulate/`
+
+```json
+{
+  "run_id": "<uuid>",
+  "model_id": "<optional-xgb-uuid>",
+  "scenarios": [
+    { "name": "add_staffing", "delta": { "nurse_hppd": 0.5 } },
+    { "name": "increase_skillmix", "delta": { "nurse_skillmix": 0.1 } }
+  ]
+}
+```
+
+### 5.4) Federated Causal Learning (scaffold; EHDS/GDPR-friendly)
+
+- Start round: `POST /api/v1/federated/round/start/`
+- Submit update: `POST /api/v1/federated/round/<round_id>/submit/`
+- Aggregate: `POST /api/v1/federated/round/<round_id>/aggregate/`
+
+Set `ICEA_FEDERATED_SECRET` to require signed updates (header: `X-ICEA-FED-SIG`).
+
+### 6) FHIR validation summary (per episode)
+
+`GET /api/v1/fhir/quality/episode/?episode_id=1`
+
+### 7) Conformal prediction (individual-risk interval)
+
+`POST /api/v1/predict/conformal/`
+
+```json
+{ "episode_id": 1, "model_id": "<uuid>", "alpha": 0.05 }
+```
+
+---
+
+## Enterprise mode (feature flags)
+
+### Install optional dependencies
+
+Option A (recommended):
+
+```bash
+pip install -r requirements-optional.txt
+```
+
+Option B (Docker runtime): set `ICEA_INSTALL_OPTIONAL_DEPS=true`.
+
+### Strict FHIR validation (optional)
+
+- `FHIR_STRICT_VALIDATION=true`
+- Optional profile enforcement: `FHIR_REQUIRED_PROFILES=<comma-separated URLs>`
+
+### DoWhy refuters (optional)
+
+Add to causal spec:
+
+```json
+{
+  "spec": {
+    "treatment": "nurse_hppd",
+    "outcome": "delta_ri",
+    "confounders": ["ri_initial"],
+    "dag_edges": [["ri_initial","nurse_hppd"],["ri_initial","delta_ri"],["nurse_hppd","delta_ri"]],
+    "refuters": ["random_common_cause", "placebo_treatment_refuter"],
+    "refuters_strict": false
+  }
+}
+```
+
+### Institutional fairness audit (Fairlearn) (optional)
+
+If `fairlearn` is installed (optional deps), ICEA+ can compute standardized metrics
+in addition to the lightweight Disparate Impact report.
+
+- Global flag: `FAIRNESS_USE_FAIRLEARN=true`
+- Or per-run:
+
+```json
+{
+  "spec": {
+    "policy_learning": {"max_depth": 3},
+    "fairness": {"use_fairlearn": true, "label_col": "delta_ri"}
+  }
+}
+```
+
+### Row-level entity history (django-simple-history) (optional)
+
+For admin/config lineage (Hospital/Unit/ModelArtifact/CausalSpec):
+
+- Install optional deps.
+- Set `ICEA_ENABLE_SIMPLE_HISTORY=true`.
+- Run `python manage.py migrate`.
+
+The platform also maintains a DB-side `EntityChangeLog` as a safe fallback
+when optional history tables are not enabled.
+
+### Rothman component forensic missingness (optional)
+
+If the Rothman Index observation (LOINC 85556-9) is missing at time-zero or follow-up,
+ICEA+ reports which *component* measurements are absent (LOINC-coded proxy list).
+
+- Override component codes: `ROTHMAN_COMPONENT_LOINC_CODES=8867-4,8480-6,...`
+
+### Realtime/ASGI (optional)
+
+- `ICEA_RUN_ASGI=true` (uses daphne/uvicorn if installed)
+- `ICEA_ENABLE_CHANNELS=true` (enables Channels routing if installed)
+
+---
+
+## Nursing Command Center (Frontend comercial)
+
+Este paquete incluye un frontend **Next.js** (en español) en `frontend/icea-nursing-command-center/`.
+
+- Dev: `docker compose -f docker-compose.dev.yml up --build` (abre `http://localhost:3000`)
+- Base compose: `docker compose --profile ui up --build`
+

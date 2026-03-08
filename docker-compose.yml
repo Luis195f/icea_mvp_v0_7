@@ -1,0 +1,64 @@
+version: "3.9"
+
+# SAFE default compose.
+# - Reads configuration from .env (copy from .env.example)
+# - No insecure hardcoded defaults
+# For development convenience, use docker-compose.dev.yml
+# For production/ENS Alto, use docker-compose.prod.yml
+
+services:
+  web:
+    build: .
+    container_name: icea_web
+    env_file:
+      - ./.env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+    volumes:
+      # Keep bind-mount only in this default compose for local iteration.
+      - ./backend:/app/backend
+
+  db:
+    image: postgres:15
+    container_name: icea_db
+    env_file:
+      - ./.env
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-icea_db}"
+      POSTGRES_USER: "${POSTGRES_USER:-icea_user}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-icea_pass}"
+    ports:
+      - "5432:5432"
+    volumes:
+      - icea_pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: icea_redis
+    ports:
+      - "6379:6379"
+
+  ncc:
+    build:
+      context: ./frontend/icea-nursing-command-center
+      dockerfile: Dockerfile
+    container_name: icea_ncc
+    env_file:
+      - ./frontend/icea-nursing-command-center/.env.example
+    environment:
+      ICEA_BACKEND_BASE_URL: "http://web:8000"
+      ICEA_TENANT: "${ICEA_TENANT:-default}"
+      ICEA_API_KEY: "${ICEA_API_KEY:-}"
+      ICEA_AUDIT_SECRET: "${AUDIT_LOG_SECRET:-}"
+    ports:
+      - "3000:3000"
+    depends_on:
+      - web
+    profiles: ["ui"]
+
+
+volumes:
+  icea_pgdata:

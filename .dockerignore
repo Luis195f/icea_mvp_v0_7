@@ -1,0 +1,43 @@
+# Prevent shipping dev artifacts / secrets into images
+
+# VCS
+.git/
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtualenvs
+.venv/
+venv/
+
+# Env files (keep examples)
+.env
+.env.*
+!.env.example
+!.env.prod.example
+!.env.dev.example
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor
+.vscode/
+.idea/
+
+# Secrets
+*.pem
+*.key
+*.pfx
+secrets/
+
+# Large local artifacts
+*.zip
+*.tar
+*.tar.gz
+
+# Node / frontend caches (if present)
+node_modules/

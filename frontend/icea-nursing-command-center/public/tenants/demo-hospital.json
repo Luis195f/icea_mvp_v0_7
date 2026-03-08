@@ -1,0 +1,10 @@
+{
+  "tenant": "demo-hospital",
+  "logoText": "Hospital Demo",
+  "brandName": "Centro de Control",
+  "tokens": {
+    "icea-brand": "262 70% 48%",
+    "icea-brand2": "255 65% 42%",
+    "icea-radius": "18px"
+  }
+}

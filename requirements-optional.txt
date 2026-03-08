@@ -1,0 +1,23 @@
+# Optional extras for enterprise-grade deployments.
+# These are NOT required for the default MVP docker-compose.
+# Install with:
+#   pip install -r requirements-optional.txt
+
+# Rich FHIR schema models (pydantic-based)
+fhir.resources==7.1.0
+
+# Causal refutation / sensitivity tooling (optional)
+dowhy==0.11.1
+
+# ASGI / realtime (optional)
+channels==4.1.0
+daphne==4.1.2
+uvicorn==0.30.1
+
+# Optional audit/lineage helpers
+
+# Institutional fairness metrics (EU AI Act / AESIA): optional but recommended
+fairlearn==0.10.0
+
+# Row-level entity history (admin / configuration lineage)
+django-simple-history==3.6.0

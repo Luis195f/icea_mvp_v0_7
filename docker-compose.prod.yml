@@ -1,0 +1,154 @@
+version: "3.9"
+
+# ICEA+ Master Production Orchestrator (ENS Alto oriented)
+# - No bind mounts
+# - Secrets via .env.prod (env_file)
+# - Redis for anti-replay + throttling
+# - Frontend (Next.js BFF) talks to backend over internal Docker network
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    env_file:
+    - ./.env.prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-icea_db}
+      POSTGRES_USER: ${POSTGRES_USER:-icea_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env.prod}
+    volumes:
+    - icea_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U ${POSTGRES_USER:-icea_user} -d ${POSTGRES_DB:-icea_db}
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+    - redis-server
+    - --appendonly
+    - 'yes'
+    volumes:
+    - icea_redis:/data
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - PING
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot initializer to fix ownership on persistent volumes.
+  # Idempotent and critical for hospital pilots where volumes may have been created as root.
+  init-volumes:
+    image: alpine:3.20
+    restart: "no"
+    user: "0:0"
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /app/backend/models /opt/venv
+        chown -R 10001:10001 /app/backend/models /opt/venv
+        chmod -R u+rwX,g+rwX /app/backend/models /opt/venv || true
+        echo "[init-volumes] ownership fixed"
+    volumes:
+      - icea_models:/app/backend/models
+      - icea_venv:/opt/venv
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icea_backend:0.7.4
+    restart: unless-stopped
+    env_file:
+    - ./.env.prod
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      ICEA_SECURE_MODE: ${ICEA_SECURE_MODE:-true}
+      ICEA_ENS_ALTO_COMPLIANCE: ${ICEA_ENS_ALTO_COMPLIANCE:-true}
+      ICEA_ENABLE_REQUEST_LIMITS: ${ICEA_ENABLE_REQUEST_LIMITS:-true}
+      ICEA_FAIL_ON_CHUNKED: ${ICEA_FAIL_ON_CHUNKED:-true}
+      ICEA_ENABLE_THROTTLING: ${ICEA_ENABLE_THROTTLING:-true}
+      ICEA_AUDIT_SIGNING_REQUIRED: ${ICEA_AUDIT_SIGNING_REQUIRED:-true}
+      ICEA_ANTI_REPLAY_REQUIRED: ${ICEA_ANTI_REPLAY_REQUIRED:-true}
+      ICEA_TRUST_PROXY_HEADERS: ${ICEA_TRUST_PROXY_HEADERS:-true}
+      # Internal BFF calls run over HTTP; TLS termination is handled by perimeter reverse proxy
+      SECURE_SSL_REDIRECT: "false"
+      # Ensure internal Docker hostnames are allowed (avoids DisallowedHost on BFF calls)
+      ALLOWED_HOSTS: "${ALLOWED_HOSTS:-icea.your-hospital.tld},backend,localhost,127.0.0.1"
+      POSTGRES_HOST: postgres
+    depends_on:
+      init-volumes:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    user: 10001:10001
+    read_only: true
+    tmpfs:
+    - /tmp
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    volumes:
+    - icea_models:/app/backend/models
+    - icea_venv:/opt/venv
+    expose:
+    - '8000'
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      retries: 15
+  frontend:
+    build:
+      context: ./frontend/icea-nursing-command-center
+      dockerfile: Dockerfile
+    image: icea_frontend_ncc:0.7.4
+    restart: unless-stopped
+    env_file:
+    - ./.env.prod
+    environment:
+      NODE_ENV: production
+      ICEA_BACKEND_BASE_URL: http://backend:8000
+      ICEA_TENANT: ${ICEA_TENANT:-default}
+      ICEA_API_KEY: ${ICEA_API_KEY:-}
+      ICEA_AUDIT_SECRET: ${ICEA_AUDIT_SECRET:?set in .env.prod}
+      ICEA_COOKIE_SECURE: ${ICEA_COOKIE_SECURE:-true}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+    - 3000:3000
+    user: 10001:10001
+    read_only: true
+    tmpfs:
+    - /tmp
+    - /app/.next/cache
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http=require('http'); const req=http.get('http://localhost:3000/', (res)=>{ if(res.statusCode!==200){process.exit(1);} res.resume(); res.on('end', ()=>process.exit(0)); }); req.on('error', ()=>process.exit(1)); req.setTimeout(2000, ()=>{req.destroy(); process.exit(1);});
+      interval: 20s
+      timeout: 5s
+      retries: 10

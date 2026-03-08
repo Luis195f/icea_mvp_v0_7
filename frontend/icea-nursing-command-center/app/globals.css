@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Carbon styles */
+@import "@carbon/styles/css/styles.css";
+
+/* ===== ICEA White-label tokens (CSS Variables) =====
+   Prefer variables over hardcoded palette to enable multi-tenant theming.
+*/
+:root {
+  --icea-brand: 210 90% 45%;
+  --icea-brand2: 200 85% 40%;
+  --icea-danger: 0 80% 45%;
+  --icea-warning: 38 92% 45%;
+  --icea-ok: 145 63% 35%;
+  --icea-surface: 210 20% 98%;
+  --icea-text: 220 20% 12%;
+  --icea-radius: 14px;
+}
+
+/* Example tenant override (demo-hospital) */
+html[data-tenant="demo-hospital"] {
+  --icea-brand: 262 70% 48%;
+  --icea-brand2: 255 65% 42%;
+  --icea-radius: 18px;
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  color: hsl(var(--icea-text));
+  background: hsl(var(--icea-surface));
+}
+
+/* Utility: reduce motion where user requests it */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    scroll-behavior: auto !important;
+    transition: none !important;
+    animation: none !important;
+  }
+}

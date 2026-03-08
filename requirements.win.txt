@@ -1,0 +1,39 @@
+## Security-hardened baseline (institutional)
+## Django 5.2 is LTS; 5.2.11 is a Feb 2026 security release.
+Django==5.2.11
+
+# API
+djangorestframework==3.16.1
+django-cors-headers==4.9.0
+drf-spectacular==0.29.0
+
+# Auth (JWT / OIDC-compatible)
+djangorestframework-simplejwt==5.5.1
+cryptography==46.0.5
+
+# DB helpers
+psycopg2-binary==2.9.11
+dj-database-url==2.2.0
+django-redis==5.4.0
+redis==5.0.8
+
+# Data / ML
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+xgboost==2.1.1
+shap==0.46.0
+
+# Causal (ICEA+ layer - optional in MVP, but included)
+econml==0.16.0
+
+# Networking
+requests==2.32.3
+
+# Validation (FHIR facade)
+pydantic==2.7.4
+
+# Server
+gunicorn==25.1.0
+
+python-dateutil==2.9.0.post0
