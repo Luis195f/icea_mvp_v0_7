@@ -20,6 +20,8 @@ Core principles:
 See:
 - `docs/ICEA_PLUS_MATH.md`
 - `docs/ICEA_PLUS_API.md`
+- `docs/ICEA_PLUS_FOLLOWUP.md`
+- `docs/ICEA_PLUS_WRITEBACK.md`
 
 ---
 
@@ -91,6 +93,11 @@ Services:
 - `GET /api/v1/icea-plus/explain/`
 - `GET /api/v1/icea-plus/aggregate/`
 - `POST /api/v1/icea-plus/calibrate/` (admin-only)
+- `POST /api/v1/icea-plus/followup/ingest/`
+- `POST /api/v1/icea-plus/followup/rescore/`
+- `GET /api/v1/icea-plus/followup/status/`
+- `GET /api/v1/icea-plus/writeback/summary/`
+- `GET /api/v1/icea-plus/writeback/patient/`
 
 Example score request:
 
@@ -108,6 +115,13 @@ Example score request:
   }
 }
 ```
+
+Follow-up/writeback notes:
+
+- enriched rescoring is episode-level in the current repo state
+- the original score is preserved and linked to any later enriched score
+- HANDOVER should consume the JSON writeback summary contract, not infer individual staff rankings
+- `team` and `shift` writeback summaries degrade to `unit` when the repo lacks reliable longitudinal support at that granularity
 
 ### 5) Run causal analysis (trial-emulation)
 

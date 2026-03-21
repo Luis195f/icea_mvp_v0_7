@@ -131,3 +131,81 @@ class ICEAPlusComputation(models.Model):
 
     def __str__(self) -> str:
         return f"ICEAPlusComputation({self.id}) formula={self.formula_version} rows={self.rows}"
+
+
+class ICEAPlusFollowupRecord(models.Model):
+    """Episode-level longitudinal trace for initial and enriched ICEA+ scoring.
+
+    The current repo only supports longitudinal rescoring at episode grain. This
+    record keeps the original score immutable and links any later enriched score
+    generated from new repo-backed follow-up evidence.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    episode = models.ForeignKey(PatientEpisode, on_delete=models.CASCADE, related_name="icea_plus_followups")
+    model = models.ForeignKey(ModelArtifact, on_delete=models.PROTECT, related_name="icea_plus_followups")
+
+    formula_version = models.CharField(max_length=64, default="icea_plus_v1")
+    formula_protocol_hash = models.CharField(max_length=64, blank=True, default="")
+    grain = models.CharField(max_length=32, default="episode")
+    patient_key = models.CharField(max_length=128, blank=True, default="")
+
+    initial_computation = models.ForeignKey(
+        ICEAPlusComputation,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="followup_initial_records",
+    )
+    enriched_computation = models.ForeignKey(
+        ICEAPlusComputation,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="followup_enriched_records",
+    )
+
+    initial_state = models.CharField(max_length=32, default="insufficient_evidence")
+    followup_status = models.CharField(max_length=32, default="pending_followup")
+    current_state = models.CharField(max_length=32, default="insufficient_evidence")
+
+    evidence_types = models.JSONField(default=list, blank=True)
+    evidence_summary = models.JSONField(default=dict, blank=True)
+    support = models.JSONField(default=dict, blank=True)
+    warnings = models.JSONField(default=list, blank=True)
+    provenance = models.JSONField(default=dict, blank=True)
+    initial_request = models.JSONField(default=dict, blank=True)
+
+    initial_result = models.JSONField(default=dict, blank=True)
+    enriched_result = models.JSONField(default=dict, blank=True)
+    feature_snapshot_hash = models.CharField(max_length=64, blank=True, default="")
+    enriched_snapshot_hash = models.CharField(max_length=64, blank=True, default="")
+
+    last_followup_at = models.DateTimeField(null=True, blank=True)
+    last_rescore_at = models.DateTimeField(null=True, blank=True)
+
+    non_individual_use = models.BooleanField(default=True)
+    shadow_mode = models.BooleanField(default=True)
+    exploratory_only = models.BooleanField(default=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["episode", "model", "updated_at"]),
+            models.Index(fields=["formula_version", "current_state"]),
+            models.Index(fields=["followup_status", "last_followup_at"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["episode", "model", "formula_version", "formula_protocol_hash"],
+                name="uniq_followup_episode_model_formula_protocol",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return (
+            f"ICEAPlusFollowupRecord({self.id}) episode={self.episode_id} "
+            f"model={self.model_id} current_state={self.current_state}"
+        )

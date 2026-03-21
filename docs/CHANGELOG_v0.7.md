@@ -65,3 +65,43 @@
 - Added `docs/ICEA_PLUS_MATH.md`
 - Added `docs/ICEA_PLUS_API.md`
 - Updated `README.md`
+
+---
+
+# ICEA+ Platform MVP — v0.7.x extension: enriched follow-up rescoring and HANDOVER writeback summary
+
+## Added
+
+- New `ICEAPlusFollowupRecord` model to persist episode-level linkage between:
+  - initial ICEA+ score
+  - follow-up evidence state
+  - enriched follow-up rescore
+- New ICEA+ endpoints:
+  - `POST /api/v1/icea-plus/followup/ingest/`
+  - `POST /api/v1/icea-plus/followup/rescore/`
+  - `GET /api/v1/icea-plus/followup/status/`
+  - `GET /api/v1/icea-plus/writeback/summary/`
+  - `GET /api/v1/icea-plus/writeback/patient/`
+
+## Behavior
+
+- Initial episode scores are now persisted for longitudinal follow-up when they come from DB-backed episode scoring.
+- Enriched rescoring reuses the governed Prompt 9 kernel and preserves:
+  - formula version
+  - protocol hash
+  - traceability to the initial computation
+- If new follow-up evidence is missing or insufficient, the API returns an explicit state instead of fabricating an enriched score.
+- HANDOVER receives a stable JSON summary contract with warnings, provenance, support, timestamps and non-individual-use flags.
+
+## Prudence
+
+- Follow-up rescoring remains observational and exploratory.
+- No individual/punitive ranking is exposed by default.
+- Team/shift writeback summaries degrade to unit-level when the repo lacks reliable longitudinal support at that granularity.
+
+## Documentation
+
+- Added `docs/ICEA_PLUS_FOLLOWUP.md`
+- Added `docs/ICEA_PLUS_WRITEBACK.md`
+- Updated `docs/ICEA_PLUS_API.md`
+- Updated `README.md`
