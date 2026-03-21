@@ -1,19 +1,68 @@
 from __future__ import annotations
 
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import Model
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from icea_core.aggregation import aggregate_scored_rows
+from icea_core.followup import (
+    build_patient_summary,
+    build_summary_writeback,
+    ensure_followup_record,
+    get_followup_record,
+    ingest_followup,
+    persist_initial_followup_records,
+    rescore_followup,
+)
 from icea_core.icea_plus_serializers import (
     ICEAPlusAggregateQuerySerializer,
     ICEAPlusCalibrateSerializer,
+    ICEAPlusFollowupIngestSerializer,
+    ICEAPlusFollowupRescoreSerializer,
+    ICEAPlusFollowupStatusQuerySerializer,
     ICEAPlusScoreRequestSerializer,
+    ICEAPlusWritebackPatientQuerySerializer,
+    ICEAPlusWritebackSummaryQuerySerializer,
 )
-from icea_core.models import ICEAPlusComputation, ModelArtifact
+from icea_core.models import ICEAPlusComputation, ModelArtifact, PatientEpisode
 from icea_core.permissions import ICEABackwardCompatiblePermission
 from icea_core.scoring import score_icea_plus, select_formula, upsert_formula_version
 from icea_pipeline.audit import append_audit_event
+
+
+def _error_response(detail: str, *, status_code: int, errors: dict | None = None, **extra):
+    payload = {"detail": detail}
+    if errors:
+        payload["errors"] = errors
+    if extra:
+        payload.update(extra)
+    return Response(payload, status=status_code)
+
+
+def _validate_serializer(ser, *, request_type: str):
+    if ser.is_valid():
+        return ser.validated_data
+    return _error_response(
+        "invalid_request",
+        status_code=400,
+        errors=ser.errors,
+        request_type=request_type,
+    )
+
+
+def _get_object_or_typed_error(model_cls: type[Model], **lookup):
+    try:
+        return model_cls.objects.get(**lookup)
+    except (model_cls.DoesNotExist, ValueError, TypeError, DjangoValidationError):
+        detail = "resource_not_found"
+        if model_cls is ModelArtifact:
+            detail = "model_not_found"
+        elif model_cls is PatientEpisode:
+            detail = "episode_not_found"
+        key, value = next(iter(lookup.items()))
+        return _error_response(detail, status_code=404, **{key: str(value)})
 
 
 class ICEAPlusExplainView(APIView):
@@ -52,6 +101,8 @@ class ICEAPlusExplainView(APIView):
 
 
 class ICEAPlusScoreView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
     def post(self, request):
         ser = ICEAPlusScoreRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -83,7 +134,7 @@ class ICEAPlusScoreView(APIView):
         request_hash = ""
         if result.get("results"):
             request_hash = str((((result["results"][0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
-        ICEAPlusComputation.objects.create(
+        computation = ICEAPlusComputation.objects.create(
             formula_version=result["formula_version"],
             model=artifact,
             grain=str(payload.get("grain") or "episode"),
@@ -102,10 +153,19 @@ class ICEAPlusScoreView(APIView):
             },
             context="icea-plus/score",
         )
+        if bool(payload.get("from_db", True)) and str(payload.get("grain") or "episode") == "episode":
+            persist_initial_followup_records(
+                artifact=artifact,
+                result=result,
+                computation=computation,
+                request_config=dict(payload),
+            )
         return Response(result)
 
 
 class ICEAPlusAggregateView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
     def get(self, request):
         ser = ICEAPlusAggregateQuerySerializer(data=request.query_params)
         ser.is_valid(raise_exception=True)
@@ -229,3 +289,140 @@ class ICEAPlusCalibrateView(APIView):
             },
             status=201,
         )
+
+
+class ICEAPlusFollowupIngestView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
+    def post(self, request):
+        ser = ICEAPlusFollowupIngestSerializer(data=request.data)
+        payload = _validate_serializer(ser, request_type="body")
+        if isinstance(payload, Response):
+            return payload
+
+        artifact = _get_object_or_typed_error(ModelArtifact, id=payload["model_id"])
+        if isinstance(artifact, Response):
+            return artifact
+        episode = _get_object_or_typed_error(PatientEpisode, id=int(payload["episode_id"]))
+        if isinstance(episode, Response):
+            return episode
+        record = ingest_followup(
+            episode=episode,
+            artifact=artifact,
+            request_config={"formula_version": str(payload.get("formula_version") or "")},
+        )
+        return Response(build_patient_summary(record))
+
+
+class ICEAPlusFollowupRescoreView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
+    def post(self, request):
+        ser = ICEAPlusFollowupRescoreSerializer(data=request.data)
+        payload = _validate_serializer(ser, request_type="body")
+        if isinstance(payload, Response):
+            return payload
+
+        artifact = _get_object_or_typed_error(ModelArtifact, id=payload["model_id"])
+        if isinstance(artifact, Response):
+            return artifact
+        episode = _get_object_or_typed_error(PatientEpisode, id=int(payload["episode_id"]))
+        if isinstance(episode, Response):
+            return episode
+        record = rescore_followup(
+            episode=episode,
+            artifact=artifact,
+            request_config={
+                "formula_version": str(payload.get("formula_version") or ""),
+                "outcome_goal": payload.get("outcome_goal"),
+                "causal_run_id": payload.get("causal_run_id"),
+                "causal_spec": payload.get("causal_spec"),
+                "baseline_model_id": payload.get("baseline_model_id"),
+                "nurse_cols": payload.get("nurse_cols"),
+            },
+        )
+        return Response(build_patient_summary(record))
+
+
+class ICEAPlusFollowupStatusView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
+    def get(self, request):
+        ser = ICEAPlusFollowupStatusQuerySerializer(data=request.query_params)
+        params = _validate_serializer(ser, request_type="query")
+        if isinstance(params, Response):
+            return params
+
+        artifact = _get_object_or_typed_error(ModelArtifact, id=params["model_id"])
+        if isinstance(artifact, Response):
+            return artifact
+        episode = _get_object_or_typed_error(PatientEpisode, id=int(params["episode_id"]))
+        if isinstance(episode, Response):
+            return episode
+        record = get_followup_record(
+            episode_id=int(episode.id),
+            model_id=str(artifact.id),
+            formula_version=(str(params.get("formula_version") or "").strip() or None),
+        )
+        if record is None:
+            return Response(
+                {
+                    "detail": "followup_record_not_found",
+                    "episode_id": int(episode.id),
+                    "model_id": str(artifact.id),
+                },
+                status=404,
+            )
+        return Response(build_patient_summary(record))
+
+
+class ICEAPlusWritebackSummaryView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
+    def get(self, request):
+        ser = ICEAPlusWritebackSummaryQuerySerializer(data=request.query_params)
+        params = _validate_serializer(ser, request_type="query")
+        if isinstance(params, Response):
+            return params
+
+        artifact = _get_object_or_typed_error(ModelArtifact, id=params["model_id"])
+        if isinstance(artifact, Response):
+            return artifact
+        payload = build_summary_writeback(
+            artifact=artifact,
+            group_by=str(params.get("group_by") or "unit"),
+            unit_id=params.get("unit_id"),
+            formula_version=(str(params.get("formula_version") or "").strip() or None),
+            date_from=params.get("date_from"),
+            date_to=params.get("date_to"),
+        )
+        return Response(payload)
+
+
+class ICEAPlusWritebackPatientView(APIView):
+    permission_classes = [ICEABackwardCompatiblePermission]
+
+    def get(self, request):
+        ser = ICEAPlusWritebackPatientQuerySerializer(data=request.query_params)
+        params = _validate_serializer(ser, request_type="query")
+        if isinstance(params, Response):
+            return params
+
+        artifact = _get_object_or_typed_error(ModelArtifact, id=params["model_id"])
+        if isinstance(artifact, Response):
+            return artifact
+        episode = _get_object_or_typed_error(PatientEpisode, id=int(params["episode_id"]))
+        if isinstance(episode, Response):
+            return episode
+        record = get_followup_record(
+            episode_id=int(episode.id),
+            model_id=str(artifact.id),
+            formula_version=(str(params.get("formula_version") or "").strip() or None),
+        )
+        if record is None:
+            record = ensure_followup_record(
+                episode=episode,
+                artifact=artifact,
+                request_config={"formula_version": str(params.get("formula_version") or "")},
+            )
+        return Response(build_patient_summary(record))

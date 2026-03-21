@@ -202,6 +202,58 @@ Admin-only endpoint to persist a new governed formula version or update an exist
 }
 ```
 
+### POST `/api/v1/icea-plus/followup/ingest/`
+
+Registers repo-backed follow-up evidence for one episode/model pair and returns the
+current longitudinal record for HANDOVER consumption.
+
+```json
+{
+  "episode_id": 42,
+  "model_id": "<uuid>"
+}
+```
+
+### POST `/api/v1/icea-plus/followup/rescore/`
+
+Triggers enriched rescoring only when the repo has sufficient new follow-up support.
+If support is missing, the endpoint returns an explicit non-enriched state instead of
+fabricating a later score.
+
+### GET `/api/v1/icea-plus/followup/status/`
+
+Returns the longitudinal state for one episode/model pair.
+
+Required query params:
+
+- `episode_id=<int>`
+- `model_id=<uuid>`
+
+### GET `/api/v1/icea-plus/writeback/patient/`
+
+Stable patient/episode JSON summary for HANDOVER.
+
+Required query params:
+
+- `episode_id=<int>`
+- `model_id=<uuid>`
+
+### GET `/api/v1/icea-plus/writeback/summary/`
+
+Stable aggregate JSON summary for HANDOVER.
+
+Required query params:
+
+- `model_id=<uuid>`
+
+Optional query params:
+
+- `group_by=unit|team|shift`
+- `unit_id=<int>`
+- `date_from=<iso-datetime>`
+- `date_to=<iso-datetime>`
+- `formula_version=<version>`
+
 ## API semantics
 
 ### Backward compatibility
@@ -214,6 +266,42 @@ Admin-only endpoint to persist a new governed formula version or update an exist
 
 - `provisional`: non-causal required components are available, causal is not.
 - `insufficient_evidence`: required components are missing, so the API refuses to fabricate a final score.
+
+### Longitudinal follow-up states
+
+- `immediate_provisional`: initial score is retained and causal support was unavailable
+- `complete`: initial score is retained with required components available
+- `enriched_followup`: a later rescore exists and is linked to the initial score
+- `insufficient_evidence`: follow-up did not justify an enriched rescore
+- `stale`: new follow-up evidence exists and the record should be rescored
+- `failed`: an enriched rescore attempt failed, while the initial score remains available
+- `pending_followup`: no usable new follow-up evidence has been observed
+
+### Typed errors for follow-up and writeback
+
+Expected error payload shape for follow-up/writeback endpoints:
+
+```json
+{
+  "detail": "invalid_request",
+  "request_type": "query",
+  "errors": {
+    "model_id": ["Must be a valid UUID."]
+  }
+}
+```
+
+Typed `detail` values used by the contract:
+
+- `invalid_request`
+- `model_not_found`
+- `episode_not_found`
+- `followup_record_not_found`
+
+Expected status codes:
+
+- `400` for invalid query/body payloads
+- `404` for missing model/episode/follow-up records
 
 ### Security and permissions
 
@@ -240,6 +328,9 @@ HANDOVER should consume these endpoints as follows:
 - patient/episode detail cards: `POST /score/`
 - unit/shift summary widgets: `GET /aggregate/`
 - tooltip/help and governance detail: `GET /explain/`
+- longitudinal episode status: `GET /followup/status/`
+- stable patient summary contract: `GET /writeback/patient/`
+- stable unit/team summary contract: `GET /writeback/summary/`
 
 The UI should always surface:
 
@@ -247,3 +338,6 @@ The UI should always surface:
 - warnings
 - condensed component breakdown
 - confidence label/value
+- `non_individual_use`
+- `shadow_mode`
+- `exploratory_only`
