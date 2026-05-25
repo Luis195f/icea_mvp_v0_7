@@ -305,9 +305,13 @@ Expected status codes:
 
 ### Security and permissions
 
-- The project-wide backward-compatible permission layer still applies.
-- `calibrate` also requires admin/staff privileges.
-- Existing HMAC/RBAC strategy remains the source of truth for the repo.
+- Production/secure defaults are fail-closed. Do not expose sensitive ICEA endpoints without authentication and an explicit ICEA role.
+- `ICEA_DEV_ALLOW_INSECURE=true` is only for local development/demo runs without PHI. Keep it `false` in secure mode.
+- Minimum ICEA roles are `viewer_aggregate` for non-nominal aggregate reads, `researcher` for causal/reporting research, `admin` for calibration/config/writeback/federated administration, and `service` for backend-to-backend HANDOVER integration.
+- `POST /score/`, `POST /predict/conformal/`, and `/causal/*` require `researcher`, `admin`, or `service`.
+- `/writeback/*`, `/fhir/writeback/*`, `/federated/*`, and `/calibrate/` require `admin` or `service`, except `/calibrate/` which is `admin` only.
+- `policy_learning`, `fairness`, `causal_discover`, `simulate`, and `federated` remain disabled until explicitly enabled with `ICEA_POLICY_LEARNING_ENABLED`, `ICEA_FAIRNESS_ENABLED`, `ICEA_CAUSAL_DISCOVER_ENABLED`, `ICEA_SIMULATE_ENABLED`, and `ICEA_FEDERATED_ENABLED`.
+- In `ICEA_SECURE_MODE=true`, startup fails unless `ICEA_AUTH_REQUIRED=true`, `ICEA_RBAC_ENFORCE=true`, `ICEA_DEV_ALLOW_INSECURE=false`, and a dedicated JWT/JWKS key source is configured.
 
 ### Logging and lineage
 

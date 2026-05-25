@@ -1,3 +1,6 @@
+import os
+from unittest import mock
+
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -6,6 +9,9 @@ from icea_core.tests.helpers import ICEAPlusFixtureMixin
 
 class ICEABackwardCompatibilityTests(ICEAPlusFixtureMixin, TestCase):
     def setUp(self):
+        self.dev_env = mock.patch.dict(os.environ, {"ICEA_DEV_ALLOW_INSECURE": "true"}, clear=False)
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
         self.client = APIClient()
 
     def test_legacy_icea_compute_endpoint_still_works(self):

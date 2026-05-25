@@ -15,6 +15,9 @@ from icea_pipeline.models import NormalizedObservation, NormalizedProcedure
 
 class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
     def setUp(self):
+        self.dev_env = mock.patch.dict(os.environ, {"ICEA_DEV_ALLOW_INSECURE": "true"}, clear=False)
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
         self.client = APIClient()
 
     def _score_initial_episode(self, episode):
