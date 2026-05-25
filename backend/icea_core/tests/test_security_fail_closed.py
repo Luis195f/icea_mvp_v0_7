@@ -206,3 +206,122 @@ class ICEAFailClosedSecurityTests(ICEAPlusFixtureMixin, TestCase):
         with mock.patch.dict(os.environ, {"ICEA_DEV_ALLOW_INSECURE": "true", "ICEA_AUTH_REQUIRED": "false", "ICEA_RBAC_ENFORCE": "false"}, clear=False):
             response = self.client.get("/api/v1/icea-plus/aggregate/", {"model_id": str(self.episode_artifact.id), "grain": "episode"})
         self.assertEqual(response.status_code, 200)
+
+    def test_valid_api_key_gets_service_role_for_sensitive_endpoint(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ICEA_API_KEY": "service-test-key",
+                "ICEA_DEV_ALLOW_INSECURE": "false",
+                "ICEA_AUTH_REQUIRED": "true",
+                "ICEA_RBAC_ENFORCE": "true",
+            },
+            clear=False,
+        ):
+            client = APIClient()
+            response = client.get(
+                "/api/v1/icea-plus/writeback/summary/",
+                {"model_id": str(self.episode_artifact.id)},
+                HTTP_X_ICEA_API_KEY="service-test-key",
+            )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_missing_or_invalid_api_key_cannot_access_sensitive_endpoint(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ICEA_API_KEY": "service-test-key",
+                "ICEA_DEV_ALLOW_INSECURE": "false",
+                "ICEA_AUTH_REQUIRED": "true",
+                "ICEA_RBAC_ENFORCE": "true",
+            },
+            clear=False,
+        ):
+            client = APIClient()
+            missing = client.get(
+                "/api/v1/icea-plus/writeback/summary/",
+                {"model_id": str(self.episode_artifact.id)},
+            )
+            invalid = client.get(
+                "/api/v1/icea-plus/writeback/summary/",
+                {"model_id": str(self.episode_artifact.id)},
+                HTTP_X_ICEA_API_KEY="wrong-key",
+            )
+
+        self.assertEqual(missing.status_code, 401)
+        self.assertEqual(invalid.status_code, 401)
+
+    def test_spoofed_service_role_header_does_not_grant_service_access(self):
+        self.client.force_authenticate(user=self.regular_user)
+
+        response = self.client.get(
+            "/api/v1/icea-plus/writeback/summary/",
+            {"model_id": str(self.episode_artifact.id)},
+            HTTP_X_ICEA_ROLES="service",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_secure_mode_blocks_dev_insecure_bypass_for_authenticated_user(self):
+        self.client.force_authenticate(user=self.regular_user)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ICEA_SECURE_MODE": "true",
+                "ICEA_DEV_ALLOW_INSECURE": "true",
+                "ICEA_AUTH_REQUIRED": "false",
+                "ICEA_RBAC_ENFORCE": "false",
+            },
+            clear=False,
+        ):
+            response = self.client.post(
+                "/api/v1/icea-plus/calibrate/",
+                {"version": "icea_plus_secure_no_bypass", "spec": {"weights": {"benefit": 1.0}}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_dev_insecure_mode_allows_authenticated_user_without_icea_role(self):
+        self.client.force_authenticate(user=self.regular_user)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ICEA_SECURE_MODE": "false",
+                "ICEA_DEV_ALLOW_INSECURE": "true",
+                "ICEA_AUTH_REQUIRED": "false",
+                "ICEA_RBAC_ENFORCE": "false",
+            },
+            clear=False,
+        ):
+            response = self.client.post(
+                "/api/v1/icea-plus/calibrate/",
+                {"version": "icea_plus_dev_auth_user", "spec": {"weights": {"benefit": 1.0}}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_without_dev_insecure_authenticated_user_without_role_is_forbidden(self):
+        self.client.force_authenticate(user=self.regular_user)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ICEA_SECURE_MODE": "false",
+                "ICEA_DEV_ALLOW_INSECURE": "false",
+                "ICEA_AUTH_REQUIRED": "false",
+                "ICEA_RBAC_ENFORCE": "false",
+            },
+            clear=False,
+        ):
+            response = self.client.post(
+                "/api/v1/icea-plus/calibrate/",
+                {"version": "icea_plus_no_dev_bypass", "spec": {"weights": {"benefit": 1.0}}},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 403)

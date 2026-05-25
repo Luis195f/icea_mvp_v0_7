@@ -143,22 +143,31 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertTrue(response_shift.json()["results"])
 
     def test_calibrate_endpoint_is_admin_only(self):
-        self.client.force_authenticate(user=self.regular_user)
-        forbidden = self.client.post(
-            "/api/v1/icea-plus/calibrate/",
-            {"version": "icea_plus_v1_test", "spec": {"weights": {"benefit": 1.5}}},
-            format="json",
-        )
-        self.assertEqual(forbidden.status_code, 403)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ICEA_DEV_ALLOW_INSECURE": "false",
+                "ICEA_AUTH_REQUIRED": "true",
+                "ICEA_RBAC_ENFORCE": "true",
+            },
+            clear=False,
+        ):
+            self.client.force_authenticate(user=self.regular_user)
+            forbidden = self.client.post(
+                "/api/v1/icea-plus/calibrate/",
+                {"version": "icea_plus_v1_test", "spec": {"weights": {"benefit": 1.5}}},
+                format="json",
+            )
+            self.assertEqual(forbidden.status_code, 403)
 
-        self.client.force_authenticate(user=self.admin_user)
-        allowed = self.client.post(
-            "/api/v1/icea-plus/calibrate/",
-            {"version": "icea_plus_v1_test", "spec": {"weights": {"benefit": 1.5}}, "activate": True},
-            format="json",
-        )
-        self.assertEqual(allowed.status_code, 201)
-        self.assertEqual(allowed.json()["formula_version"], "icea_plus_v1_test")
+            self.client.force_authenticate(user=self.admin_user)
+            allowed = self.client.post(
+                "/api/v1/icea-plus/calibrate/",
+                {"version": "icea_plus_v1_test", "spec": {"weights": {"benefit": 1.5}}, "activate": True},
+                format="json",
+            )
+            self.assertEqual(allowed.status_code, 201)
+            self.assertEqual(allowed.json()["formula_version"], "icea_plus_v1_test")
 
     def test_followup_without_new_evidence_does_not_create_enriched_score(self):
         episode = self.episodes[0]

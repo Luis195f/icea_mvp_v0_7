@@ -71,18 +71,30 @@ def _normalize_roles(val: Any) -> set[str]:
     return {str(val).strip()} if str(val).strip() else set()
 
 
+def _api_key_authenticated(request) -> bool:
+    return bool(getattr(request, "icea_api_key_authenticated", False))
+
+
 def get_request_roles(request) -> set[str]:
     """Resolve roles from:
     1) JWT claim (ICEA_JWT_ROLE_CLAIM)
     2) Django groups (request.user.groups)
-    3) Optional header X-ICEA-ROLES (service-to-service)
+    3) Validated ICEA_API_KEY middleware marker (service)
+    4) Optional legacy header X-ICEA-ROLES (never trusted for service)
     """
 
     roles: set[str] = set()
 
-    # 3) Service-to-service header (optional)
+    # 4) Legacy role header. Do not let spoofable headers grant service.
     hdr = (request.headers.get("X-ICEA-ROLES") or "").strip()
-    roles |= _normalize_roles(hdr)
+    header_roles = _normalize_roles(hdr)
+    if not _api_key_authenticated(request):
+        header_roles = {
+            role
+            for role in header_roles
+            if ROLE_ALIASES.get(role.lower(), role.lower()) != "service"
+        }
+    roles |= header_roles
 
     # 1) JWT claim
     claim = os.environ.get("ICEA_JWT_ROLE_CLAIM", "roles").strip() or "roles"
@@ -101,6 +113,10 @@ def get_request_roles(request) -> set[str]:
     except Exception:
         pass
 
+    # 3) API-key authentication is validated only by OptionalAPIKeyMiddleware.
+    if _api_key_authenticated(request):
+        roles.add("service")
+
     normalized = {r.lower() for r in roles}
     return {ROLE_ALIASES.get(r, r) for r in normalized}
 
@@ -118,10 +134,6 @@ def _dev_insecure_allowed() -> bool:
     return _truthy(os.environ.get("ICEA_DEV_ALLOW_INSECURE", "false"))
 
 
-def _api_key_authenticated(request) -> bool:
-    return bool(getattr(request, "icea_api_key_authenticated", False))
-
-
 def _request_is_authenticated(request) -> bool:
     user = getattr(request, "user", None)
     return bool((user and getattr(user, "is_authenticated", False)) or _api_key_authenticated(request))
@@ -129,6 +141,14 @@ def _request_is_authenticated(request) -> bool:
 
 def _env_flag_enabled(name: str) -> bool:
     return _truthy(os.environ.get(name, "false"))
+
+
+def _dev_insecure_auth_rbac_bypass_allowed() -> bool:
+    return (
+        _dev_insecure_allowed()
+        and not _truthy(os.environ.get("ICEA_AUTH_REQUIRED", "false"))
+        and not _truthy(os.environ.get("ICEA_RBAC_ENFORCE", "false"))
+    )
 
 
 def _load_rbac_rules() -> dict[str, list[str]]:
@@ -243,14 +263,8 @@ class ICEARolePermission(BasePermission):
             self.message = f"{self.feature_flag} must be explicitly enabled"
             return False
 
-        if (
-            _dev_insecure_allowed()
-            and not _truthy(os.environ.get("ICEA_AUTH_REQUIRED", "false"))
-            and not _truthy(os.environ.get("ICEA_RBAC_ENFORCE", "false"))
-        ):
-            user = getattr(request, "user", None)
-            if not user or not getattr(user, "is_authenticated", False):
-                return True
+        if _dev_insecure_auth_rbac_bypass_allowed():
+            return True
 
         user = getattr(request, "user", None)
         if user and getattr(user, "is_superuser", False):
