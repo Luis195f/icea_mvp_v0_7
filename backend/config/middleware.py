@@ -28,4 +28,5 @@ class OptionalAPIKeyMiddleware:
                 key = auth.split(" ", 1)[1].strip()
             if key != self.api_key:
                 return JsonResponse({"detail": "Unauthorized"}, status=401)
+            request.icea_api_key_authenticated = True
         return self.get_response(request)

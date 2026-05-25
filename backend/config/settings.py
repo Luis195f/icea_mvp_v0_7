@@ -185,8 +185,12 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # --- Security hardening (ENS Alto / EU AI Act)
-# Secure mode is OFF by default to preserve backward compatibility in local/dev.
+# Secure mode is OFF for local/dev. Sensitive ICEA views still fail closed unless
+# ICEA_DEV_ALLOW_INSECURE=true is explicitly set for local demos/tests.
 ICEA_SECURE_MODE = os.environ.get("ICEA_SECURE_MODE", "false").lower() in {"1", "true", "yes"}
+ICEA_DEV_ALLOW_INSECURE = os.environ.get("ICEA_DEV_ALLOW_INSECURE", "false").lower() in {"1", "true", "yes"}
+ICEA_AUTH_REQUIRED = os.environ.get("ICEA_AUTH_REQUIRED", "true" if not ICEA_DEV_ALLOW_INSECURE else "false").lower() in {"1", "true", "yes"}
+ICEA_RBAC_ENFORCE = os.environ.get("ICEA_RBAC_ENFORCE", "true" if not ICEA_DEV_ALLOW_INSECURE else "false").lower() in {"1", "true", "yes"}
 
 # ENS Alto: never allow the development SECRET_KEY in secure deployments.
 # This prevents accidental production deployments with a predictable key.
@@ -195,6 +199,19 @@ if ICEA_SECURE_MODE and SECRET_KEY == "unsafe-secret-for-dev":
         "ICEA_SECURE_MODE=true but SECRET_KEY is the development default. "
         "Set SECRET_KEY to a strong, unique value."
     )
+
+if ICEA_SECURE_MODE:
+    if ICEA_DEV_ALLOW_INSECURE:
+        raise ImproperlyConfigured("ICEA_SECURE_MODE=true cannot be combined with ICEA_DEV_ALLOW_INSECURE=true.")
+    if not ICEA_AUTH_REQUIRED:
+        raise ImproperlyConfigured("ICEA_SECURE_MODE=true requires ICEA_AUTH_REQUIRED=true.")
+    if not ICEA_RBAC_ENFORCE:
+        raise ImproperlyConfigured("ICEA_SECURE_MODE=true requires ICEA_RBAC_ENFORCE=true.")
+    if not (os.environ.get("JWT_SIGNING_KEY") or os.environ.get("JWT_VERIFYING_KEY") or os.environ.get("OIDC_JWKS_URL")):
+        raise ImproperlyConfigured(
+            "ICEA_SECURE_MODE=true requires JWT_SIGNING_KEY, JWT_VERIFYING_KEY, or OIDC_JWKS_URL. "
+            "Do not rely on the Django SECRET_KEY for clinical/high-risk API tokens."
+        )
 
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = os.environ.get("X_FRAME_OPTIONS", "DENY")
@@ -245,7 +262,7 @@ REST_FRAMEWORK = {
         # Keep SessionAuth for /admin/ and local debugging.
         "rest_framework.authentication.SessionAuthentication",
     ],
-    # Backward-compatible: AllowAny unless ICEA_AUTH_REQUIRED=true.
+    # Fail-closed by default; local demos must explicitly set ICEA_DEV_ALLOW_INSECURE=true.
     "DEFAULT_PERMISSION_CLASSES": ["icea_core.permissions.ICEABackwardCompatiblePermission"],
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",

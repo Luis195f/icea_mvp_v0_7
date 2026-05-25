@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Model
-from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -27,7 +26,13 @@ from icea_core.icea_plus_serializers import (
     ICEAPlusWritebackSummaryQuerySerializer,
 )
 from icea_core.models import ICEAPlusComputation, ModelArtifact, PatientEpisode
-from icea_core.permissions import ICEABackwardCompatiblePermission
+from icea_core.permissions import (
+    ICEAAdminPermission,
+    ICEAAdminOrServicePermission,
+    ICEAAggregateViewerPermission,
+    ICEABackwardCompatiblePermission,
+    ICEAResearcherPermission,
+)
 from icea_core.scoring import score_icea_plus, select_formula, upsert_formula_version
 from icea_pipeline.audit import append_audit_event
 
@@ -101,7 +106,7 @@ class ICEAPlusExplainView(APIView):
 
 
 class ICEAPlusScoreView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAResearcherPermission]
 
     def post(self, request):
         ser = ICEAPlusScoreRequestSerializer(data=request.data)
@@ -164,7 +169,7 @@ class ICEAPlusScoreView(APIView):
 
 
 class ICEAPlusAggregateView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAAggregateViewerPermission]
 
     def get(self, request):
         ser = ICEAPlusAggregateQuerySerializer(data=request.query_params)
@@ -257,7 +262,7 @@ class ICEAPlusAggregateView(APIView):
 
 
 class ICEAPlusCalibrateView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission, IsAdminUser]
+    permission_classes = [ICEAAdminPermission]
 
     def post(self, request):
         ser = ICEAPlusCalibrateSerializer(data=request.data)
@@ -377,7 +382,7 @@ class ICEAPlusFollowupStatusView(APIView):
 
 
 class ICEAPlusWritebackSummaryView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAAdminOrServicePermission]
 
     def get(self, request):
         ser = ICEAPlusWritebackSummaryQuerySerializer(data=request.query_params)
@@ -400,7 +405,7 @@ class ICEAPlusWritebackSummaryView(APIView):
 
 
 class ICEAPlusWritebackPatientView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAAdminOrServicePermission]
 
     def get(self, request):
         ser = ICEAPlusWritebackPatientQuerySerializer(data=request.query_params)

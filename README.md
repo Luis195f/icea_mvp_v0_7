@@ -2,7 +2,7 @@
 
 This version is a **pilot-grade + trial-emulation kit** with an **enterprise-ready, feature-flagged** architecture:
 
-**FHIR ingestion (encounter‑centered) → normalization (deterministic nursing labels) → dataset builder (roster‑aware) → scheduled training → causal runs (bootstrap + sensitivity + CONSORT emulation + cohort-flow stages) → policy learning + fairness audit → dashboard → optional FHIR writeback (RiskAssessment)**
+**FHIR ingestion (encounter‑centered) → normalization (deterministic nursing labels) → dataset builder (roster‑aware) → scheduled training → causal runs (bootstrap + sensitivity + CONSORT emulation + cohort-flow stages) → explicitly opted-in policy learning/fairness audit → dashboard → optional FHIR writeback (RiskAssessment)**
 
 Core principles:
 - **Traceability first**: raw FHIR JSON is stored for audit/replay.
@@ -10,6 +10,7 @@ Core principles:
 - **Model governance**: models are versioned artifacts (features + target + metrics).
 - **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
 - **Bedside-grade uncertainty**: optional conformal prediction intervals for individual risk.
+- **Fail-closed high-risk APIs**: scoring, causal, writeback, federated, simulate, policy learning, and fairness require explicit auth/RBAC and feature flags outside dev-only mode.
 
 ## ICEA vs ICEA+
 

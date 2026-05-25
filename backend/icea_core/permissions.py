@@ -1,17 +1,17 @@
-"""RBAC permissions for ICEA+ (backward compatible).
+"""RBAC permissions for ICEA+.
 
 Design goals:
-1) Backward compatibility: existing clients keep working unless the operator
-   explicitly enables enforcement flags.
-2) Institutional hardening: when enabled, enforce authentication and minimum
-   roles for high-risk operations (writeback/governance/federated).
+1) Fail closed by default for institutional/high-risk surfaces.
+2) Keep local MVP compatibility only when the operator explicitly enables a
+   documented dev-only override.
 3) OIDC/JWT compatibility: roles can come from JWT claims or Django groups.
 
 Environment toggles:
+  - ICEA_DEV_ALLOW_INSECURE=true|false (dev only; never with PHI)
   - ICEA_AUTH_REQUIRED=true|false
   - ICEA_RBAC_ENFORCE=true|false
   - ICEA_JWT_ROLE_CLAIM=roles (default)  (comma-separated list, or single)
-  - ICEA_RBAC_RULES_JSON='{"/api/v1/fhir/writeback": ["command_center_admin"]}'
+  - ICEA_RBAC_RULES_JSON='{"/api/v1/fhir/writeback": ["admin", "service"]}'
 
 Note:
   This module is intentionally dependency-free beyond DRF.
@@ -31,6 +31,15 @@ from typing import Any
 from django.core.cache import cache
 
 from rest_framework.permissions import BasePermission
+
+
+ICEA_ROLES = {"viewer_aggregate", "researcher", "admin", "service"}
+ROLE_ALIASES = {
+    "command_center_admin": "admin",
+    "clinical_staff": "researcher",
+    "command-center-admin": "admin",
+    "viewer-aggregate": "viewer_aggregate",
+}
 
 
 def _truthy(v: str | None) -> bool:
@@ -92,7 +101,34 @@ def get_request_roles(request) -> set[str]:
     except Exception:
         pass
 
-    return {r.lower() for r in roles}
+    normalized = {r.lower() for r in roles}
+    return {ROLE_ALIASES.get(r, r) for r in normalized}
+
+
+def _dev_insecure_allowed() -> bool:
+    """Explicit dev-only compatibility switch.
+
+    The override is intentionally tied to ICEA_DEV_ALLOW_INSECURE and blocked
+    when secure mode is active. This keeps production/institutional defaults
+    fail-closed while preserving local demos that opt in loudly.
+    """
+
+    if _truthy(os.environ.get("ICEA_SECURE_MODE", "false")):
+        return False
+    return _truthy(os.environ.get("ICEA_DEV_ALLOW_INSECURE", "false"))
+
+
+def _api_key_authenticated(request) -> bool:
+    return bool(getattr(request, "icea_api_key_authenticated", False))
+
+
+def _request_is_authenticated(request) -> bool:
+    user = getattr(request, "user", None)
+    return bool((user and getattr(user, "is_authenticated", False)) or _api_key_authenticated(request))
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return _truthy(os.environ.get(name, "false"))
 
 
 def _load_rbac_rules() -> dict[str, list[str]]:
@@ -116,7 +152,7 @@ def _load_rbac_rules() -> dict[str, list[str]]:
             for k, v in obj.items():
                 if not isinstance(k, str):
                     continue
-                out[k] = [str(x).lower() for x in (v or [])]
+                out[k] = [ROLE_ALIASES.get(str(x).lower(), str(x).lower()) for x in (v or [])]
             return out
     except Exception:
         return {}
@@ -124,27 +160,30 @@ def _load_rbac_rules() -> dict[str, list[str]]:
 
 
 class ICEABackwardCompatiblePermission(BasePermission):
-    """Default permission that preserves MVP compatibility.
+    """Default permission for non-specialized ICEA endpoints.
 
-    - If ICEA_AUTH_REQUIRED is false (default), allow all requests.
+    - If ICEA_DEV_ALLOW_INSECURE=true, preserve local MVP compatibility.
+    - Otherwise require authentication by default.
     - If ICEA_AUTH_REQUIRED is true, require authenticated.
     - If ICEA_RBAC_ENFORCE is true, apply path-prefix RBAC rules.
 
-    This allows deployments to flip flags at runtime without changing URLs.
+    Sensitive views should use one of the explicit ICEA role permissions below.
     """
 
     message = "Unauthorized"
 
     def has_permission(self, request, view) -> bool:
-        auth_required = _truthy(os.environ.get("ICEA_AUTH_REQUIRED", "false"))
-        rbac_enforce = _truthy(os.environ.get("ICEA_RBAC_ENFORCE", "false"))
+        dev_insecure = _dev_insecure_allowed()
+        auth_default = "false" if dev_insecure else "true"
+        rbac_default = "false" if dev_insecure else "true"
+        auth_required = _truthy(os.environ.get("ICEA_AUTH_REQUIRED", auth_default))
+        rbac_enforce = _truthy(os.environ.get("ICEA_RBAC_ENFORCE", rbac_default))
 
-        # MVP mode: open by default.
+        # Explicit local/dev compatibility mode.
         if not auth_required and not rbac_enforce:
-            return True
+            return dev_insecure
 
-        user = getattr(request, "user", None)
-        if not user or not getattr(user, "is_authenticated", False):
+        if not _request_is_authenticated(request):
             return False
 
         if not rbac_enforce:
@@ -157,9 +196,13 @@ class ICEABackwardCompatiblePermission(BasePermission):
         # Built-in hardening defaults (only when rbac_enforce is true).
         # These are conservative and can be overridden by ICEA_RBAC_RULES_JSON.
         builtin = {
-            "/api/v1/fhir/writeback": ["command_center_admin"],
-            "/api/v1/governance": ["command_center_admin"],
-            "/api/v1/federated": ["command_center_admin"],
+            "/api/v1/fhir/writeback": ["admin", "service"],
+            "/api/v1/governance": ["admin"],
+            "/api/v1/federated": ["admin", "service"],
+            "/api/v1/causal": ["researcher", "admin", "service"],
+            "/api/v1/icea-plus/calibrate": ["admin"],
+            "/api/v1/icea-plus/writeback": ["admin", "service"],
+            "/api/v1/predict/conformal": ["researcher", "admin", "service"],
         }
         for k, v in builtin.items():
             rules.setdefault(k, v)
@@ -177,7 +220,80 @@ class ICEABackwardCompatiblePermission(BasePermission):
             # Authenticated is enough.
             return True
 
-        return bool(roles.intersection({r.lower() for r in matched_roles}))
+        required = {ROLE_ALIASES.get(r.lower(), r.lower()) for r in matched_roles}
+        return bool(roles.intersection(required))
+
+
+class ICEARolePermission(BasePermission):
+    """Require authentication plus one of the declared ICEA roles.
+
+    Roles:
+      - viewer_aggregate: aggregate, non-nominal read surfaces.
+      - researcher: causal/reporting/research surfaces.
+      - admin: calibration, governance, federated and writeback administration.
+      - service: backend-to-backend HANDOVER integration.
+    """
+
+    required_roles: set[str] = set()
+    feature_flag: str | None = None
+    message = "ICEA role required"
+
+    def has_permission(self, request, view) -> bool:
+        if self.feature_flag and not _env_flag_enabled(self.feature_flag):
+            self.message = f"{self.feature_flag} must be explicitly enabled"
+            return False
+
+        if (
+            _dev_insecure_allowed()
+            and not _truthy(os.environ.get("ICEA_AUTH_REQUIRED", "false"))
+            and not _truthy(os.environ.get("ICEA_RBAC_ENFORCE", "false"))
+        ):
+            user = getattr(request, "user", None)
+            if not user or not getattr(user, "is_authenticated", False):
+                return True
+
+        user = getattr(request, "user", None)
+        if user and getattr(user, "is_superuser", False):
+            return True
+
+        if not _request_is_authenticated(request):
+            return False
+
+        roles = get_request_roles(request)
+        required = {ROLE_ALIASES.get(r.lower(), r.lower()) for r in self.required_roles}
+        return bool(roles.intersection(required))
+
+
+class ICEAAggregateViewerPermission(ICEARolePermission):
+    required_roles = {"viewer_aggregate", "researcher", "admin", "service"}
+    message = "viewer_aggregate, researcher, admin or service role required"
+
+
+class ICEAResearcherPermission(ICEARolePermission):
+    required_roles = {"researcher", "admin", "service"}
+    message = "researcher, admin or service role required"
+
+
+class ICEAAdminPermission(ICEARolePermission):
+    required_roles = {"admin"}
+    message = "admin role required"
+
+
+class ICEAAdminOrServicePermission(ICEARolePermission):
+    required_roles = {"admin", "service"}
+    message = "admin or service role required"
+
+
+class ICEACausalDiscoverPermission(ICEAResearcherPermission):
+    feature_flag = "ICEA_CAUSAL_DISCOVER_ENABLED"
+
+
+class ICEASimulatePermission(ICEAResearcherPermission):
+    feature_flag = "ICEA_SIMULATE_ENABLED"
+
+
+class ICEAFederatedPermission(ICEAAdminOrServicePermission):
+    feature_flag = "ICEA_FEDERATED_ENABLED"
 
 
 class IsClinicalStaff(BasePermission):
@@ -189,9 +305,9 @@ class IsClinicalStaff(BasePermission):
         user = getattr(request, "user", None)
         if user and getattr(user, "is_superuser", False):
             return True
-        if not user or not getattr(user, "is_authenticated", False):
+        if not _request_is_authenticated(request):
             return False
-        return "clinical_staff" in get_request_roles(request)
+        return bool({"clinical_staff", "researcher"}.intersection(get_request_roles(request)))
 
 
 class IsCommandCenterAdmin(BasePermission):
@@ -203,9 +319,9 @@ class IsCommandCenterAdmin(BasePermission):
         user = getattr(request, "user", None)
         if user and getattr(user, "is_superuser", False):
             return True
-        if not user or not getattr(user, "is_authenticated", False):
+        if not _request_is_authenticated(request):
             return False
-        return "command_center_admin" in get_request_roles(request)
+        return bool({"command_center_admin", "admin"}.intersection(get_request_roles(request)))
 
 
 class RequiresHMACSignature(BasePermission):
@@ -479,4 +595,3 @@ class RequiresAntiReplayHMAC(BasePermission):
             self.message = "Invalid X-ICEA-Signature"
 
         return ok
-

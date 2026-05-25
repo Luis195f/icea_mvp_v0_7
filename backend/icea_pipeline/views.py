@@ -17,7 +17,15 @@ from django.utils.dateparse import parse_datetime
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from icea_core.permissions import ICEABackwardCompatiblePermission, RequiresAntiReplayHMAC
+from icea_core.permissions import (
+    ICEAAdminOrServicePermission,
+    ICEABackwardCompatiblePermission,
+    ICEACausalDiscoverPermission,
+    ICEAFederatedPermission,
+    ICEAResearcherPermission,
+    ICEASimulatePermission,
+    RequiresAntiReplayHMAC,
+)
 
 from fhir_integration.facade import FHIRFacade
 from fhir_integration.service import FHIRClient
@@ -997,6 +1005,8 @@ class CausalRunView(APIView):
       - optional window-grain dataset (episode-windows)
     """
 
+    permission_classes = [ICEAResearcherPermission]
+
     def post(self, request):
         ser = CausalRunSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -1149,6 +1159,9 @@ class CausalRunView(APIView):
         try:
             dd = spec.get("dag_discovery") if isinstance(spec.get("dag_discovery"), dict) else None
             if dd and bool(dd.get("enabled", False)):
+                if str(os.environ.get("ICEA_CAUSAL_DISCOVER_ENABLED", "false")).lower() not in {"1", "true", "yes", "on"}:
+                    dag_discovery_out = {"available": False, "detail": "ICEA_CAUSAL_DISCOVER_ENABLED must be explicitly enabled"}
+                    raise RuntimeError("causal_discovery_disabled")
                 from icea_pipeline.causal_discovery import discover_dag_pc
 
                 dd_vars = list(dd.get("variables") or []) or list({treatment, outcome, *confounders, *effect_modifiers})
@@ -1176,7 +1189,8 @@ class CausalRunView(APIView):
                     spec["dag_edges"] = disc.dag_edges
                     dag_edges = disc.dag_edges
         except Exception as e:
-            dag_discovery_out = {"available": False, "error": f"{e.__class__.__name__}: {str(e)}"}
+            if dag_discovery_out is None:
+                dag_discovery_out = {"available": False, "error": f"{e.__class__.__name__}: {str(e)}"}
 
 
         needed = [treatment, outcome] + confounders + effect_modifiers
@@ -1305,7 +1319,19 @@ class CausalRunView(APIView):
         fairness_audit = {}
         try:
             policy_cfg = spec.get("policy_learning")
-            if policy_cfg is not False:
+            fairness_cfg = spec.get("fairness")
+            policy_enabled = str(os.environ.get("ICEA_POLICY_LEARNING_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
+            fairness_enabled = str(os.environ.get("ICEA_FAIRNESS_ENABLED", "false")).lower() in {"1", "true", "yes", "on"}
+
+            if policy_cfg and policy_cfg is not False and not policy_enabled:
+                policy_learning = {"available": False, "detail": "ICEA_POLICY_LEARNING_ENABLED must be explicitly enabled"}
+                if fairness_cfg and fairness_cfg is not False:
+                    fairness_audit = {"available": False, "detail": "ICEA_FAIRNESS_ENABLED requires explicit opt-in and policy_learning output"}
+
+            elif fairness_cfg and fairness_cfg is not False and not policy_cfg:
+                fairness_audit = {"available": False, "detail": "ICEA_FAIRNESS_ENABLED requires explicit policy_learning opt-in"}
+
+            elif policy_cfg and policy_cfg is not False and policy_enabled:
                 from icea_pipeline.policy_learning import learn_policy_from_marginal_cate
 
                 feat_cols = []
@@ -1391,8 +1417,9 @@ class CausalRunView(APIView):
                     policy_learning.setdefault("robustness", {})
                     policy_learning["robustness"]["dowhy_policy_ate"] = {"error": f"{e.__class__.__name__}: {str(e)}"}
 
-                fairness_cfg = spec.get("fairness")
-                if fairness_cfg is not False:
+                if fairness_cfg and fairness_cfg is not False and not fairness_enabled:
+                    fairness_audit = {"available": False, "detail": "ICEA_FAIRNESS_ENABLED must be explicitly enabled"}
+                elif fairness_cfg and fairness_cfg is not False and fairness_enabled:
                     from icea_pipeline.fairness import audit_fairness_bundle
 
                     sensitive = []
@@ -1607,6 +1634,8 @@ class CausalReportView(APIView):
       - Policy learning + fairness audit (when available)
     """
 
+    permission_classes = [ICEAResearcherPermission]
+
     def get(self, request):
         run_id = (request.query_params.get("run_id") or "").strip()
         if not run_id:
@@ -1672,7 +1701,7 @@ class RiskAssessmentWritebackView(APIView):
     """Create (and optionally write back) a FHIR RiskAssessment for an episode/model."""
 
     # Optional HMAC signing (v0.7.2) + optional anti-replay (v0.7.3).
-    permission_classes = [ICEABackwardCompatiblePermission, RequiresAntiReplayHMAC]
+    permission_classes = [ICEAAdminOrServicePermission, RequiresAntiReplayHMAC]
 
     # Scoped throttling (v0.7.3)
     throttle_scope = "writeback"
@@ -1787,6 +1816,8 @@ class ConformalPredictView(APIView):
     coverage band.
     """
 
+    permission_classes = [ICEAResearcherPermission]
+
     def post(self, request):
         ser = ConformalPredictSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -1842,6 +1873,8 @@ class ConformalPredictView(APIView):
 
 
 class WritebackListView(APIView):
+    permission_classes = [ICEAAdminOrServicePermission]
+
     def get(self, request):
         qs = FHIRWritebackRecord.objects.order_by("-created_at")[:50]
         out = []
@@ -1966,6 +1999,8 @@ class CausalDiscoverView(APIView):
     This endpoint NEVER mutates existing causal specs; it only suggests dag_edges.
     """
 
+    permission_classes = [ICEACausalDiscoverPermission]
+
     def post(self, request):
         from icea_pipeline.serializers import CausalDiscoverSerializer
         from icea_pipeline.causal_discovery import discover_dag_pc
@@ -2057,6 +2092,8 @@ class CausalSimulateView(APIView):
     Uses DML effects; optionally uses a predictive XGB model to attach conformal intervals.
     """
 
+    permission_classes = [ICEASimulatePermission]
+
     def post(self, request):
         from icea_pipeline.serializers import CausalSimulateSerializer
         from icea_pipeline.models import CounterfactualSimulationRun, CausalRun, EpisodeFeatureRow, EpisodeWindowFeatureRow
@@ -2104,6 +2141,12 @@ class CausalSimulateView(APIView):
                 data.append(row)
 
         df = pd.DataFrame(data).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        treatment = str(spec.get("treatment") or "").strip()
+        outcome = str(spec.get("outcome") or "delta_ri").strip()
+        confounders = list(spec.get("confounders") or [])
+        effect_modifiers = list(spec.get("effect_modifiers") or [])
+        dag_edges = spec.get("dag_edges") or []
+        dag_discovery = None
         # v0.7: optional causal discovery (PC) to suggest dag_edges from observed unit data.
         # This never mutates the protocol unless explicitly requested (auto_update=true).
         try:
@@ -2122,7 +2165,7 @@ class CausalSimulateView(APIView):
                         df_dd[v] = np.nan
                 df_dd = df_dd[dd_vars].apply(pd.to_numeric, errors="coerce").dropna(axis=0, how="any")
                 disc = discover_dag_pc(df_dd, variables=dd_vars, alpha=dd_alpha, max_cond_set=dd_max, forbid_edges=forbid)
-                summary["dag_discovery"] = {
+                dag_discovery = {
                     "available": True,
                     "method": disc.method,
                     "alpha": disc.alpha,
@@ -2137,7 +2180,7 @@ class CausalSimulateView(APIView):
                     spec["dag_edges"] = disc.dag_edges
                     dag_edges = disc.dag_edges
         except Exception as e:
-            summary["dag_discovery"] = {"available": False, "error": f"{e.__class__.__name__}: {str(e)}"}
+            dag_discovery = {"available": False, "error": f"{e.__class__.__name__}: {str(e)}"}
 
         scenarios_in = list(p.get("scenarios") or [])
         scenarios: list[SimulationScenario] = []
@@ -2155,6 +2198,8 @@ class CausalSimulateView(APIView):
         model_id = str(p.get("model_id") or "") if p.get("model_id") else None
 
         result = simulate_counterfactual(df, spec=spec, scenarios=scenarios, model_id=model_id)
+        if dag_discovery is not None:
+            result["dag_discovery"] = dag_discovery
 
         sim = CounterfactualSimulationRun.objects.create(
             actor=actor,
@@ -2176,7 +2221,7 @@ class CausalSimulateView(APIView):
 class FederatedRoundStartView(APIView):
 
     # Optional HMAC signing (v0.7.2) + optional anti-replay (v0.7.3).
-    permission_classes = [ICEABackwardCompatiblePermission, RequiresAntiReplayHMAC]
+    permission_classes = [ICEAFederatedPermission, RequiresAntiReplayHMAC]
 
     # Scoped throttling (v0.7.3)
     throttle_scope = "federated"
@@ -2207,7 +2252,7 @@ class FederatedRoundStartView(APIView):
 class FederatedSubmitUpdateView(APIView):
 
     # Optional HMAC signing (v0.7.2) + optional anti-replay (v0.7.3).
-    permission_classes = [ICEABackwardCompatiblePermission, RequiresAntiReplayHMAC]
+    permission_classes = [ICEAFederatedPermission, RequiresAntiReplayHMAC]
 
     # Scoped throttling (v0.7.3)
     throttle_scope = "federated"
@@ -2290,7 +2335,7 @@ class FederatedSubmitUpdateView(APIView):
 class FederatedAggregateView(APIView):
 
     # Optional HMAC signing (v0.7.2) + optional anti-replay (v0.7.3).
-    permission_classes = [ICEABackwardCompatiblePermission, RequiresAntiReplayHMAC]
+    permission_classes = [ICEAFederatedPermission, RequiresAntiReplayHMAC]
 
     # Scoped throttling (v0.7.3)
     throttle_scope = "federated"
