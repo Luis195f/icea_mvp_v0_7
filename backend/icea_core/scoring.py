@@ -112,7 +112,7 @@ def _normalize_external_rows(rows: list[dict[str, Any]] | None) -> list[dict[str
             flat[flag_name] = 1.0 if bool(value) else 0.0
         flat.update(
             {
-                "row_id": str(row.get("row_id") or f"row:{idx}"),
+                "row_id": _external_row_id(row, idx),
                 "episode_id": row.get("episode_id"),
                 "window_id": row.get("window_id"),
                 "patient_key": row.get("patient_key") or row.get("episode_id") or f"row:{idx}",
@@ -165,7 +165,7 @@ def _validate_external_feature_contract(
             )
             continue
 
-        row_id = str(row.get("row_id") or f"row:{idx}")
+        row_id = _external_row_id(row, idx)
         features_payload = row.get("features")
         if not isinstance(features_payload, dict):
             features_payload = row
@@ -613,7 +613,7 @@ def load_dataset(
         for idx, row in enumerate(selected):
             meta_rows.append(
                 {
-                    "row_id": str(row.get("row_id") or f"row:{idx}"),
+                    "row_id": _external_row_id(row, idx),
                     "episode_id": row.get("episode_id"),
                     "window_id": row.get("window_id"),
                     "patient_key": str(row.get("patient_key") or row.get("episode_id") or f"row:{idx}"),
@@ -871,7 +871,7 @@ def score_icea_plus(
             )
         if baseline_model_id:
             baseline_model_for_contract = ModelArtifact.objects.filter(id=baseline_model_id).first()
-            if baseline_model_for_contract is not None:
+            if baseline_model_for_contract is not None and baseline_model_for_contract.model_path:
                 contract_issues.extend(
                     _validate_external_feature_contract(
                         rows=rows,

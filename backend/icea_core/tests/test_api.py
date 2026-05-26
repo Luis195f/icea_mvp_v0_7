@@ -274,6 +274,53 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             ["primary", "baseline"],
         )
 
+    def test_score_endpoint_baseline_without_model_path_does_not_block_external_contract(self):
+        baseline = self.window_artifact
+        baseline.model_path = ""
+        baseline.save(update_fields=["model_path"])
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(baseline.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=self._native_feature_row())],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["baseline_mode"], "counterfactual_nursing_reference")
+        self.assertEqual(body["summary"]["status_counts"].get("contract_mismatch", 0), 0)
+        self.assertNotEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertNotIn("feature_contract", body["results"][0])
+
+    def test_score_endpoint_baseline_with_model_path_validates_external_contract(self):
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(self.window_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=self._native_feature_row())],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["summary"]["status_counts"]["contract_mismatch"], 1)
+        self.assertEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertIsNone(body["results"][0]["score"])
+        self.assertEqual(body["results"][0]["feature_contract"]["validated_model_roles"], ["baseline"])
+
     def test_score_endpoint_reports_model_specific_expected_contract_identifiers(self):
         artifact = self.episode_artifact
         artifact.metrics = {
@@ -308,6 +355,55 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(feature_contract["expected_source_repo"], "Luis195f/custom-handover")
         self.assertEqual(feature_contract["contract_version"], "handover-icea-feature-v2-custom")
         self.assertEqual(feature_contract["source_repo"], "Luis195f/custom-handover")
+
+    def test_score_endpoint_preserves_numeric_zero_row_id_in_contract_failure(self):
+        features = self._native_feature_row()
+        features.pop("nurse_hppd")
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(row_id=0, features=features)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["results"][0]["row_id"], "0")
+        self.assertEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertIsNone(body["results"][0]["score"])
+
+    def test_score_endpoint_numeric_zero_row_id_is_not_replaced_with_fallback(self):
+        valid_row = self._contract_row(row_id=0, features=self._native_feature_row())
+        invalid_row = self._contract_row(
+            row_id="episode:invalid-row",
+            features={"ri_initial": self._native_feature_row()["ri_initial"]},
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [valid_row, invalid_row],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        by_row = {row["row_id"]: row for row in body["results"]}
+        self.assertIn("0", by_row)
+        self.assertNotIn("row:0", by_row)
+        self.assertEqual(by_row["0"]["status"], "contract_mismatch")
+        self.assertIn("scoring_blocked_by_batch_contract_failure", by_row["0"]["warnings"])
 
     def test_score_endpoint_mixed_batch_preserves_valid_row_trace_when_another_row_fails(self):
         valid_row = self._contract_row(
