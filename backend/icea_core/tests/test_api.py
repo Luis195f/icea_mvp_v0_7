@@ -236,6 +236,70 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["results"][0]["status"], "low_feature_coverage")
         self.assertTrue(body["results"][0]["flags"]["low_feature_coverage"])
 
+    def test_score_endpoint_deduplicates_primary_and_baseline_contract_failures_by_row(self):
+        features = {key: self._native_feature_row()[key] for key in ("ri_initial", "proc_count")}
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(self.window_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=features)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body["results"]), 1)
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["summary"]["status_counts"]["contract_mismatch"], 1)
+        self.assertEqual(body["summary"]["status_counts"]["low_feature_coverage"], 0)
+        self.assertEqual(body["results"][0]["row_id"], "episode:handover-fixture-001")
+        self.assertEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertIsNone(body["results"][0]["score"])
+        self.assertEqual(
+            body["results"][0]["feature_contract"]["validated_model_roles"],
+            ["primary", "baseline"],
+        )
+
+    def test_score_endpoint_reports_model_specific_expected_contract_identifiers(self):
+        artifact = self.episode_artifact
+        artifact.metrics = {
+            **(artifact.metrics or {}),
+            "feature_contract": {
+                "contract_version": "handover-icea-feature-v2-custom",
+                "source_repo": "Luis195f/custom-handover",
+            },
+        }
+        artifact.save(update_fields=["metrics"])
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=self._native_feature_row())],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        feature_contract = body["results"][0]["feature_contract"]
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["summary"]["status_counts"]["contract_mismatch"], 1)
+        self.assertEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertIsNone(body["results"][0]["score"])
+        self.assertEqual(feature_contract["expected_contract_version"], "handover-icea-feature-v2-custom")
+        self.assertEqual(feature_contract["expected_source_repo"], "Luis195f/custom-handover")
+        self.assertEqual(feature_contract["contract_version"], "handover-icea-feature-v2-custom")
+        self.assertEqual(feature_contract["source_repo"], "Luis195f/custom-handover")
+
     def test_score_endpoint_requires_auth_when_flag_enabled(self):
         with mock.patch.dict(os.environ, {"ICEA_AUTH_REQUIRED": "true"}, clear=False):
             response = self.client.post(
