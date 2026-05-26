@@ -91,6 +91,14 @@ def _external_feature_payload(row: dict[str, Any]) -> dict[str, Any]:
     return dict(features) if isinstance(features, dict) else dict(row)
 
 
+def _external_row_id(row: Any, idx: int) -> str:
+    if isinstance(row, dict):
+        value = row.get("row_id")
+        if value not in (None, ""):
+            return str(value)
+    return f"row:{idx}"
+
+
 def _normalize_external_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     normalized: list[dict[str, Any]] = []
     for idx, row in enumerate(rows or []):
@@ -144,7 +152,7 @@ def _validate_external_feature_contract(
                     status="contract_mismatch",
                     row_id=f"row:{idx}",
                     warnings=["row_not_object"],
-                    flags={"contract_mismatch": True, "insufficient_evidence": True},
+                    flags={"contract_mismatch": True, "insufficient_evidence": False},
                     coverage=0.0,
                     missing_features=features,
                     missing_critical_features=required_features,
@@ -218,7 +226,7 @@ def _validate_external_feature_contract(
                     flags={
                         "contract_mismatch": status == "contract_mismatch",
                         "low_feature_coverage": status == "low_feature_coverage",
-                        "insufficient_evidence": True,
+                        "insufficient_evidence": status == "insufficient_evidence" or bool(missing_critical),
                         "missing_key_inputs": bool(missing_critical),
                     },
                     coverage=coverage,
@@ -236,6 +244,7 @@ def _validate_external_feature_contract(
 
 def _feature_contract_status_rank(status: str) -> int:
     return {
+        "blocked_by_reference_contract": 4,
         "low_feature_coverage": 1,
         "insufficient_evidence": 2,
         "contract_mismatch": 3,
@@ -292,15 +301,122 @@ def _merge_feature_contract_issues(issues: list[FeatureContractIssue]) -> list[F
     return list(by_row.values())
 
 
+def _feature_contract_issue_payload(issue: FeatureContractIssue) -> dict[str, Any]:
+    return {
+        "contract_version": issue.expected_contract_version,
+        "source_repo": issue.expected_source_repo,
+        "expected_contract_version": issue.expected_contract_version,
+        "expected_source_repo": issue.expected_source_repo,
+        "expected_contract_versions": issue.expected_contract_versions or [issue.expected_contract_version],
+        "expected_source_repos": issue.expected_source_repos or [issue.expected_source_repo],
+        "feature_coverage": issue.coverage,
+        "missing_features": issue.missing_features,
+        "missing_critical_features": issue.missing_critical_features,
+        "validated_model_roles": issue.model_role.split(",") if issue.model_role else [],
+    }
+
+
+def _blocking_issue_from_reference(reference_issues: list[FeatureContractIssue]) -> FeatureContractIssue:
+    merged = _merge_feature_contract_issues(reference_issues)
+    status = "blocked_by_reference_contract"
+    warnings = sorted({"blocked_by_reference_contract", *[warning for issue in merged for warning in issue.warnings]})
+    flags: dict[str, Any] = {
+        "blocked_by_reference_contract": True,
+        "contract_mismatch": any(issue.flags.get("contract_mismatch") for issue in merged),
+        "low_feature_coverage": any(issue.flags.get("low_feature_coverage") for issue in merged),
+        "insufficient_evidence": any(issue.flags.get("insufficient_evidence") for issue in merged),
+        "missing_key_inputs": any(issue.flags.get("missing_key_inputs") for issue in merged),
+    }
+    expected_contract_versions = _merge_unique_preserving_order(
+        [value for issue in merged for value in (issue.expected_contract_versions or [issue.expected_contract_version])]
+    )
+    expected_source_repos = _merge_unique_preserving_order(
+        [value for issue in merged for value in (issue.expected_source_repos or [issue.expected_source_repo])]
+    )
+    model_roles = _merge_unique_preserving_order(
+        [role for issue in merged for role in issue.model_role.split(",") if role]
+    )
+    return FeatureContractIssue(
+        status=status,
+        row_id="reference_rows",
+        warnings=warnings,
+        flags=flags,
+        coverage=min((issue.coverage for issue in merged), default=0.0),
+        missing_features=sorted({feature for issue in merged for feature in issue.missing_features}),
+        missing_critical_features=sorted({feature for issue in merged for feature in issue.missing_critical_features}),
+        expected_contract_version=expected_contract_versions[0] if expected_contract_versions else FEATURE_CONTRACT_VERSION,
+        expected_source_repo=expected_source_repos[0] if expected_source_repos else FEATURE_SOURCE_REPO,
+        expected_contract_versions=expected_contract_versions,
+        expected_source_repos=expected_source_repos,
+        model_role=",".join(model_roles),
+    )
+
+
+def _blocked_row_issue(*, row_id: str, blocking_issue: FeatureContractIssue, status: str, warning: str) -> FeatureContractIssue:
+    flags = {
+        "contract_mismatch": status == "contract_mismatch" or bool(blocking_issue.flags.get("contract_mismatch")),
+        "low_feature_coverage": bool(blocking_issue.flags.get("low_feature_coverage")),
+        "insufficient_evidence": False,
+        "missing_key_inputs": False,
+    }
+    if status == "blocked_by_reference_contract":
+        flags["blocked_by_reference_contract"] = True
+    return FeatureContractIssue(
+        status=status,
+        row_id=row_id,
+        warnings=sorted(set([warning] + blocking_issue.warnings)),
+        flags=flags,
+        coverage=blocking_issue.coverage,
+        missing_features=blocking_issue.missing_features,
+        missing_critical_features=blocking_issue.missing_critical_features,
+        expected_contract_version=blocking_issue.expected_contract_version,
+        expected_source_repo=blocking_issue.expected_source_repo,
+        expected_contract_versions=blocking_issue.expected_contract_versions,
+        expected_source_repos=blocking_issue.expected_source_repos,
+        model_role=blocking_issue.model_role,
+    )
+
+
 def _feature_contract_failure_result(
     *,
     formula: FormulaSelection,
     model_artifact: ModelArtifact,
     grain: str,
+    input_rows: list[dict[str, Any]] | None,
     issues: list[FeatureContractIssue],
+    reference_issues: list[FeatureContractIssue] | None = None,
 ) -> dict[str, Any]:
+    issues = _merge_feature_contract_issues(issues)
+    reference_issues = _merge_feature_contract_issues(reference_issues or [])
+    issues_by_row = {issue.row_id: issue for issue in issues}
+    reference_blocker = _blocking_issue_from_reference(reference_issues) if reference_issues else None
+    batch_blocker = max(issues, key=lambda issue: _feature_contract_status_rank(issue.status)) if issues else None
     rows = []
-    for issue in issues:
+    result_issues: list[FeatureContractIssue] = []
+    for idx, row in enumerate(input_rows or []):
+        row_id = _external_row_id(row, idx)
+        issue = issues_by_row.get(row_id)
+        if issue is None and reference_blocker is not None:
+            issue = _blocked_row_issue(
+                row_id=row_id,
+                blocking_issue=reference_blocker,
+                status="blocked_by_reference_contract",
+                warning="scoring_blocked_by_reference_rows_contract_failure",
+            )
+        elif issue is None and batch_blocker is not None:
+            issue = _blocked_row_issue(
+                row_id=row_id,
+                blocking_issue=batch_blocker,
+                status="contract_mismatch",
+                warning="scoring_blocked_by_batch_contract_failure",
+            )
+        if issue is not None:
+            result_issues.append(issue)
+
+    if not result_issues:
+        result_issues = issues
+
+    for issue in result_issues:
         rows.append(
             {
                 "row_id": issue.row_id,
@@ -311,18 +427,7 @@ def _feature_contract_failure_result(
                 "components": {},
                 "flags": issue.flags,
                 "warnings": issue.warnings,
-                "feature_contract": {
-                    "contract_version": issue.expected_contract_version,
-                    "source_repo": issue.expected_source_repo,
-                    "expected_contract_version": issue.expected_contract_version,
-                    "expected_source_repo": issue.expected_source_repo,
-                    "expected_contract_versions": issue.expected_contract_versions or [issue.expected_contract_version],
-                    "expected_source_repos": issue.expected_source_repos or [issue.expected_source_repo],
-                    "feature_coverage": issue.coverage,
-                    "missing_features": issue.missing_features,
-                    "missing_critical_features": issue.missing_critical_features,
-                    "validated_model_roles": issue.model_role.split(",") if issue.model_role else [],
-                },
+                "feature_contract": _feature_contract_issue_payload(issue),
                 "lineage": {
                     "formula_version": formula.version,
                     "formula_protocol_hash": formula.protocol_hash,
@@ -336,9 +441,12 @@ def _feature_contract_failure_result(
     status_counts = {
         "complete": 0,
         "provisional": 0,
-        "insufficient_evidence": int(sum(1 for issue in issues if issue.status == "insufficient_evidence")),
-        "contract_mismatch": int(sum(1 for issue in issues if issue.status == "contract_mismatch")),
-        "low_feature_coverage": int(sum(1 for issue in issues if issue.status == "low_feature_coverage")),
+        "insufficient_evidence": int(sum(1 for issue in result_issues if issue.status == "insufficient_evidence")),
+        "contract_mismatch": int(sum(1 for issue in result_issues if issue.status == "contract_mismatch")),
+        "low_feature_coverage": int(sum(1 for issue in result_issues if issue.status == "low_feature_coverage")),
+        "blocked_by_reference_contract": int(
+            sum(1 for issue in result_issues if issue.status == "blocked_by_reference_contract")
+        ),
     }
     return {
         "formula_version": formula.version,
@@ -351,10 +459,10 @@ def _feature_contract_failure_result(
             "target": model_artifact.target,
         },
         "summary": {
-            "rows_requested": int(len(issues)),
+            "rows_requested": int(len(input_rows or result_issues)),
             "rows_scored": 0,
             "status_counts": status_counts,
-            "warnings": sorted({warning for issue in issues for warning in issue.warnings}),
+            "warnings": sorted({warning for issue in result_issues for warning in issue.warnings}),
         },
         "results": rows,
     }
@@ -749,9 +857,17 @@ def score_icea_plus(
     if not from_db:
         contract_issues = _validate_external_feature_contract(
             rows=rows,
+            model_artifact=model_artifact,
+            grain=grain,
+            model_role="primary",
+        )
+        reference_contract_issues: list[FeatureContractIssue] = []
+        if reference_rows is not None:
+            reference_contract_issues = _validate_external_feature_contract(
+                rows=reference_rows,
                 model_artifact=model_artifact,
                 grain=grain,
-                model_role="primary",
+                model_role="reference_primary",
             )
         if baseline_model_id:
             baseline_model_for_contract = ModelArtifact.objects.filter(id=baseline_model_id).first()
@@ -764,13 +880,23 @@ def score_icea_plus(
                         model_role="baseline",
                     )
                 )
-        if contract_issues:
-            contract_issues = _merge_feature_contract_issues(contract_issues)
+                if reference_rows is not None:
+                    reference_contract_issues.extend(
+                        _validate_external_feature_contract(
+                            rows=reference_rows,
+                            model_artifact=baseline_model_for_contract,
+                            grain=grain,
+                            model_role="reference_baseline",
+                        )
+                    )
+        if contract_issues or reference_contract_issues:
             return _feature_contract_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
+                input_rows=rows,
                 issues=contract_issues,
+                reference_issues=reference_contract_issues,
             )
 
     selected_df = dataset.selected_df.copy()

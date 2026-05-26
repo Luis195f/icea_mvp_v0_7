@@ -88,12 +88,21 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         row = self.episode_train_df.drop(columns=["delta_ri"]).iloc[0].to_dict()
         return {key: float(value) for key, value in row.items()}
 
-    def _contract_row(self, *, features, missingness_flags=None, source_grain="episode"):
+    def _contract_row(
+        self,
+        *,
+        features,
+        missingness_flags=None,
+        source_grain="episode",
+        row_id="episode:handover-fixture-001",
+        contract_version="handover-icea-feature-v1",
+        source_repo="Luis195f/HANDOVER",
+    ):
         return {
-            "contract_version": "handover-icea-feature-v1",
-            "source_repo": "Luis195f/HANDOVER",
+            "contract_version": contract_version,
+            "source_repo": source_repo,
             "source_grain": source_grain,
-            "row_id": "episode:handover-fixture-001",
+            "row_id": row_id,
             "episode_id": "handover-fixture-001",
             "unit_id": "icu-a",
             "clinical_timestamp": "2026-03-08T15:00:00Z",
@@ -299,6 +308,123 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(feature_contract["expected_source_repo"], "Luis195f/custom-handover")
         self.assertEqual(feature_contract["contract_version"], "handover-icea-feature-v2-custom")
         self.assertEqual(feature_contract["source_repo"], "Luis195f/custom-handover")
+
+    def test_score_endpoint_mixed_batch_preserves_valid_row_trace_when_another_row_fails(self):
+        valid_row = self._contract_row(
+            row_id="episode:valid-row",
+            features=self._native_feature_row(),
+        )
+        invalid_row = self._contract_row(
+            row_id="episode:invalid-row",
+            features={"ri_initial": self._native_feature_row()["ri_initial"]},
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [valid_row, invalid_row],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 2)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(len(body["results"]), 2)
+        by_row = {row["row_id"]: row for row in body["results"]}
+        self.assertEqual(set(by_row), {"episode:valid-row", "episode:invalid-row"})
+        self.assertEqual(by_row["episode:invalid-row"]["status"], "contract_mismatch")
+        self.assertEqual(by_row["episode:valid-row"]["status"], "contract_mismatch")
+        self.assertIn("scoring_blocked_by_batch_contract_failure", by_row["episode:valid-row"]["warnings"])
+        self.assertIsNone(by_row["episode:valid-row"]["score"])
+        self.assertIsNone(by_row["episode:invalid-row"]["score"])
+        self.assertFalse(by_row["episode:valid-row"]["flags"]["insufficient_evidence"])
+        self.assertEqual(body["summary"]["status_counts"]["contract_mismatch"], 2)
+
+    def test_score_endpoint_reference_rows_contract_mismatch_blocks_numeric_scoring(self):
+        valid_row = self._contract_row(features=self._native_feature_row())
+        bad_reference = self._contract_row(
+            row_id="episode:bad-reference",
+            features=self._native_feature_row(),
+            contract_version="handover-icea-feature-v9-bad",
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [valid_row],
+                "reference_rows": [bad_reference],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(len(body["results"]), 1)
+        result = body["results"][0]
+        self.assertEqual(result["row_id"], "episode:handover-fixture-001")
+        self.assertEqual(result["status"], "blocked_by_reference_contract")
+        self.assertIsNone(result["score"])
+        self.assertIsNone(result["raw_score"])
+        self.assertTrue(result["flags"]["blocked_by_reference_contract"])
+        self.assertTrue(result["flags"]["contract_mismatch"])
+        self.assertFalse(result["flags"]["insufficient_evidence"])
+        self.assertIn("scoring_blocked_by_reference_rows_contract_failure", result["warnings"])
+        self.assertEqual(body["summary"]["status_counts"]["blocked_by_reference_contract"], 1)
+
+    def test_score_endpoint_reference_rows_low_feature_coverage_blocks_numeric_scoring(self):
+        artifact = self.episode_artifact
+        artifact.metrics = {
+            **(artifact.metrics or {}),
+            "feature_contract": {
+                "contract_version": "handover-icea-feature-v1",
+                "source_repo": "Luis195f/HANDOVER",
+                "required_features": ["ri_initial"],
+                "min_feature_coverage": 0.95,
+            },
+        }
+        artifact.save(update_fields=["metrics"])
+        valid_row = self._contract_row(features=self._native_feature_row())
+        low_coverage_reference = self._contract_row(
+            row_id="episode:low-coverage-reference",
+            features={"ri_initial": self._native_feature_row()["ri_initial"]},
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [valid_row],
+                "reference_rows": [low_coverage_reference],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(len(body["results"]), 1)
+        result = body["results"][0]
+        self.assertEqual(result["status"], "blocked_by_reference_contract")
+        self.assertIsNone(result["score"])
+        self.assertIsNone(result["raw_score"])
+        self.assertTrue(result["flags"]["blocked_by_reference_contract"])
+        self.assertTrue(result["flags"]["low_feature_coverage"])
+        self.assertFalse(result["flags"]["insufficient_evidence"])
+        self.assertIn("low_feature_coverage", result["warnings"])
+        self.assertEqual(body["summary"]["status_counts"]["blocked_by_reference_contract"], 1)
 
     def test_score_endpoint_requires_auth_when_flag_enabled(self):
         with mock.patch.dict(os.environ, {"ICEA_AUTH_REQUIRED": "true"}, clear=False):
