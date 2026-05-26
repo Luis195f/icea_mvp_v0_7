@@ -82,10 +82,6 @@ def _feature_contract_config(model_artifact: ModelArtifact) -> dict[str, Any]:
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def _contract_rows_present(rows: list[dict[str, Any]] | None) -> bool:
-    return any(isinstance(row, dict) and "features" in row for row in rows or [])
-
-
 def _external_feature_payload(row: dict[str, Any]) -> dict[str, Any]:
     features = row.get("features")
     return dict(features) if isinstance(features, dict) else dict(row)
@@ -187,22 +183,21 @@ def _validate_external_feature_contract(
 
         warnings: list[str] = []
         status = ""
-        if _contract_rows_present(rows):
-            if row.get("contract_version") != expected_contract_version:
-                warnings.append("contract_version_mismatch")
-                status = "contract_mismatch"
-            if row.get("source_repo") != expected_source_repo:
-                warnings.append("source_repo_mismatch")
-                status = "contract_mismatch"
-            if row.get("source_grain") != grain:
-                warnings.append("grain_mismatch")
-                status = "contract_mismatch"
-            if not row.get("clinical_timestamp") or not row.get("recorded_timestamp"):
-                warnings.append("temporal_context_missing")
-                status = "contract_mismatch"
-            if row.get("shadow_mode") is not True or row.get("non_individual_use") is not True:
-                warnings.append("governance_flags_missing")
-                status = "contract_mismatch"
+        if row.get("contract_version") != expected_contract_version:
+            warnings.append("contract_version_mismatch")
+            status = "contract_mismatch"
+        if row.get("source_repo") != expected_source_repo:
+            warnings.append("source_repo_mismatch")
+            status = "contract_mismatch"
+        if row.get("source_grain") != grain:
+            warnings.append("grain_mismatch")
+            status = "contract_mismatch"
+        if not row.get("clinical_timestamp") or not row.get("recorded_timestamp"):
+            warnings.append("temporal_context_missing")
+            status = "contract_mismatch"
+        if row.get("shadow_mode") is not True or row.get("non_individual_use") is not True:
+            warnings.append("governance_flags_missing")
+            status = "contract_mismatch"
 
         if missing_features and not status:
             if not missing_critical and coverage < min_coverage:
