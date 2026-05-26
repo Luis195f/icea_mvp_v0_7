@@ -293,6 +293,54 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertIn("nurse_hppd", body["results"][0]["feature_contract"]["missing_critical_features"])
         self.assertIsNone(body["results"][0]["score"])
 
+    def test_score_endpoint_missingness_string_false_and_zero_do_not_mark_feature_missing(self):
+        features = self._native_feature_row()
+        missingness = {key: False for key in features}
+        missingness["nurse_hppd"] = "false"
+        missingness["ri_initial"] = "0"
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=features, missingness_flags=missingness)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertNotIn("feature_contract", body["results"][0])
+
+    def test_score_endpoint_missingness_string_true_and_one_mark_feature_missing(self):
+        features = self._native_feature_row()
+        missingness = {key: False for key in features}
+        missingness["nurse_hppd"] = "true"
+        missingness["ri_initial"] = "1"
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=features, missingness_flags=missingness)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        result = body["results"][0]
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertIn("nurse_hppd", result["feature_contract"]["missing_critical_features"])
+        self.assertIn("ri_initial", result["feature_contract"]["missing_critical_features"])
+        self.assertIsNone(result["score"])
+
     def test_score_endpoint_blocks_low_feature_coverage(self):
         artifact = self.episode_artifact
         artifact.metrics = {
@@ -358,6 +406,38 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertTrue(result["flags"]["insufficient_evidence"])
         self.assertNotIn("low_feature_coverage", result["warnings"])
         self.assertIn("nurse_hppd", result["feature_contract"]["missing_critical_features"])
+        self.assertIsNone(result["score"])
+
+    def test_score_endpoint_invalid_min_feature_coverage_returns_contract_failure(self):
+        artifact = self.episode_artifact
+        artifact.metrics = {
+            **(artifact.metrics or {}),
+            "feature_contract": {
+                "contract_version": "handover-icea-feature-v1",
+                "source_repo": "Luis195f/HANDOVER",
+                "min_feature_coverage": "not-a-number",
+            },
+        }
+        artifact.save(update_fields=["metrics"])
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=self._native_feature_row())],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        result = body["results"][0]
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(result["status"], "contract_mismatch")
+        self.assertIn("invalid_min_feature_coverage", result["warnings"])
         self.assertIsNone(result["score"])
 
     def test_score_endpoint_deduplicates_primary_and_baseline_contract_failures_by_row(self):

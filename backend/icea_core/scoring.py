@@ -95,6 +95,35 @@ def _external_row_id(row: Any, idx: int) -> str:
     return f"row:{idx}"
 
 
+def _missingness_flag_is_true(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "no", "n"}:
+            return False
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+    return True
+
+
+def _min_feature_coverage_from_config(config: dict[str, Any]) -> tuple[float, str | None]:
+    raw_min_coverage = config.get("min_feature_coverage")
+    if raw_min_coverage is None:
+        return DEFAULT_MIN_FEATURE_COVERAGE, None
+    try:
+        min_coverage = float(raw_min_coverage)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_FEATURE_COVERAGE, "invalid_min_feature_coverage"
+    if not np.isfinite(min_coverage):
+        return DEFAULT_MIN_FEATURE_COVERAGE, "invalid_min_feature_coverage"
+    return min_coverage, None
+
+
 def _normalize_external_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
     normalized: list[dict[str, Any]] = []
     for idx, row in enumerate(rows or []):
@@ -105,7 +134,7 @@ def _normalize_external_rows(rows: list[dict[str, Any]] | None) -> list[dict[str
         flat = dict(features)
         for key, value in missingness.items():
             flag_name = str(key) if str(key).startswith("missing_") else f"missing_{key}"
-            flat[flag_name] = 1.0 if bool(value) else 0.0
+            flat[flag_name] = 1.0 if _missingness_flag_is_true(value) else 0.0
         flat.update(
             {
                 "row_id": _external_row_id(row, idx),
@@ -136,8 +165,7 @@ def _validate_external_feature_contract(
 
     config = _feature_contract_config(model_artifact)
     required_features = [str(feature) for feature in config.get("required_features") or features]
-    raw_min_coverage = config.get("min_feature_coverage")
-    min_coverage = DEFAULT_MIN_FEATURE_COVERAGE if raw_min_coverage is None else float(raw_min_coverage)
+    min_coverage, min_coverage_config_warning = _min_feature_coverage_from_config(config)
     expected_contract_version = str(config.get("contract_version") or FEATURE_CONTRACT_VERSION)
     expected_source_repo = str(config.get("source_repo") or FEATURE_SOURCE_REPO)
     issues: list[FeatureContractIssue] = []
@@ -177,12 +205,15 @@ def _validate_external_feature_contract(
             for feature in required_features
             if feature not in provided
             or features_payload.get(feature) is None
-            or bool(missingness.get(feature))
-            or bool(missingness.get(f"missing_{feature}"))
+            or _missingness_flag_is_true(missingness.get(feature))
+            or _missingness_flag_is_true(missingness.get(f"missing_{feature}"))
         )
 
         warnings: list[str] = []
         status = ""
+        if min_coverage_config_warning:
+            warnings.append(min_coverage_config_warning)
+            status = "contract_mismatch"
         if row.get("contract_version") != expected_contract_version:
             warnings.append("contract_version_mismatch")
             status = "contract_mismatch"
