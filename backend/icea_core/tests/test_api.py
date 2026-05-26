@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
+from pathlib import Path
 from unittest import mock
 
 from django.test import TestCase
@@ -11,6 +13,14 @@ from rest_framework.test import APIClient
 from icea_core.models import ICEAPlusFollowupRecord
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_pipeline.models import NormalizedObservation, NormalizedProcedure
+
+
+CONTRACT_FIXTURE = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "icea" / "handover_icea_feature_contract_v1.json"
+
+
+def load_contract_fixture():
+    with CONTRACT_FIXTURE.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
@@ -74,6 +84,27 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             performed_dt=followup_dt,
         )
 
+    def _native_feature_row(self):
+        row = self.episode_train_df.drop(columns=["delta_ri"]).iloc[0].to_dict()
+        return {key: float(value) for key, value in row.items()}
+
+    def _contract_row(self, *, features, missingness_flags=None, source_grain="episode"):
+        return {
+            "contract_version": "handover-icea-feature-v1",
+            "source_repo": "Luis195f/HANDOVER",
+            "source_grain": source_grain,
+            "row_id": "episode:handover-fixture-001",
+            "episode_id": "handover-fixture-001",
+            "unit_id": "icu-a",
+            "clinical_timestamp": "2026-03-08T15:00:00Z",
+            "recorded_timestamp": "2026-03-08T15:03:00Z",
+            "features": features,
+            "missingness_flags": missingness_flags or {key: False for key in features},
+            "warnings": [],
+            "shadow_mode": True,
+            "non_individual_use": True,
+        }
+
     def test_score_endpoint_returns_breakdown(self):
         response = self.client.post(
             "/api/v1/icea-plus/score/",
@@ -109,6 +140,101 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400)
+
+    def test_score_endpoint_returns_contract_mismatch_for_handover_feature_space(self):
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "window",
+                "from_db": False,
+                "rows": [load_contract_fixture()],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertIsNone(body["results"][0]["score"])
+        self.assertIn("model_feature_space_mismatch", body["results"][0]["warnings"])
+
+    def test_score_endpoint_does_not_zero_fill_missing_model_features(self):
+        features = self._native_feature_row()
+        features.pop("nurse_hppd")
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [{"row_id": "episode:missing-nurse-hppd", **features}],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["results"][0]["status"], "contract_mismatch")
+        self.assertIsNone(body["results"][0]["score"])
+
+    def test_score_endpoint_no_score_if_critical_feature_is_missing(self):
+        features = self._native_feature_row()
+        features["nurse_hppd"] = None
+        missingness = {key: False for key in features}
+        missingness["nurse_hppd"] = True
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=features, missingness_flags=missingness)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["results"][0]["status"], "insufficient_evidence")
+        self.assertIn("nurse_hppd", body["results"][0]["feature_contract"]["missing_critical_features"])
+        self.assertIsNone(body["results"][0]["score"])
+
+    def test_score_endpoint_blocks_low_feature_coverage(self):
+        artifact = self.episode_artifact
+        artifact.metrics = {
+            **(artifact.metrics or {}),
+            "feature_contract": {
+                "contract_version": "handover-icea-feature-v1",
+                "source_repo": "Luis195f/HANDOVER",
+                "required_features": ["ri_initial", "proc_count"],
+                "min_feature_coverage": 0.95,
+            },
+        }
+        artifact.save(update_fields=["metrics"])
+
+        features = {key: self._native_feature_row()[key] for key in ("ri_initial", "proc_count")}
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features=features)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(body["results"][0]["status"], "low_feature_coverage")
+        self.assertTrue(body["results"][0]["flags"]["low_feature_coverage"])
 
     def test_score_endpoint_requires_auth_when_flag_enabled(self):
         with mock.patch.dict(os.environ, {"ICEA_AUTH_REQUIRED": "true"}, clear=False):

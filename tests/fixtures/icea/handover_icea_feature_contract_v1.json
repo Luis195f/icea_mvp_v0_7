@@ -1,0 +1,29 @@
+{
+  "contract_version": "handover-icea-feature-v1",
+  "source_repo": "Luis195f/HANDOVER",
+  "source_grain": "window",
+  "row_id": "window:enc-bridge-001",
+  "episode_id": "enc-bridge-001",
+  "unit_id": "icu-a",
+  "clinical_timestamp": "2026-03-08T15:00:00Z",
+  "recorded_timestamp": "2026-03-08T15:03:00Z",
+  "features": {
+    "age_years": 37.0,
+    "documented_medication_count": 1.0,
+    "documented_procedure_count": 1.0,
+    "severity_weight": 0.2,
+    "structured_completeness_rate": 0.8,
+    "shift_closure_documented": 1.0
+  },
+  "missingness_flags": {
+    "age_years": false,
+    "documented_medication_count": false,
+    "documented_procedure_count": false,
+    "severity_weight": false,
+    "structured_completeness_rate": false,
+    "shift_closure_documented": false
+  },
+  "warnings": [],
+  "shadow_mode": true,
+  "non_individual_use": true
+}

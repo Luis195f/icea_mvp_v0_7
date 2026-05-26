@@ -32,6 +32,10 @@ from icea_core.models import ICEAPlusFormulaVersion, ModelArtifact
 from icea_core.specs import build_default_icea_plus_spec, deep_merge_dict, formula_protocol_hash
 from icea_pipeline.models import CausalRun, EpisodeFeatureRow, EpisodeWindowFeatureRow, NormalizedProcedure
 
+FEATURE_CONTRACT_VERSION = "handover-icea-feature-v1"
+FEATURE_SOURCE_REPO = "Luis195f/HANDOVER"
+DEFAULT_MIN_FEATURE_COVERAGE = 0.95
+
 
 @dataclass
 class FormulaSelection:
@@ -51,10 +55,230 @@ class LoadedDataset:
     grain: str
 
 
+@dataclass
+class FeatureContractIssue:
+    status: str
+    row_id: str
+    warnings: list[str]
+    flags: dict[str, Any]
+    coverage: float
+    missing_features: list[str]
+    missing_critical_features: list[str]
+
+
 
 def _safe_json_hash(obj: Any) -> str:
     dumped = json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str, ensure_ascii=False)
     return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+
+def _feature_contract_config(model_artifact: ModelArtifact) -> dict[str, Any]:
+    raw = (model_artifact.metrics or {}).get("feature_contract")
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _contract_rows_present(rows: list[dict[str, Any]] | None) -> bool:
+    return any(isinstance(row, dict) and "features" in row for row in rows or [])
+
+
+def _external_feature_payload(row: dict[str, Any]) -> dict[str, Any]:
+    features = row.get("features")
+    return dict(features) if isinstance(features, dict) else dict(row)
+
+
+def _normalize_external_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    normalized: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        features = _external_feature_payload(row)
+        missingness = row.get("missingness_flags") if isinstance(row.get("missingness_flags"), dict) else {}
+        flat = dict(features)
+        for key, value in missingness.items():
+            flag_name = str(key) if str(key).startswith("missing_") else f"missing_{key}"
+            flat[flag_name] = 1.0 if bool(value) else 0.0
+        flat.update(
+            {
+                "row_id": str(row.get("row_id") or f"row:{idx}"),
+                "episode_id": row.get("episode_id"),
+                "window_id": row.get("window_id"),
+                "patient_key": row.get("patient_key") or row.get("episode_id") or f"row:{idx}",
+                "unit_id": row.get("unit_id"),
+                "start_dt": row.get("start_dt") or row.get("clinical_timestamp"),
+                "end_dt": row.get("end_dt") or row.get("clinical_timestamp"),
+                "nurse_shares": dict(row.get("nurse_shares") or {}),
+                "nurse_reliability": float(row.get("nurse_reliability") or 0.0),
+            }
+        )
+        normalized.append(flat)
+    return normalized
+
+
+def _validate_external_feature_contract(
+    *,
+    rows: list[dict[str, Any]] | None,
+    model_artifact: ModelArtifact,
+    grain: str,
+) -> list[FeatureContractIssue]:
+    features = [str(feature) for feature in list(model_artifact.features or []) if str(feature)]
+    if not rows:
+        return []
+
+    config = _feature_contract_config(model_artifact)
+    required_features = [str(feature) for feature in config.get("required_features") or features]
+    min_coverage = float(config.get("min_feature_coverage") or DEFAULT_MIN_FEATURE_COVERAGE)
+    expected_contract_version = str(config.get("contract_version") or FEATURE_CONTRACT_VERSION)
+    expected_source_repo = str(config.get("source_repo") or FEATURE_SOURCE_REPO)
+    issues: list[FeatureContractIssue] = []
+
+    for idx, row in enumerate(rows):
+        if not isinstance(row, dict):
+            issues.append(
+                FeatureContractIssue(
+                    status="contract_mismatch",
+                    row_id=f"row:{idx}",
+                    warnings=["row_not_object"],
+                    flags={"contract_mismatch": True, "insufficient_evidence": True},
+                    coverage=0.0,
+                    missing_features=features,
+                    missing_critical_features=required_features,
+                )
+            )
+            continue
+
+        row_id = str(row.get("row_id") or f"row:{idx}")
+        features_payload = row.get("features")
+        if not isinstance(features_payload, dict):
+            features_payload = row
+        provided = set(str(key) for key in features_payload.keys())
+        expected = set(features)
+        missing_features = sorted(expected - provided)
+        present_count = len(expected & provided)
+        coverage = float(present_count / len(expected)) if expected else 0.0
+        missingness = row.get("missingness_flags") if isinstance(row.get("missingness_flags"), dict) else {}
+        missing_critical = sorted(
+            feature
+            for feature in required_features
+            if feature not in provided
+            or features_payload.get(feature) is None
+            or bool(missingness.get(feature))
+            or bool(missingness.get(f"missing_{feature}"))
+        )
+
+        warnings: list[str] = []
+        status = ""
+        if _contract_rows_present(rows):
+            if row.get("contract_version") != expected_contract_version:
+                warnings.append("contract_version_mismatch")
+                status = "contract_mismatch"
+            if row.get("source_repo") != expected_source_repo:
+                warnings.append("source_repo_mismatch")
+                status = "contract_mismatch"
+            if row.get("source_grain") != grain:
+                warnings.append("grain_mismatch")
+                status = "contract_mismatch"
+            if not row.get("clinical_timestamp") or not row.get("recorded_timestamp"):
+                warnings.append("temporal_context_missing")
+                status = "contract_mismatch"
+            if row.get("shadow_mode") is not True or row.get("non_individual_use") is not True:
+                warnings.append("governance_flags_missing")
+                status = "contract_mismatch"
+
+        if missing_features and not status:
+            if not missing_critical and coverage < min_coverage:
+                warnings.append("low_feature_coverage")
+                status = "low_feature_coverage"
+            else:
+                warnings.append("model_feature_space_mismatch")
+                status = "contract_mismatch"
+        if coverage < min_coverage and not status:
+            warnings.append("low_feature_coverage")
+            status = "low_feature_coverage"
+        if missing_critical and not status:
+            warnings.append("missing_critical_features")
+            status = "insufficient_evidence"
+
+        if status:
+            issues.append(
+                FeatureContractIssue(
+                    status=status,
+                    row_id=row_id,
+                    warnings=sorted(set(warnings)),
+                    flags={
+                        "contract_mismatch": status == "contract_mismatch",
+                        "low_feature_coverage": status == "low_feature_coverage",
+                        "insufficient_evidence": True,
+                        "missing_key_inputs": bool(missing_critical),
+                    },
+                    coverage=coverage,
+                    missing_features=missing_features,
+                    missing_critical_features=missing_critical,
+                )
+            )
+    return issues
+
+
+def _feature_contract_failure_result(
+    *,
+    formula: FormulaSelection,
+    model_artifact: ModelArtifact,
+    grain: str,
+    issues: list[FeatureContractIssue],
+) -> dict[str, Any]:
+    rows = []
+    for issue in issues:
+        rows.append(
+            {
+                "row_id": issue.row_id,
+                "grain": grain,
+                "status": issue.status,
+                "score": None,
+                "raw_score": None,
+                "components": {},
+                "flags": issue.flags,
+                "warnings": issue.warnings,
+                "feature_contract": {
+                    "contract_version": FEATURE_CONTRACT_VERSION,
+                    "source_repo": FEATURE_SOURCE_REPO,
+                    "feature_coverage": issue.coverage,
+                    "missing_features": issue.missing_features,
+                    "missing_critical_features": issue.missing_critical_features,
+                },
+                "lineage": {
+                    "formula_version": formula.version,
+                    "formula_protocol_hash": formula.protocol_hash,
+                    "model_id": str(model_artifact.id),
+                    "model_version": str(model_artifact.version),
+                    "source": {"grain": grain, "feature_contract_status": issue.status},
+                },
+            }
+        )
+
+    status_counts = {
+        "complete": 0,
+        "provisional": 0,
+        "insufficient_evidence": int(sum(1 for issue in issues if issue.status == "insufficient_evidence")),
+        "contract_mismatch": int(sum(1 for issue in issues if issue.status == "contract_mismatch")),
+        "low_feature_coverage": int(sum(1 for issue in issues if issue.status == "low_feature_coverage")),
+    }
+    return {
+        "formula_version": formula.version,
+        "formula_protocol_hash": formula.protocol_hash,
+        "formula_source": formula.source,
+        "model": {
+            "id": str(model_artifact.id),
+            "name": model_artifact.name,
+            "version": model_artifact.version,
+            "target": model_artifact.target,
+        },
+        "summary": {
+            "rows_requested": int(len(issues)),
+            "rows_scored": 0,
+            "status_counts": status_counts,
+            "warnings": sorted({warning for issue in issues for warning in issue.warnings}),
+        },
+        "results": rows,
+    }
 
 
 
@@ -196,8 +420,8 @@ def load_dataset(
     date_to: datetime | None = None,
 ) -> LoadedDataset:
     if not from_db:
-        selected = list(rows or [])
-        reference = list(reference_rows or selected)
+        selected = list(_normalize_external_rows(rows) or [])
+        reference = list(_normalize_external_rows(reference_rows) or selected)
         meta_rows = []
         for idx, row in enumerate(selected):
             meta_rows.append(
@@ -443,12 +667,37 @@ def score_icea_plus(
             "formula_protocol_hash": formula.protocol_hash,
         }
 
+    if not from_db:
+        contract_issues = _validate_external_feature_contract(
+            rows=rows,
+            model_artifact=model_artifact,
+            grain=grain,
+        )
+        if baseline_model_id:
+            baseline_model_for_contract = ModelArtifact.objects.filter(id=baseline_model_id).first()
+            if baseline_model_for_contract is not None:
+                contract_issues.extend(
+                    _validate_external_feature_contract(
+                        rows=rows,
+                        model_artifact=baseline_model_for_contract,
+                        grain=grain,
+                    )
+                )
+        if contract_issues:
+            return _feature_contract_failure_result(
+                formula=formula,
+                model_artifact=model_artifact,
+                grain=grain,
+                issues=contract_issues,
+            )
+
     selected_df = dataset.selected_df.copy()
     reference_df = dataset.reference_df.copy()
-    for frame in (selected_df, reference_df):
-        for feature in features:
-            if feature not in frame.columns:
-                frame[feature] = 0.0
+    if from_db:
+        for frame in (selected_df, reference_df):
+            for feature in features:
+                if feature not in frame.columns:
+                    frame[feature] = 0.0
 
     inferred_nurse_cols = infer_nurse_columns(features=features, df=selected_df, supplied=nurse_cols)
     goal, goal_source = (outcome_goal, "request") if outcome_goal else infer_outcome_goal(model_artifact.target, formula.spec.get("outcome_goal_rules"))
@@ -777,5 +1026,4 @@ def score_icea_plus(
         "summary": summary,
         "results": results,
     }
-
 
