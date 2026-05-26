@@ -245,6 +245,42 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["results"][0]["status"], "low_feature_coverage")
         self.assertTrue(body["results"][0]["flags"]["low_feature_coverage"])
 
+    def test_score_endpoint_respects_explicit_zero_min_feature_coverage(self):
+        artifact = self.episode_artifact
+        artifact.metrics = {
+            **(artifact.metrics or {}),
+            "feature_contract": {
+                "contract_version": "handover-icea-feature-v1",
+                "source_repo": "Luis195f/HANDOVER",
+                "required_features": ["nurse_hppd"],
+                "min_feature_coverage": 0.0,
+            },
+        }
+        artifact.save(update_fields=["metrics"])
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(artifact.id),
+                "grain": "episode",
+                "from_db": False,
+                "rows": [self._contract_row(features={"ri_initial": self._native_feature_row()["ri_initial"]})],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        result = body["results"][0]
+        self.assertEqual(body["summary"]["rows_requested"], 1)
+        self.assertEqual(body["summary"]["rows_scored"], 0)
+        self.assertEqual(result["status"], "contract_mismatch")
+        self.assertFalse(result["flags"]["low_feature_coverage"])
+        self.assertTrue(result["flags"]["insufficient_evidence"])
+        self.assertNotIn("low_feature_coverage", result["warnings"])
+        self.assertIn("nurse_hppd", result["feature_contract"]["missing_critical_features"])
+        self.assertIsNone(result["score"])
+
     def test_score_endpoint_deduplicates_primary_and_baseline_contract_failures_by_row(self):
         features = {key: self._native_feature_row()[key] for key in ("ri_initial", "proc_count")}
         response = self.client.post(

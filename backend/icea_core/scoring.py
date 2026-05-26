@@ -140,7 +140,8 @@ def _validate_external_feature_contract(
 
     config = _feature_contract_config(model_artifact)
     required_features = [str(feature) for feature in config.get("required_features") or features]
-    min_coverage = float(config.get("min_feature_coverage") or DEFAULT_MIN_FEATURE_COVERAGE)
+    raw_min_coverage = config.get("min_feature_coverage")
+    min_coverage = DEFAULT_MIN_FEATURE_COVERAGE if raw_min_coverage is None else float(raw_min_coverage)
     expected_contract_version = str(config.get("contract_version") or FEATURE_CONTRACT_VERSION)
     expected_source_repo = str(config.get("source_repo") or FEATURE_SOURCE_REPO)
     issues: list[FeatureContractIssue] = []
