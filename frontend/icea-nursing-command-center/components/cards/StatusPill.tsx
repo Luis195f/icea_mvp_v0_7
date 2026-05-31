@@ -4,8 +4,9 @@ import React from "react";
 import { Tag } from "@carbon/react";
 
 type Kind = "ok" | "warning" | "danger" | "info" | "neutral";
+type StatusTagType = "green" | "red" | "blue" | "cool-gray";
 
-const map: Record<Kind, { type: React.ComponentProps<typeof Tag>["type"] }> = {
+const map: Record<Kind, { type: StatusTagType }> = {
   ok: { type: "green" },
   warning: { type: "red" }, // Carbon doesn't have amber; red is high-contrast.
   danger: { type: "red" },
