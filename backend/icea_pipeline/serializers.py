@@ -45,7 +45,7 @@ class RiskAssessmentWritebackSerializer(serializers.Serializer):
     episode_id = serializers.IntegerField(required=True)
     model_id = serializers.UUIDField(required=True)
     writeback = serializers.BooleanField(required=False, default=False)
-    # v0.5.5: return conformal interval (if available) for individual-risk guarantees.
+    # Retained for compatibility; response suppresses individual prediction values in shadow mode.
     conformal = serializers.BooleanField(required=False, default=False)
 
 

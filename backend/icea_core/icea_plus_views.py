@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db.models import Model
+from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from icea_core.aggregation import aggregate_scored_rows
+from icea_core.aggregation import (
+    MIN_AGGREGATE_EPISODES,
+    MIN_STAFF_FOR_STAFF_DIMENSION,
+    aggregate_scored_rows,
+    governance_export_metadata,
+    redacted_low_support_summary,
+)
 from icea_core.followup import (
     build_patient_summary,
     build_summary_writeback,
@@ -57,6 +64,29 @@ def _validate_serializer(ser, *, request_type: str):
     )
 
 
+def _safe_aggregate_grouping(requested_group_by: str, *, grain: str) -> tuple[str, list[str], bool]:
+    requested = str(requested_group_by or "unit")
+    warnings: list[str] = []
+    require_staff_count = False
+    if requested in {"patient", "episode", "window", "nurse"}:
+        warnings.append(f"{requested}_grouping_individualizable_falling_back_to_unit")
+        return "unit", warnings, False
+    if requested == "team":
+        warnings.append("team_not_explicitly_modeled_falling_back_to_unit")
+        return "unit", warnings, False
+    if requested == "shift":
+        if str(grain or "episode") != "window":
+            warnings.append("shift_aggregation_requires_window_grain_falling_back_to_unit")
+            return "unit", warnings, False
+        require_staff_count = True
+        warnings.append("shift_aggregation_deidentified_to_unit_date_bucket")
+        return "shift", warnings, require_staff_count
+    if requested not in {"unit", "date"}:
+        warnings.append("unsupported_grouping_falling_back_to_unit")
+        return "unit", warnings, False
+    return requested, warnings, require_staff_count
+
+
 def _get_object_or_typed_error(model_cls: type[Model], **lookup):
     try:
         return model_cls.objects.get(**lookup)
@@ -93,7 +123,7 @@ class ICEAPlusExplainView(APIView):
                 "limitations": [
                     "Pilot-grade/calibration-ready formula: institutional calibration and external validation remain pending.",
                     "ICEA+ does not replace clinical judgment and must not be used as automatic labor sanctioning evidence.",
-                    "Causal contribution degrades to provisional when the current repo cannot support a defensible effect estimate.",
+                    "Causal component is exploratory, aggregate-only, and degrades to provisional when support is not defensible.",
                     "Uncertainty and process-quality components only use signals that exist in the current repo state.",
                 ],
                 "flags": {
@@ -202,38 +232,45 @@ class ICEAPlusAggregateView(APIView):
         formula = select_formula((params.get("formula_version") or "").strip() or None)
         min_rel = float((((formula.spec).get("aggregation") or {}).get("min_nurse_reliability")) or 0.60)
 
-        if requested_group_by == "team":
-            effective_group_by = "unit"
-            warnings.append("team_not_explicitly_modeled_falling_back_to_unit")
-
-        if requested_group_by == "shift" and str(params.get("grain") or "episode") != "window":
-            effective_group_by = "unit"
-            warnings.append("shift_aggregation_requires_window_grain_falling_back_to_unit")
-
+        effective_group_by, grouping_warnings, require_staff_count = _safe_aggregate_grouping(
+            requested_group_by,
+            grain=str(params.get("grain") or "episode"),
+        )
+        warnings.extend(grouping_warnings)
         if requested_group_by == "nurse":
-            nurse_rows = []
-            for row in rows:
-                shares = dict((row.get("aggregation") or {}).get("nurse_shares") or {})
-                reliability = float((row.get("aggregation") or {}).get("nurse_reliability") or 0.0)
-                if reliability < min_rel or not shares:
-                    continue
-                for nurse_id, share in shares.items():
-                    clone = dict(row)
-                    clone["aggregation"] = dict(row.get("aggregation") or {})
-                    clone["aggregation"]["effective_exposure_share"] = float(share)
-                    clone["patient_key"] = str(nurse_id)
-                    nurse_rows.append(clone)
-            if not nurse_rows:
-                effective_group_by = "unit"
-                warnings.append("nurse_level_attribution_unreliable_falling_back_to_unit")
-            else:
-                rows = nurse_rows
-                effective_group_by = "patient"
+            warnings.append("nurse_level_attribution_not_exported_or_ranked")
+        if requested_group_by in {"team", "shift", "nurse"} and min_rel > 0:
+            warnings.append("staff_dimension_requires_minimum_support_and_non_punitive_use")
 
         aggregated = aggregate_scored_rows(
             rows=rows,
             group_by=effective_group_by,
             epsilon=float((((formula.spec).get("aggregation") or {}).get("epsilon")) or 1e-6),
+            enforce_suppression=True,
+            min_cell_count=MIN_AGGREGATE_EPISODES,
+            min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
+            require_staff_count=require_staff_count,
+        )
+        suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
+        response_summary = score_result.get("summary")
+        if suppressed_cells > 0:
+            response_summary = redacted_low_support_summary(
+                suppressed_cells=suppressed_cells,
+                aggregation_level=effective_group_by,
+                min_cell_count=MIN_AGGREGATE_EPISODES,
+                min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
+            )
+        export_metadata = governance_export_metadata(
+            aggregation_level=effective_group_by,
+            min_cell_count=MIN_AGGREGATE_EPISODES,
+            suppressed_cells=suppressed_cells,
+            formula_version=score_result["formula_version"],
+            model_lineage={
+                "model_id": str(artifact.id),
+                "model_version": artifact.version,
+                "formula_protocol_hash": score_result["formula_protocol_hash"],
+            },
+            generated_at=timezone.now().isoformat(),
         )
 
         append_audit_event(
@@ -255,7 +292,12 @@ class ICEAPlusAggregateView(APIView):
                 "effective_group_by": effective_group_by,
                 "grain": str(params.get("grain") or "episode"),
                 "warnings": warnings,
-                "summary": score_result.get("summary"),
+                "summary": response_summary,
+                "governance": export_metadata,
+                "non_individual_use": True,
+                "shadow_mode": True,
+                "suppressed_cells": suppressed_cells,
+                "min_cell_count": MIN_AGGREGATE_EPISODES,
                 "results": aggregated,
             }
         )

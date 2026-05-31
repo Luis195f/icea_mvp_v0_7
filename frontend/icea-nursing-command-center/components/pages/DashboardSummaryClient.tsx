@@ -35,8 +35,8 @@ export function DashboardSummaryClient() {
       <div className="grid gap-4 md:grid-cols-4">
         <MetricCard title="Episodios" value={String(data.episodes)} subtitle="Cohorte ingestada" status={<StatusPill kind="info" label="Estructura" />} />
         <MetricCard title="Recursos FHIR" value={String(data.raw_fhir)} subtitle="Crudo validado" status={<StatusPill kind="neutral" label="Proceso" />} />
-        <MetricCard title="Filas dataset" value={String(data.dataset_rows)} subtitle="Analítica" status={<StatusPill kind="info" label="Proceso" />} />
-        <MetricCard title="Modelo" value={modelLabel} subtitle="Último artefacto" status={<StatusPill kind="ok" label="Resultado" />} />
+        <MetricCard title="Filas dataset" value={String(data.dataset_rows)} subtitle="Base agregada" status={<StatusPill kind="info" label="Shadow" />} />
+        <MetricCard title="Modelo" value={modelLabel} subtitle="Último artefacto no operativo" status={<StatusPill kind="neutral" label="Validación" />} />
       </div>
 
       <div className="grid gap-4 md:grid-cols-3">
@@ -72,8 +72,8 @@ export function DashboardSummaryClient() {
             <Tag type="green" size="sm">Turnos</Tag>
           </div>
           <dl className="mt-3 grid grid-cols-2 gap-2 text-sm">
-            <div><dt className="text-neutral-600">Shifts roster</dt><dd className="font-medium">{data.roster_shifts}</dd></div>
-            <div><dt className="text-neutral-600">Causal latest</dt><dd className="font-medium">{data.latest_causal?.id ? "OK" : "—"}</dd></div>
+            <div><dt className="text-neutral-600">Turnos roster</dt><dd className="font-medium">{data.roster_shifts}</dd></div>
+            <div><dt className="text-neutral-600">Causal agregado</dt><dd className="font-medium">{data.latest_causal?.id ? "OK" : "—"}</dd></div>
             <div><dt className="text-neutral-600">Compute latest</dt><dd className="font-medium">{data.latest_compute?.id ? "OK" : "—"}</dd></div>
             <div><dt className="text-neutral-600">Entrenamiento</dt><dd className="font-medium">{data.latest_training?.id ? "OK" : "—"}</dd></div>
           </dl>

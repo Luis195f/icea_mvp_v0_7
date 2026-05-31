@@ -28,8 +28,8 @@ Current limitation:
 - `failed`: a rescore attempt failed and the initial score remains preserved
 - `pending_followup`: no usable new follow-up evidence has been observed yet
 
-The original score is always retained. The enriched score is stored as a linked
-second computation and never silently overwrites the initial result.
+The original row result is always retained for traceability. The enriched result is stored as a linked
+second computation and never silently overwrites the initial result. Patient/episode writeback summaries suppress numeric score fields and expose state/lineage only.
 
 ## Sufficiency rule
 
@@ -85,6 +85,7 @@ Each longitudinal record persists:
 
 - Follow-up rescoring remains observational and exploratory.
 - It does not establish causal proof for an individual patient or professional.
+- It must not be used for patient, nurse, team, or small-shift ranking.
 - `non_individual_use` remains enabled by default.
 - When individual-level nurse attribution is weak, the APIs emit warnings and HANDOVER
   should degrade to team/unit interpretation.

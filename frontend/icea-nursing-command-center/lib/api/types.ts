@@ -112,8 +112,12 @@ export const ConformalPredictResponseSchema = z.object({
   episode_id: z.number().int(),
   model_id: z.string(),
   target: z.string(),
-  pred: z.number(),
+  pred: z.number().nullable(),
   interval: z.record(z.string(), z.unknown()),
+  status: z.string().optional(),
+  score_suppressed: z.boolean().optional(),
+  non_individual_use: z.boolean().optional(),
+  shadow_mode: z.boolean().optional(),
 });
 export type ConformalPredictResponse = z.infer<typeof ConformalPredictResponseSchema>;
 

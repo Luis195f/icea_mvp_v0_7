@@ -67,7 +67,7 @@ export default function ShapForceLikeChart({ contributions, baseValue, predictio
 
       <div className="text-xs text-neutral-700">
         <span className="font-medium">Interpretación:</span> valores &gt; 0 aumentan el resultado; valores &lt; 0 lo reducen.
-        ICEA resume el bloque enfermería como contribución marginal global.
+        ICEA resume una señal agregada de enfermería en validación; no es atribución causal individual.
       </div>
     </div>
   );

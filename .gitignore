@@ -169,3 +169,6 @@ exports/
 
 docs/*.docx
 docs/*.docx
+
+# Local/generated ICEA model artifacts
+backend/models/

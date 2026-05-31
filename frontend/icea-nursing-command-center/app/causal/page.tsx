@@ -99,7 +99,7 @@ export default function CausalPage() {
       <div>
         <h1 className="text-2xl font-semibold">Causal & gemelo digital</h1>
         <p className="text-sm text-neutral-700">
-          Descubrimiento de DAG (best-effort), análisis causal y simulación contrafactual.
+          Componentes causales exploratorios para cohortes agregadas; no prueban contribución individual ni justifican sanciones.
         </p>
       </div>
 
@@ -135,16 +135,16 @@ export default function CausalPage() {
         </Tile>
 
         <Tile className="p-4 rounded-icea space-y-3">
-          <h2 className="text-lg font-semibold">DAG interactivo (D3)</h2>
+          <h2 className="text-lg font-semibold">DAG exploratorio (D3)</h2>
           <p className="text-sm text-neutral-700">
-            Herramienta de razonamiento causal (no depender de color; nodos etiquetados).
+            Herramienta de hipótesis agregadas; requiere protocolo, case-mix y revisión humana.
           </p>
           <CausalDag edges={dagEdges.length > 0 ? dagEdges : [["unit_staffing_level","patient_acuity"],["patient_acuity","length_of_stay"]]} />
         </Tile>
       </div>
 
       <Tile className="p-4 rounded-icea space-y-3">
-        <h2 className="text-lg font-semibold">Ejecutar análisis causal</h2>
+        <h2 className="text-lg font-semibold">Ejecutar análisis causal agregado</h2>
         <TextArea
           id="spec"
           labelText="spec (JSON)"
@@ -170,7 +170,7 @@ export default function CausalPage() {
       ) : null}
 
       <Tile className="p-4 rounded-icea space-y-3">
-        <h2 className="text-lg font-semibold">Simulación (gemelo digital)</h2>
+        <h2 className="text-lg font-semibold">Simulación agregada</h2>
         <TextArea
           id="sim"
           labelText="payload (JSON)"
@@ -191,8 +191,8 @@ export default function CausalPage() {
       <Accordion>
         <AccordionItem title="Nota metodológica">
           <p className="text-sm text-neutral-800">
-            El DAG formaliza hipótesis causales (confusores, mediadores). El sistema prioriza trazabilidad y gobernanza:
-            cada ejecución genera eventos de auditoría y puede requerir decisión HITL en despliegues ENS Alto.
+            El DAG formaliza hipótesis causales de cohorte. No convierte SHAP, efectos causales ni simulaciones en evidencia
+            individual accionable; cada ejecución requiere trazabilidad, case-mix y gobernanza.
           </p>
         </AccordionItem>
       </Accordion>

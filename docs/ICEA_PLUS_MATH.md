@@ -5,8 +5,8 @@
 ICEA+ v1 is the official composite index implemented in the current Django/Django REST architecture of this repo.
 It extends the legacy ICEA signal without replacing it:
 
-- `ICEA` = predictive nursing attribution, mainly SHAP/group nursing.
-- `ICEA+` = composite pilot-grade index integrating benefit, predictive nursing attribution, causal effect when defensible, process quality, and uncertainty penalties.
+- `ICEA` = predictive nursing attribution signal, mainly SHAP/group nursing, for aggregate shadow analytics.
+- `ICEA+` = composite pilot-grade index integrating benefit, predictive nursing attribution, causal effect when defensible, process quality, and uncertainty penalties for governed aggregate monitoring.
 
 ICEA+ v1 is:
 
@@ -16,10 +16,11 @@ ICEA+ v1 is:
 - not a claim of universal clinical validity
 - not a substitute for clinical judgment
 - not suitable as automatic labor-sanction evidence
+- not a patient, nurse, team, or small-shift ranking system
 
 ## Why the legacy ICEA alone is not enough
 
-SHAP alone measures explanatory contribution inside a predictive model. That is useful, but it does not by itself provide:
+SHAP alone measures explanatory contribution inside a predictive model. It is not proof of individual clinical or professional contribution. That signal can be useful for aggregate model governance, but it does not by itself provide:
 
 - case-mix adjusted benefit vs expected baseline
 - causal effect estimates
@@ -182,20 +183,17 @@ ICEA+ v1 emits explicit safeguards such as:
 
 ## Aggregation
 
-For actor/team/unit-level aggregation:
+For governed aggregate cells:
 
 `ICEA+_(n,group) = sum_i (s_i * e_i,n * ICEA+_i) / sum_i (s_i * e_i,n + epsilon)`
 
 Current repo support:
 
-- patient/episode
-- window
 - date
 - unit
-- shift using window boundaries
-- nurse when `NormalizedProcedure.performer_actor_ref` provides reliable performer evidence
+- deidentified shift-like unit/date buckets only when support thresholds are met
 
-If nurse-level attribution is not reliable, aggregation degrades explicitly to unit-level output.
+Individualizable groupings (`patient`, `episode`, `window`, `nurse`) are not exportable dashboard groupings. `team` and unsupported staff dimensions degrade to `unit`. Cells with fewer than 10 episodes, or fewer than 5 staff when a staff-sensitive dimension is requested, return `suppressed_low_support` with `score=null`.
 
 ## Severity and exposure shares
 
@@ -217,13 +215,13 @@ Each ICEA+ score row includes lineage fields such as:
 
 ## Correct interpretation
 
-ICEA+ v1 should be read as a composite operational-research score of nursing-adjusted contribution under the current data and assumptions.
-It is not a universal clinical truth statement.
+ICEA+ v1 should be read as a composite operational-research signal for aggregate shadow monitoring under the current data and assumptions.
+It is not a universal clinical truth statement, an individual causal attribution, or a labor performance metric.
 
 Reasonable uses:
 
 - pilot benchmarking
-- unit/shift monitoring with warnings visible
+- unit/date monitoring with warnings, support counts, and suppression visible
 - input to dashboards and handover views with provisional vs complete distinction
 - audit trails for institutional calibration work
 
@@ -232,13 +230,14 @@ Incorrect uses:
 - claiming definitive causality from the score alone
 - using the score without uncertainty/warning context
 - using it as the sole basis for staff punishment or credentialing decisions
+- ranking patients, nurses, teams, or small shifts
 
 ## HANDOVER integration contract
 
-HANDOVER should consume ICEA+ through the REST layer and display:
+Dashboard/service consumers should consume ICEA+ through the REST layer and display:
 
-- patient/episode score
-- aggregate unit/shift score
+- patient/episode state and lineage without numeric score
+- aggregate unit/date score only when support thresholds are met
 - compact component breakdown (`B`, `A`, `C`, `Q`, `U`)
-- `complete` vs `provisional` vs `insufficient_evidence`
+- `scored_aggregate` vs `provisional` vs `insufficient_evidence` vs `suppressed_low_support`
 - warnings such as high uncertainty or low support

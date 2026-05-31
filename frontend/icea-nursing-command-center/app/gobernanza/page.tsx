@@ -96,7 +96,7 @@ export default function GobernanzaPage() {
               <thead className="bg-neutral-50">
                 <tr>
                   <th className="p-2 text-left">Fecha</th>
-                  <th className="p-2 text-left">Episodio</th>
+                  <th className="p-2 text-left">Identificador</th>
                   <th className="p-2 text-left">Modelo</th>
                   <th className="p-2 text-left">OK</th>
                 </tr>
@@ -105,7 +105,7 @@ export default function GobernanzaPage() {
                 {(writebacks.data ?? []).map((w) => (
                   <tr key={w.id} className="border-t border-neutral-100">
                     <td className="p-2">{String(w.created_at)}</td>
-                    <td className="p-2">{w.episode_id ?? "—"}</td>
+                    <td className="p-2">Suprimido</td>
                     <td className="p-2 font-mono">{w.model_id.slice(0, 8)}…</td>
                     <td className="p-2">{w.ok ? "Sí" : "No"}</td>
                   </tr>
