@@ -10,7 +10,7 @@ export default function CentroMandoPage() {
       <div className="flex flex-col gap-2">
         <h1 className="text-2xl font-semibold">Centro de mando de Enfermería (ICEA+)</h1>
         <p className="text-sm text-neutral-700">
-          Vista operacional para alta agudeza: **estructura**, **proceso** y **resultado** (Donabedian).
+          Shadow mode agregado para estructura, proceso y resultado (Donabedian), con case-mix y supresión por bajo soporte.
         </p>
       </div>
 
@@ -19,20 +19,20 @@ export default function CentroMandoPage() {
       <div className="grid gap-4 md:grid-cols-3">
         <MetricCard
           title="Riesgo clínico (on-demand)"
-          value="Interactivo"
-          subtitle="Predicción conformal + explicación tipo SHAP en «Pacientes»."
-          status={<StatusPill kind="info" label="Acción clínica" />}
+          value="Suprimido"
+          subtitle="No se expone score operativo por paciente/episodio."
+          status={<StatusPill kind="warning" label="Shadow mode" />}
         />
         <MetricCard
           title="Déficit de dotación proyectado"
           value="—"
-          subtitle="Cargar roster CSV para activar proyección por turno."
+          subtitle="Solo monitorización agregada con umbrales mínimos."
           status={<StatusPill kind="warning" label="Pendiente de datos" />}
         />
         <MetricCard
           title="Ahorro económico estimado"
           value="—"
-          subtitle="Se habilita con pipeline + modelos calibrados en producción."
+          subtitle="No accionable sin validación, case-mix y revisión de gobernanza."
           status={<StatusPill kind="neutral" label="Piloto" />}
         />
       </div>
@@ -42,10 +42,10 @@ export default function CentroMandoPage() {
           <div>
             <h2 className="text-lg font-semibold">Tendencia operativa (demo)</h2>
             <p className="text-sm text-neutral-700">
-              Ejemplo de telemetría longitudinal. Sustituir por KPIs reales (LOS, readmisiones, boarding, etc.).
+              Ejemplo de telemetría longitudinal agregada; no permite drill-down individual ni ranking laboral.
             </p>
           </div>
-          <StatusPill kind="ok" label="Comprensión en 5 segundos" />
+          <StatusPill kind="ok" label="Agregado" />
         </div>
         <div className="mt-4">
           <TrendLineChart />

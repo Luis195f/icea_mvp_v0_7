@@ -12,7 +12,7 @@ from rest_framework.test import APIClient
 
 from icea_core.models import ICEAPlusFollowupRecord
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
-from icea_pipeline.models import NormalizedObservation, NormalizedProcedure
+from icea_pipeline.models import FHIRWritebackRecord, NormalizedObservation, NormalizedProcedure
 
 
 CONTRACT_FIXTURE = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "icea" / "handover_icea_feature_contract_v1.json"
@@ -740,14 +740,38 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             {"model_id": str(self.episode_artifact.id), "group_by": "unit", "grain": "episode"},
         )
         self.assertEqual(response_unit.status_code, 200)
-        self.assertTrue(response_unit.json()["results"])
+        unit_body = response_unit.json()
+        self.assertTrue(unit_body["results"])
+        self.assertTrue(unit_body["non_individual_use"])
+        self.assertTrue(unit_body["shadow_mode"])
+        self.assertIn("governance", unit_body)
 
         response_shift = self.client.get(
             "/api/v1/icea-plus/aggregate/",
             {"model_id": str(self.window_artifact.id), "group_by": "shift", "grain": "window"},
         )
         self.assertEqual(response_shift.status_code, 200)
-        self.assertTrue(response_shift.json()["results"])
+        shift_body = response_shift.json()
+        self.assertTrue(shift_body["results"])
+        self.assertIn("shift_aggregation_deidentified_to_unit_date_bucket", shift_body["warnings"])
+
+    def test_aggregate_endpoint_blocks_individualizable_grouping_and_suppresses_low_support(self):
+        response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "group_by": "patient",
+                "grain": "episode",
+                "date_from": self.episodes[0].admission_date.isoformat(),
+                "date_to": (self.episodes[0].admission_date + timezone.timedelta(seconds=1)).isoformat(),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["effective_group_by"], "unit")
+        self.assertIn("patient_grouping_individualizable_falling_back_to_unit", body["warnings"])
+        self.assertEqual(body["results"][0]["status"], "suppressed_low_support")
+        self.assertIsNone(body["results"][0]["score"])
 
     def test_calibrate_endpoint_is_admin_only(self):
         with mock.patch.dict(
@@ -829,7 +853,10 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             body["enriched_score"]["lineage"]["formula_protocol_hash"],
         )
         self.assertNotEqual(body["comparison"]["initial_computation_id"], body["comparison"]["enriched_computation_id"])
-        self.assertEqual(body["initial_score"]["score"], initial_row["score"])
+        self.assertIsNone(body["initial_score"]["score"])
+        self.assertEqual(body["initial_score"]["status"], "shadow_only")
+        self.assertTrue(body["initial_score"]["score_suppressed"])
+        self.assertEqual(body["initial_score"]["source_status"], initial_row["status"])
 
         record = ICEAPlusFollowupRecord.objects.get(episode=episode, model=self.episode_artifact)
         self.assertIsNotNone(record.initial_computation)
@@ -876,6 +903,9 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(patient_body["score_states"]["current"], "enriched_followup")
         self.assertIn("timestamps", patient_body)
         self.assertIn("evidence", patient_body)
+        self.assertIsNone(patient_body["current_score"]["score"])
+        self.assertTrue(patient_body["current_score"]["score_suppressed"])
+        self.assertFalse(patient_body["operational_score"])
 
     def test_writeback_summary_is_stable_and_degrades_team_to_unit(self):
         episode = self.episodes[3]
@@ -903,7 +933,24 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertIn("team_writeback_not_explicitly_modeled_falling_back_to_unit", body["warnings"])
         self.assertIn("status_counts", body)
         self.assertTrue(body["non_individual_use"])
+        self.assertIn("governance", body)
         self.assertIn("results", body)
+        for row in body["results"]:
+            if row["status"] == "suppressed_low_support":
+                self.assertIsNone(row["score"])
+
+    def test_writeback_list_suppresses_episode_identifier_for_export_surface(self):
+        FHIRWritebackRecord.objects.create(
+            episode=self.episodes[0],
+            model_id=self.episode_artifact.id,
+            payload={"resourceType": "RiskAssessment"},
+        )
+        response = self.client.get("/api/v1/fhir/writeback/list/")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body)
+        self.assertIsNone(body[0]["episode_id"])
+        self.assertTrue(body[0]["identifier_suppressed"])
 
     def test_followup_endpoint_requires_auth_when_flag_enabled(self):
         episode = self.episodes[4]

@@ -9,7 +9,12 @@ from typing import Any
 from django.db.models import Max
 from django.utils import timezone
 
-from icea_core.aggregation import aggregate_scored_rows
+from icea_core.aggregation import (
+    MIN_AGGREGATE_EPISODES,
+    MIN_STAFF_FOR_STAFF_DIMENSION,
+    aggregate_scored_rows,
+    governance_export_metadata,
+)
 from icea_core.models import (
     ICEAPlusComputation,
     ICEAPlusFollowupRecord,
@@ -141,12 +146,20 @@ def _compact_score_payload(result_row: dict[str, Any], *, scored_at: datetime | 
         return {}
     lineage = dict(result_row.get("lineage") or {})
     return {
-        "status": result_row.get("status"),
-        "score": result_row.get("score"),
-        "raw_score": result_row.get("raw_score"),
+        "status": "shadow_only",
+        "source_status": result_row.get("status"),
+        "score": None,
+        "raw_score": None,
+        "score_suppressed": True,
+        "suppression_reason": "patient_episode_score_is_not_operational_or_exportable",
         "confidence": dict(result_row.get("confidence") or {}),
         "warnings": list(result_row.get("warnings") or []),
-        "flags": dict(result_row.get("flags") or {}),
+        "flags": {
+            **dict(result_row.get("flags") or {}),
+            "non_individual_use": True,
+            "shadow_mode": True,
+            "operational_score": False,
+        },
         "lineage": {
             "formula_version": lineage.get("formula_version"),
             "formula_protocol_hash": lineage.get("formula_protocol_hash"),
@@ -663,19 +676,11 @@ def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
     current_score = enriched_score if record.followup_status == "enriched_followup" and enriched_score else initial_score
 
     delta_score = None
-    if initial_score and enriched_score:
-        try:
-            initial_value = initial_score.get("score")
-            enriched_value = enriched_score.get("score")
-            if initial_value is not None and enriched_value is not None:
-                delta_score = float(enriched_value) - float(initial_value)
-        except Exception:
-            delta_score = None
 
     return {
         "record_id": str(record.id),
         "episode_id": int(record.episode_id),
-        "patient_key": str(record.patient_key or record.episode_id),
+        "patient_key": None,
         "unit_id": int(record.episode.unit_id),
         "score_states": {
             "initial": record.initial_state,
@@ -687,6 +692,8 @@ def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
         "current_score": current_score,
         "comparison": {
             "delta_score": delta_score,
+            "score_suppressed": True,
+            "suppression_reason": "patient_episode_score_is_not_operational_or_exportable",
             "initial_computation_id": str(record.initial_computation_id or ""),
             "enriched_computation_id": str(record.enriched_computation_id or ""),
         },
@@ -714,6 +721,7 @@ def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
         "non_individual_use": bool(record.non_individual_use),
         "shadow_mode": bool(record.shadow_mode),
         "exploratory_only": bool(record.exploratory_only),
+        "operational_score": False,
     }
 
 
@@ -747,13 +755,19 @@ def build_summary_writeback(
     if requested_group_by == "shift":
         effective_group_by = "unit"
         warnings.append("shift_writeback_requires_window_followup_falling_back_to_unit")
+    require_staff_count = requested_group_by in {"team", "shift"}
 
     rows = [_effective_result(record) for record in qs if _effective_result(record)]
     aggregated = aggregate_scored_rows(
         rows=rows,
         group_by=effective_group_by,
         epsilon=float((((formula.spec or {}).get("aggregation") or {}).get("epsilon")) or 1e-6),
+        enforce_suppression=True,
+        min_cell_count=MIN_AGGREGATE_EPISODES,
+        min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
+        require_staff_count=require_staff_count,
     )
+    suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
     state_counts = {
         "immediate_provisional": int(qs.filter(initial_state="immediate_provisional").count()),
         "complete": int(qs.filter(current_state="complete").count()),
@@ -773,7 +787,21 @@ def build_summary_writeback(
             "records": int(qs.count()),
             "group_count": int(len(aggregated)),
             "coverage": float(sum((row.get("coverage") or 0.0) for row in aggregated) / len(aggregated)) if aggregated else 0.0,
+            "suppressed_cells": suppressed_cells,
+            "min_cell_count": MIN_AGGREGATE_EPISODES,
         },
+        "governance": governance_export_metadata(
+            aggregation_level=effective_group_by,
+            min_cell_count=MIN_AGGREGATE_EPISODES,
+            suppressed_cells=suppressed_cells,
+            formula_version=formula.version,
+            model_lineage={
+                "model_id": str(artifact.id),
+                "model_version": artifact.version,
+                "formula_protocol_hash": formula.protocol_hash,
+            },
+            generated_at=timezone.now().isoformat(),
+        ),
         "warnings": sorted(set(warnings + [warning for record in qs for warning in (record.warnings or [])])),
         "results": aggregated,
         "non_individual_use": True,

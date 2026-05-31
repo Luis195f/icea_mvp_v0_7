@@ -4,7 +4,7 @@
 
 ### POST `/api/v1/icea-plus/score/`
 
-Scores episode- or window-grain rows and returns the ICEA+ breakdown.
+Scores episode- or window-grain rows for governed research/service flows. Dashboard and export surfaces must treat row-level output as shadow-only and must not expose it as an operational patient, episode, nurse, team, or shift score.
 
 #### Request patterns
 
@@ -148,6 +148,8 @@ Aggregates ICEA+ scores over DB-backed cohorts.
 - `causal_run_id=<uuid>` optional
 - `outcome_goal=higher_is_better|lower_is_better|adverse_event` optional
 
+Individualizable groupings (`patient`, `episode`, `window`, `nurse`) are accepted only for backward-compatible query parsing and fall back to `unit`. `team` also falls back to `unit`. `shift` is deidentified to a unit/date bucket and is suppressed unless support thresholds are met.
+
 #### Response sketch
 
 ```json
@@ -155,12 +157,34 @@ Aggregates ICEA+ scores over DB-backed cohorts.
   "formula_version": "icea_plus_v1",
   "requested_group_by": "nurse",
   "effective_group_by": "unit",
-  "warnings": ["nurse_level_attribution_unreliable_falling_back_to_unit"],
+  "warnings": ["nurse_grouping_individualizable_falling_back_to_unit"],
+  "non_individual_use": true,
+  "shadow_mode": true,
+  "governance": {
+    "non_individual_use": true,
+    "shadow_mode": true,
+    "aggregation_level": "unit",
+    "min_cell_count": 10,
+    "suppressed_cells": 0,
+    "formula_version": "icea_plus_v1",
+    "model_lineage": {"model_id": "<uuid>", "model_version": "v0.7.4"},
+    "generated_at": "<iso-datetime>"
+  },
   "results": [
     {
       "group": "1",
+      "status": "scored_aggregate",
       "score": 64.2,
       "n_observations": 24,
+      "support": {
+        "n_observations": 24,
+        "n_episodes": 24,
+        "n_staff": 0,
+        "min_cell_count": 10,
+        "min_staff_count": 5,
+        "suppressed": false,
+        "suppression_reasons": []
+      },
       "coverage": 0.92,
       "provisional_fraction": 0.25,
       "complete_fraction": 0.67,
@@ -231,7 +255,7 @@ Required query params:
 
 ### GET `/api/v1/icea-plus/writeback/patient/`
 
-Stable patient/episode JSON summary for HANDOVER.
+Stable episode JSON summary for service follow-up. It is shadow-only: `initial_score`, `enriched_score`, and `current_score` retain lineage and state but suppress `score` and `raw_score`.
 
 Required query params:
 
@@ -240,7 +264,7 @@ Required query params:
 
 ### GET `/api/v1/icea-plus/writeback/summary/`
 
-Stable aggregate JSON summary for HANDOVER.
+Stable aggregate JSON summary. Results include support counts, suppression flags, and governance metadata and are the only exportable ICEA+ writeback surface.
 
 Required query params:
 
@@ -258,14 +282,19 @@ Optional query params:
 
 ### Backward compatibility
 
-- Legacy `POST /api/v1/icea/compute/` remains unchanged.
+- Legacy `POST /api/v1/icea/compute/` remains for compatibility, but the command-center UI does not expose it as a patient/episode score.
 - Existing causal endpoints remain unchanged.
 - ICEA+ is additive to the current API surface.
 
 ### Provisional vs insufficient evidence
 
+- `scored_aggregate`: aggregate cell with enough support and only scoreable rows contributing to numeric output.
 - `provisional`: non-causal required components are available, causal is not.
 - `insufficient_evidence`: required components are missing, so the API refuses to fabricate a final score.
+- `contract_mismatch`: feature contract validation failed; no score is emitted.
+- `low_feature_coverage`: required coverage threshold failed; no score is emitted.
+- `suppressed_low_support`: aggregate cell failed `n_episodes >= 10` or staff support checks; no score is emitted.
+- `shadow_only`: individual patient/episode prediction surfaces are non-operational and suppress score fields.
 
 ### Longitudinal follow-up states
 
@@ -327,21 +356,20 @@ Lineage in the response identifies:
 
 ## Intended HANDOVER consumption
 
-HANDOVER should consume these endpoints as follows:
+Dashboard/service consumers should consume these endpoints as follows:
 
-- patient/episode detail cards: `POST /score/`
-- unit/shift summary widgets: `GET /aggregate/`
+- patient/episode detail cards: state and lineage only; no numeric operational score
+- unit/date summary widgets: `GET /aggregate/`
 - tooltip/help and governance detail: `GET /explain/`
 - longitudinal episode status: `GET /followup/status/`
-- stable patient summary contract: `GET /writeback/patient/`
-- stable unit/team summary contract: `GET /writeback/summary/`
+- stable episode follow-up contract: `GET /writeback/patient/` with scores suppressed
+- stable aggregate summary contract: `GET /writeback/summary/`
 
 The UI should always surface:
 
-- status: `complete` / `provisional` / `insufficient_evidence`
+- status: `scored_aggregate` / `provisional` / `insufficient_evidence` / `contract_mismatch` / `low_feature_coverage` / `suppressed_low_support` / `shadow_only`
 - warnings
-- condensed component breakdown
-- confidence label/value
+- support counts and suppression flags
 - `non_individual_use`
 - `shadow_mode`
 - `exploratory_only`

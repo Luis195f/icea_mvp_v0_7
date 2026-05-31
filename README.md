@@ -9,14 +9,14 @@ Core principles:
 - **Semantic interoperability**: resources are normalized into canonical tables for analytics.
 - **Model governance**: models are versioned artifacts (features + target + metrics).
 - **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
-- **Bedside-grade uncertainty**: optional conformal prediction intervals for individual risk.
+- **Shadow aggregate governance**: ICEA/ICEA+ dashboard and export surfaces are aggregate-only, non-punitive, and suppress low-support cells.
 - **Fail-closed high-risk APIs**: scoring, causal, writeback, federated, simulate, policy learning, and fairness require explicit auth/RBAC and feature flags outside dev-only mode.
 
 ## ICEA vs ICEA+
 
 - **ICEA** remains the legacy predictive nursing attribution based mainly on SHAP/group nursing.
 - **ICEA+ v1** is the new official mathematical core exposed in this repo through dedicated endpoints and versioned governance.
-- **ICEA+** integrates risk-adjusted benefit, relative nursing attribution, causal effect when defensible, process quality, and explicit uncertainty penalties.
+- **ICEA+** integrates risk-adjusted benefit, relative nursing attribution, causal effect when defensible, process quality, and explicit uncertainty penalties for aggregate shadow monitoring; it is not an individual causal or labor-performance score.
 
 See:
 - `docs/ICEA_PLUS_MATH.md`
@@ -123,6 +123,8 @@ Follow-up/writeback notes:
 - the original score is preserved and linked to any later enriched score
 - HANDOVER should consume the JSON writeback summary contract, not infer individual staff rankings
 - `team` and `shift` writeback summaries degrade to `unit` when the repo lacks reliable longitudinal support at that granularity
+- dashboard/export outputs use `n_episodes >= 10`; staff-sensitive cells require `n_staff >= 5`
+- patient/episode writeback fields suppress numeric `score`/`raw_score` in shadow mode
 
 ### 5) Run causal analysis (trial-emulation)
 
@@ -195,13 +197,15 @@ Set `ICEA_FEDERATED_SECRET` to require signed updates (header: `X-ICEA-FED-SIG`)
 
 `GET /api/v1/fhir/quality/episode/?episode_id=1`
 
-### 7) Conformal prediction (individual-risk interval)
+### 7) Conformal prediction (shadow-only interval)
 
 `POST /api/v1/predict/conformal/`
 
 ```json
 { "episode_id": 1, "model_id": "<uuid>", "alpha": 0.05 }
 ```
+
+The endpoint is retained for governed research compatibility, but command-center surfaces suppress the individual prediction value and must not use it as an operational patient score.
 
 ---
 

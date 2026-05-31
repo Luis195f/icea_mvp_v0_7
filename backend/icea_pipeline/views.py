@@ -1714,7 +1714,6 @@ class RiskAssessmentWritebackView(APIView):
         model_id = payload["model_id"]
         episode_id = int(payload["episode_id"])
         writeback = bool(payload.get("writeback"))
-        want_conformal = bool(payload.get("conformal"))
 
         artifact = ModelArtifact.objects.get(id=model_id)
         ep = PatientEpisode.objects.get(id=episode_id)
@@ -1732,41 +1731,16 @@ class RiskAssessmentWritebackView(APIView):
         if not fr:
             return Response({"detail": "No EpisodeFeatureRow. Run build-dataset first.", "episode_id": ep.id}, status=400)
 
-        df = pd.DataFrame([dict(fr.features)])
-        features = artifact.features
-
-        nurse_cols = [c for c in features if c.startswith("nurse_") or c.startswith("nic_")]
-        for extra in ["nurse_proc_count_det", "nurse_proc_count", "nurse_hppd", "nurse_skillmix"]:
-            if extra in df.columns and extra not in nurse_cols:
-                nurse_cols.append(extra)
-        if not nurse_cols:
-            nurse_cols = ["nurse_proc_count_det", "nurse_hppd", "nurse_skillmix", "nurse_proc_count"]
-
-        engine = ICEAEngine(artifact.model_path, background=df, shap_mode="interventional")
-        icea_res = engine.compute(df, features=features, nurse_cols=nurse_cols, group_map={"nursing": nurse_cols})
-
-        pred = float(icea_res.predictions[0])
-        base = float(icea_res.base_value)
-        icea = float(icea_res.icea[0])
-
-        conformal = None
-        if want_conformal or (str(os.environ.get("ICEA_CONFORMAL_ENABLED", "false")).lower() in {"1", "true", "yes"}):
-            try:
-                from icea_core.conformal import conformal_interval_from_metrics
-
-                conformal = conformal_interval_from_metrics(pred, artifact.metrics)
-            except Exception:
-                conformal = None
-
         now = timezone.now().isoformat()
-        note_txt = f"ICEA+ v0.7.0 | pred={pred:.3f} base={base:.3f} ICEA(nursing)={icea:.3f}"
-        if conformal:
-            note_txt += f" | conformal95=[{conformal['lower']:.3f},{conformal['upper']:.3f}]"
+        note_txt = (
+            "ICEA+ shadow-only aggregate analytics. Individual RiskAssessment score is suppressed; "
+            "not for operational, punitive, staffing, or causal individual use."
+        )
 
         risk_assessment = {
             "resourceType": "RiskAssessment",
-            "status": "final",
-            "method": {"text": "ICEA+ v0.5"},
+            "status": "entered-in-error",
+            "method": {"text": "ICEA+ shadow mode: individual score suppressed"},
             "subject": {"reference": f"Patient/{ep.fhir_patient_id}"},
             "encounter": {"reference": f"Encounter/{ep.fhir_encounter_id}"},
             "occurrenceDateTime": now,
@@ -1784,16 +1758,13 @@ class RiskAssessmentWritebackView(APIView):
         if writeback and (str(os.environ.get("FHIR_WRITEBACK_ENABLED", "false")).lower() in {"1", "true", "yes"}):
             rec.attempted_writeback = True
             rec.save(update_fields=["attempted_writeback"])
-            try:
-                client = FHIRClient()
-                resp = client.post("RiskAssessment", risk_assessment)
-                rec.writeback_ok = True
-                rec.writeback_response = resp
-                rec.save(update_fields=["writeback_ok", "writeback_response"])
-            except Exception as e:
-                rec.writeback_ok = False
-                rec.writeback_response = {"error": str(e)}
-                rec.save(update_fields=["writeback_ok", "writeback_response"])
+            rec.writeback_ok = False
+            rec.writeback_response = {
+                "detail": "individual_riskassessment_writeback_blocked_in_shadow_mode",
+                "non_individual_use": True,
+                "shadow_mode": True,
+            }
+            rec.save(update_fields=["writeback_ok", "writeback_response"])
 
         append_audit_event(event_type="fhir_writeback", payload={"record_id": str(rec.id), "episode_id": int(ep.id), "model_id": str(artifact.id), "attempted": bool(rec.attempted_writeback), "ok": bool(rec.writeback_ok)}, context="fhir/writeback/riskassessment")
 
@@ -1802,8 +1773,19 @@ class RiskAssessmentWritebackView(APIView):
                 "record_id": str(rec.id),
                 "episode_id": ep.id,
                 "writeback_ok": bool(rec.writeback_ok),
-                "prediction": {"target": artifact.target, "pred": pred, "base": base, "icea_nursing": icea},
-                "conformal": conformal,
+                "status": "shadow_only",
+                "prediction": {
+                    "target": artifact.target,
+                    "pred": None,
+                    "base": None,
+                    "icea_nursing": None,
+                    "score_suppressed": True,
+                    "suppression_reason": "individual_riskassessment_writeback_blocked_in_shadow_mode",
+                },
+                "conformal": None,
+                "non_individual_use": True,
+                "shadow_mode": True,
+                "operational_score": False,
             }
         )
 
@@ -1829,39 +1811,11 @@ class ConformalPredictView(APIView):
         if not fr:
             return Response({"detail": "No EpisodeFeatureRow. Run build-dataset first.", "episode_id": ep.id}, status=400)
 
-        df = pd.DataFrame([dict(fr.features)])
-        features = artifact.features
-
-        nurse_cols = [c for c in features if c.startswith("nurse_") or c.startswith("nic_")]
-        for extra in ["nurse_proc_count_det", "nurse_proc_count", "nurse_hppd", "nurse_skillmix"]:
-            if extra in df.columns and extra not in nurse_cols:
-                nurse_cols.append(extra)
-        if not nurse_cols:
-            nurse_cols = ["nurse_proc_count_det", "nurse_hppd", "nurse_skillmix", "nurse_proc_count"]
-
-        engine = ICEAEngine(artifact.model_path, background=df, shap_mode="interventional")
-        icea_res = engine.compute(df, features=features, nurse_cols=nurse_cols, group_map={"nursing": nurse_cols})
-        pred = float(icea_res.predictions[0])
-
-        from icea_core.conformal import conformal_interval_from_metrics
-
-        interval = conformal_interval_from_metrics(pred, artifact.metrics)
-        if not interval:
-            return Response(
-                {
-                    "detail": "conformal_not_available_for_model",
-                    "model_id": str(artifact.id),
-                    "target": artifact.target,
-                    "pred": pred,
-                },
-                status=501,
-            )
-
-        # For now, alpha is fixed at training time (default 0.05). If client asks
-        # for a different alpha, return a clear note.
-        alpha_req = float(p.get("alpha") or 0.05)
-        if abs(alpha_req - float(interval.get("alpha") or 0.05)) > 1e-9:
-            interval["note"] = "alpha is fixed by stored calibration; retrain to change alpha"
+        interval = {
+            "status": "shadow_only",
+            "score_suppressed": True,
+            "suppression_reason": "individual_prediction_not_operational_or_exportable",
+        }
 
         append_audit_event(
             event_type="conformal_predict",
@@ -1869,7 +1823,21 @@ class ConformalPredictView(APIView):
             context="predict/conformal",
         )
 
-        return Response({"episode_id": int(ep.id), "model_id": str(artifact.id), "target": artifact.target, "pred": pred, "interval": interval})
+        return Response(
+            {
+                "episode_id": int(ep.id),
+                "model_id": str(artifact.id),
+                "target": artifact.target,
+                "pred": None,
+                "interval": interval,
+                "status": "shadow_only",
+                "score_suppressed": True,
+                "suppression_reason": "individual_prediction_not_operational_or_exportable",
+                "non_individual_use": True,
+                "shadow_mode": True,
+                "operational_score": False,
+            }
+        )
 
 
 class WritebackListView(APIView):
@@ -1883,10 +1851,13 @@ class WritebackListView(APIView):
                 {
                     "id": str(r.id),
                     "created_at": r.created_at,
-                    "episode_id": r.episode_id,
+                    "episode_id": None,
                     "model_id": str(r.model_id),
                     "attempted": bool(r.attempted_writeback),
                     "ok": bool(r.writeback_ok),
+                    "non_individual_use": True,
+                    "shadow_mode": True,
+                    "identifier_suppressed": True,
                 }
             )
         return Response(out)

@@ -6,9 +6,7 @@ The stable contract exposed here is JSON summary output for HANDOVER.
 It reuses the governed ICEA+ kernel and the repo's existing persistence, but it does
 not introduce new FHIR writeback semantics for enriched follow-up.
 
-Existing FHIR RiskAssessment writeback remains available in the pipeline for the
-legacy path. The new longitudinal HANDOVER contract should consume the summary JSON
-endpoints below.
+Individual FHIR RiskAssessment writeback is blocked in shadow mode and does not emit an operational score. The exportable contract is the governed aggregate JSON surface below.
 
 ## Endpoints
 
@@ -35,7 +33,7 @@ The patient/episode contract includes:
 - `shadow_mode`
 - `exploratory_only`
 
-This contract is designed for HANDOVER episode cards and patient/episode drill-downs.
+This contract is limited to follow-up state and lineage for a requested episode. `initial_score`, `enriched_score`, and `current_score` suppress `score` and `raw_score`; they are not operational patient metrics.
 
 ## Aggregate payload
 
@@ -47,6 +45,7 @@ The aggregate summary contract includes:
 - `formula_protocol_hash`
 - `status_counts`
 - `summary`
+- `governance`
 - `warnings`
 - `results`
 - `non_individual_use`
@@ -64,6 +63,9 @@ Current degradation rules:
 - `team` falls back to `unit`
 - `shift` falls back to `unit` in the current repo state because the longitudinal
   enriched contract is episode-level
+- cells with fewer than 10 episodes are returned as `suppressed_low_support`
+- staff-sensitive cells require at least 5 staff members when that dimension is requested
+- suppression never uses zero-fill
 
 ## HANDOVER guidance
 
@@ -73,10 +75,11 @@ HANDOVER should consume this contract as prudent analytic support:
 - surface warnings, support and stale state
 - retain provenance in the UI
 - avoid individual nurse ranking or punitive interpretation
+- do not display a patient/episode numeric score from this contract
 
 ## Methodological limits
 
 - enriched rescoring remains observational and exploratory
 - no individual labor ranking is exposed by default
 - no causal claims are added by this writeback layer
-- no new FHIR writeback path is claimed beyond the repo's existing RiskAssessment support
+- no individual RiskAssessment score is written in shadow mode

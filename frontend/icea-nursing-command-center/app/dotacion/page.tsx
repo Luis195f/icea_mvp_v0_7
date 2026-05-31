@@ -31,7 +31,7 @@ export default function DotacionPage() {
       <div>
         <h1 className="text-2xl font-semibold">Dotación & turnos</h1>
         <p className="text-sm text-neutral-700">
-          Subida de roster (CSV) para habilitar proyección de dotación ajustada por agudeza y simulación causal.
+          Subida de roster (CSV) para monitorización agregada ajustada por agudeza; sin ranking por turno pequeño o profesional.
         </p>
       </div>
 
@@ -41,7 +41,7 @@ export default function DotacionPage() {
         {data ? (
           <div className="grid gap-4 md:grid-cols-3">
             <div>
-              <div className="text-xs text-neutral-600">Roster shifts</div>
+              <div className="text-xs text-neutral-600">Turnos roster</div>
               <div className="text-xl font-semibold">{data.roster_shifts}</div>
             </div>
             <div>
