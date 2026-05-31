@@ -35,6 +35,14 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         spec["outcome_status"] = outcome_status
         return spec
 
+    def _valid_target_trial(self):
+        return {
+            "time_zero": "window_start",
+            "follow_up": {"horizon_hours": 12, "anchor": "time_zero", "mode": "fixed"},
+            "eligibility": [],
+            "estimand": "ATE",
+        }
+
     def test_missing_index_time_blocks_defensible_scoring(self):
         issue = validate_temporal_row({"delta_ri": 1.0}, feature_names=["ri_initial"], target="delta_ri")
         self.assertIsNotNone(issue)
@@ -79,6 +87,43 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         )
         self.assertEqual(issue.status, "temporal_leakage_blocked")
 
+    def test_none_outcome_target_is_insufficient_outcome_evidence(self):
+        issue = validate_temporal_row(
+            {"delta_ri": None, "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", issue.warnings)
+        self.assertTrue(issue.flags["insufficient_outcome_evidence"])
+
+    def test_float_nan_outcome_target_is_insufficient_outcome_evidence(self):
+        issue = validate_temporal_row(
+            {"delta_ri": float("nan"), "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", issue.warnings)
+        self.assertFalse(issue.flags["temporal_spec_valid"])
+
+    def test_numpy_nan_outcome_target_is_insufficient_outcome_evidence_when_available(self):
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy unavailable")
+
+        issue = validate_temporal_row(
+            {"delta_ri": np.nan, "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", issue.warnings)
+
     def test_case_mix_spec_absent_is_marked_insufficient(self):
         issue = validate_case_mix_spec(None)
         self.assertEqual(issue.status, "case_mix_insufficient")
@@ -96,6 +141,43 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         self.assertIsNotNone(issue)
         self.assertFalse(issue.flags["causal_available"])
         self.assertIn("confounder_post_treatment:proc_count", issue.warnings)
+
+    def test_valid_target_trial_without_dag_edge_proves_treatment_outcome_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "target_trial": self._valid_target_trial(),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_empty_target_trial_without_dag_edge_is_blocked(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "target_trial": {},
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_missing_target_trial_temporal_spec_and_dag_edge_still_blocks(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "dag_edges": [],
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
 
     def test_unit_aggregation_without_case_mix_warns_not_comparable(self):
         rows = []

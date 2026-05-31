@@ -60,7 +60,7 @@ def _iso(dt: datetime | None) -> str | None:
 def _parse_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value
-    if not value:
+    if _is_missing_value(value, empty_string=True):
         return None
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -70,6 +70,47 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
+
+
+def _is_missing_value(value: Any, *, empty_string: bool = False) -> bool:
+    if value is None:
+        return True
+    if empty_string and isinstance(value, str) and not value.strip():
+        return True
+    try:
+        missing = pd.isna(value)
+    except Exception:
+        return False
+    if isinstance(missing, bool):
+        return missing
+    try:
+        return bool(missing)
+    except Exception:
+        return False
+
+
+def _target_trial_has_temporal_order(spec: dict[str, Any]) -> bool:
+    tt = spec.get("target_trial")
+    if not isinstance(tt, dict) or not tt:
+        return False
+    time_zero = tt.get("time_zero")
+    follow_up = tt.get("follow_up")
+    if _is_missing_value(time_zero, empty_string=True) or not isinstance(follow_up, dict):
+        return False
+    horizon = follow_up.get("horizon_hours")
+    try:
+        horizon_hours = int(horizon)
+    except Exception:
+        return False
+    if horizon_hours <= 0:
+        return False
+    anchor = str(follow_up.get("anchor") or "").strip()
+    mode = str(follow_up.get("mode") or "").strip()
+    if anchor not in {"time_zero", "window_start"}:
+        return False
+    if mode not in {"fixed", "shift"}:
+        return False
+    return True
 
 
 def build_temporal_spec(
@@ -175,8 +216,8 @@ def validate_temporal_row(row: dict[str, Any], *, feature_names: list[str] | Non
         flags["insufficient_outcome_evidence"] = True
         return TemporalIssue("insufficient_outcome_evidence", sorted(set(warnings)), flags)
 
-    if target and row.get(target) is None:
-        warnings.append("target_missing_no_outcome_fabrication")
+    if target and (target not in row or _is_missing_value(row.get(target))):
+        warnings.append("missing_outcome_target")
         flags["insufficient_outcome_evidence"] = True
         return TemporalIssue("insufficient_outcome_evidence", sorted(set(warnings)), flags)
 
@@ -245,13 +286,17 @@ def validate_causal_temporal_order(spec: dict[str, Any]) -> TemporalIssue | None
     confounders = [str(c) for c in (spec.get("confounders") or []) if str(c)]
     dag_edges = [list(edge) for edge in (spec.get("dag_edges") or []) if isinstance(edge, (list, tuple)) and len(edge) == 2]
     post_treatment = {str(v) for v in (spec.get("post_treatment_variables") or []) if str(v)}
+    has_temporal_spec = bool(spec.get("temporal_spec"))
+    target_trial_has_order = _target_trial_has_temporal_order(spec)
 
     warnings: list[str] = []
     if not treatment:
         warnings.append("treatment_missing")
-    if not spec.get("target_trial") and not spec.get("temporal_spec"):
+    if spec.get("target_trial") and not target_trial_has_order:
+        warnings.append("target_trial_temporal_order_not_demonstrated")
+    if not target_trial_has_order and not has_temporal_spec:
         warnings.append("insufficient_temporal_spec")
-    if [treatment, outcome] not in dag_edges and not spec.get("temporal_spec"):
+    if [treatment, outcome] not in dag_edges and not has_temporal_spec and not target_trial_has_order:
         warnings.append("treatment_outcome_temporal_order_not_proven")
     for c in confounders:
         if c in post_treatment or [treatment, c] in dag_edges:
@@ -266,4 +311,3 @@ def validate_causal_temporal_order(spec: dict[str, Any]) -> TemporalIssue | None
             {"causal_available": False, "leakage_blocked": True},
         )
     return None
-
