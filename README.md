@@ -23,6 +23,7 @@ See:
 - `docs/ICEA_PLUS_API.md`
 - `docs/ICEA_PLUS_FOLLOWUP.md`
 - `docs/ICEA_PLUS_WRITEBACK.md`
+- `docs/CI.md`
 
 ---
 

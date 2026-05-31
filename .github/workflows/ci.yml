@@ -1,0 +1,181 @@
+name: ci
+
+on:
+  push:
+    branches: ["main", "fix/icea-ci-cd-risk-gates"]
+  pull_request:
+    branches: ["main"]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Hygiene and artifact guardrails
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Whitespace check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            git diff --check "$PR_BASE_SHA"...HEAD
+          elif [[ -n "$BEFORE_SHA" && "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]]; then
+            git diff --check "$BEFORE_SHA"...HEAD
+          else
+            git diff-tree --check --no-commit-id --root -r HEAD
+          fi
+
+      - name: Block generated artifacts and real env files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          disallowed_paths="$(git ls-files | grep -E '(^|/)backend/models/.*\.json$|(^|/)db\.sqlite3$|\.sqlite3$|(^|/)__pycache__/|(^|/)\.pytest_cache/|(^|/)node_modules/|(^|/)coverage\.xml$|(^|/)\.coverage($|\.)' || true)"
+          if [[ -n "$disallowed_paths" ]]; then
+            echo "Generated/runtime artifacts must not be versioned:"
+            echo "$disallowed_paths"
+            exit 1
+          fi
+
+          real_env_files="$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -Ev '(^|/)\.env(\.[A-Za-z0-9_-]+)?\.example$' || true)"
+          if [[ -n "$real_env_files" ]]; then
+            echo "Real .env files must not be versioned; commit only .env*.example templates:"
+            echo "$real_env_files"
+            exit 1
+          fi
+
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DJANGO_DEBUG: "false"
+      DATABASE_URL: sqlite:////tmp/icea-ci.sqlite3
+      SECRET_KEY: ci-test-secret-not-for-production
+      ICEA_DEV_ALLOW_INSECURE: "false"
+      ICEA_AUTH_REQUIRED: "true"
+      ICEA_RBAC_ENFORCE: "true"
+      ICEA_SECURE_MODE: "false"
+      ICEA_CAUSAL_DISCOVER_ENABLED: "false"
+      ICEA_SIMULATE_ENABLED: "false"
+      ICEA_FEDERATED_ENABLED: "false"
+      ICEA_POLICY_LEARNING_ENABLED: "false"
+      ICEA_FAIRNESS_ENABLED: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: Run Django backend tests
+        working-directory: backend
+        run: python manage.py test -v 2
+
+  backend-risk-regression-tests:
+    name: Backend risk regression tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DJANGO_DEBUG: "false"
+      DATABASE_URL: sqlite:////tmp/icea-risk-ci.sqlite3
+      SECRET_KEY: ci-risk-test-secret-not-for-production
+      ICEA_DEV_ALLOW_INSECURE: "false"
+      ICEA_AUTH_REQUIRED: "true"
+      ICEA_RBAC_ENFORCE: "true"
+      ICEA_SECURE_MODE: "false"
+      ICEA_CAUSAL_DISCOVER_ENABLED: "false"
+      ICEA_SIMULATE_ENABLED: "false"
+      ICEA_FEDERATED_ENABLED: "false"
+      ICEA_POLICY_LEARNING_ENABLED: "false"
+      ICEA_FAIRNESS_ENABLED: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: Run high-risk guardrail tests
+        working-directory: backend
+        run: |
+          python manage.py test -v 2 \
+            icea_core.tests.test_security_fail_closed \
+            icea_core.tests.test_aggregation \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_returns_contract_mismatch_for_handover_feature_space \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_does_not_zero_fill_missing_model_features \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_blocks_low_feature_coverage \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_reference_rows_contract_mismatch_blocks_numeric_scoring \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_reference_rows_low_feature_coverage_blocks_numeric_scoring \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_aggregate_endpoint_blocks_individualizable_grouping_and_suppresses_low_support \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_aggregate_endpoint_redacts_numeric_summary_when_any_cell_is_suppressed \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_followup_without_new_evidence_does_not_create_enriched_score \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_followup_status_and_patient_writeback_contract \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_writeback_summary_is_stable_and_degrades_team_to_unit \
+            icea_core.tests.test_api.ICEAPlusAPITests.test_writeback_list_suppresses_episode_identifier_for_export_surface
+
+  frontend-check:
+    name: Frontend build and lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend/icea-nursing-command-center
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/icea-nursing-command-center/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint --if-present
+
+      - name: Test frontend if script exists
+        run: npm run test --if-present
+
+      - name: Build frontend
+        run: npm run build --if-present

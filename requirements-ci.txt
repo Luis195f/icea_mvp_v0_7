@@ -1,0 +1,38 @@
+# Minimal dependency set for GitHub Actions backend test gates.
+#
+# Keep production/runtime dependency pins in requirements.txt. This file exists
+# because the backend URL configuration imports the causal layer during
+# manage.py test discovery, while requirements.txt pins econml==0.15.0 next to
+# scikit-learn==1.5.1. CI uses the same scikit-learn pin and the already
+# Windows-tested econml line from requirements.win.txt to keep the gate
+# installable without pulling optional enterprise extras.
+
+Django==5.2.11
+
+# API
+djangorestframework==3.16.1
+django-cors-headers==4.9.0
+drf-spectacular==0.29.0
+
+# Auth / crypto
+djangorestframework-simplejwt==5.5.1
+cryptography==46.0.5
+
+# Settings/cache helpers imported by Django settings
+dj-database-url==2.2.0
+django-redis==5.4.0
+redis==5.0.8
+
+# Data / ML imports required by the backend test surface
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+xgboost==2.1.1
+shap==0.46.0
+econml==0.16.0
+
+# Networking and validation
+requests==2.32.3
+pydantic==2.7.4
+
+python-dateutil==2.9.0.post0
