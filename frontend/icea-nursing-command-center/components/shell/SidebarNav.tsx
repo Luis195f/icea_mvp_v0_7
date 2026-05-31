@@ -3,7 +3,7 @@
 import React from "react";
 import Link from "next/link";
 import { SideNav, SideNavItems, SideNavLink } from "@carbon/react";
-import { Dashboard, UserFollow, UserRole, Settings, Analyze } from "@carbon/icons-react";
+import { Dashboard, UserFollow, UserRole, Settings, DataAnalytics } from "@carbon/icons-react";
 import { usePathname } from "next/navigation";
 
 type Props = {
@@ -33,7 +33,7 @@ export default function SidebarNav({ roles }: Props) {
           Dotación & turnos
         </SideNavLink>
 
-        <SideNavLink as={Link} href="/causal" aria-current={active("/causal")} renderIcon={Analyze}>
+        <SideNavLink as={Link} href="/causal" aria-current={active("/causal")} renderIcon={DataAnalytics}>
           Causal & gemelo digital
         </SideNavLink>
 
