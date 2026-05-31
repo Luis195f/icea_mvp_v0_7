@@ -219,12 +219,16 @@ jobs:
               continue;
             }
             const url = new URL(resolved);
+            if (url.protocol !== 'https:') {
+              offenders.push(`${name || '<root>'}: package-lock resolved URL must use HTTPS: ${resolved}`);
+              continue;
+            }
             if (!allowedHosts.has(url.host) || privateHints.some((hint) => resolved.includes(hint))) {
-              offenders.push(`${name || '<root>'}: ${resolved}`);
+              offenders.push(`${name || '<root>'}: package-lock resolved URL must use the public npm registry: ${resolved}`);
             }
           }
           if (offenders.length) {
-            console.error('package-lock.json must use only the public npm registry for CI reproducibility.');
+            console.error('package-lock.json must use only HTTPS URLs from the public npm registry for CI reproducibility.');
             console.error(offenders.slice(0, 20).join('\n'));
             if (offenders.length > 20) {
               console.error(`...and ${offenders.length - 20} more`);

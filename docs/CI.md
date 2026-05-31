@@ -23,9 +23,10 @@ silent zero-fill, no exposed generated model artifacts, and no real secrets.
   intentionally prove dev compatibility remain in the full `backend-tests` job.
 - `frontend-check`: uses `npm ci` because the command-center frontend has
   `package-lock.json`, validates that required `lint` and `build` scripts exist,
-  rejects private/internal registries in `package-lock.json`, runs `lint` and
-  `build`, and runs `test` only when a test script is present. CI uses the
-  public npm registry only; it does not use private registry credentials.
+  rejects non-HTTPS or private/internal registries in `package-lock.json`, runs
+  `lint` and `build`, and runs `test` only when a test script is present. CI
+  uses the public npm registry only; it does not use private registry
+  credentials.
 - `codeql`: remains in `.github/workflows/codeql.yml` for Python and
   JavaScript/TypeScript static analysis.
 
@@ -60,8 +61,10 @@ packages remain in `requirements-optional.txt` and are not installed by CI.
 `frontend/icea-nursing-command-center/package-lock.json` must not contain
 internal registry hosts such as `packages.applied-caas-gateway`,
 `internal.api.openai.org`, Artifactory, Verdaccio, GitHub Packages, or Azure
-Artifacts URLs. `frontend-check` fails before `npm ci` if any resolved package
-tarball points outside `https://registry.npmjs.org/`.
+Artifacts URLs. Every package tarball `resolved` URL must use
+`https://registry.npmjs.org/`; `http://` is prohibited. `frontend-check` fails
+before `npm ci` if any resolved package tarball uses HTTP or points outside the
+public npm registry.
 
 To regenerate the lockfile against the public npm registry:
 
