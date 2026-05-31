@@ -196,6 +196,43 @@ jobs:
           test -f package-lock.json
           node -e "const p=require('./package.json'); for (const s of ['lint','build']) { if (!p.scripts || !p.scripts[s]) { throw new Error('Missing required script: ' + s); } }"
 
+      - name: Reject private registries in frontend lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('fs');
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+          const allowedHosts = new Set(['registry.npmjs.org']);
+          const privateHints = [
+            'packages.applied-caas-gateway',
+            'internal.api.openai.org',
+            'artifactory',
+            'verdaccio',
+            'npm.pkg.github.com',
+            'pkgs.dev.azure.com',
+          ];
+          const offenders = [];
+          for (const [name, entry] of Object.entries(lock.packages || {})) {
+            const resolved = entry && entry.resolved;
+            if (!resolved || !/^https?:\/\//.test(resolved)) {
+              continue;
+            }
+            const url = new URL(resolved);
+            if (!allowedHosts.has(url.host) || privateHints.some((hint) => resolved.includes(hint))) {
+              offenders.push(`${name || '<root>'}: ${resolved}`);
+            }
+          }
+          if (offenders.length) {
+            console.error('package-lock.json must use only the public npm registry for CI reproducibility.');
+            console.error(offenders.slice(0, 20).join('\n'));
+            if (offenders.length > 20) {
+              console.error(`...and ${offenders.length - 20} more`);
+            }
+            process.exit(1);
+          }
+          NODE
+
       - name: Install frontend dependencies
         shell: bash
         run: |
