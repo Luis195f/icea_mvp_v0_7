@@ -11,6 +11,7 @@ from icea_core.aggregation import (
     MIN_STAFF_FOR_STAFF_DIMENSION,
     aggregate_scored_rows,
     governance_export_metadata,
+    redacted_low_support_summary,
 )
 from icea_core.followup import (
     build_patient_summary,
@@ -251,6 +252,14 @@ class ICEAPlusAggregateView(APIView):
             require_staff_count=require_staff_count,
         )
         suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
+        response_summary = score_result.get("summary")
+        if suppressed_cells > 0:
+            response_summary = redacted_low_support_summary(
+                suppressed_cells=suppressed_cells,
+                aggregation_level=effective_group_by,
+                min_cell_count=MIN_AGGREGATE_EPISODES,
+                min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
+            )
         export_metadata = governance_export_metadata(
             aggregation_level=effective_group_by,
             min_cell_count=MIN_AGGREGATE_EPISODES,
@@ -283,7 +292,7 @@ class ICEAPlusAggregateView(APIView):
                 "effective_group_by": effective_group_by,
                 "grain": str(params.get("grain") or "episode"),
                 "warnings": warnings,
-                "summary": score_result.get("summary"),
+                "summary": response_summary,
                 "governance": export_metadata,
                 "non_individual_use": True,
                 "shadow_mode": True,

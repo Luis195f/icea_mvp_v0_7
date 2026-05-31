@@ -772,6 +772,52 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertIn("patient_grouping_individualizable_falling_back_to_unit", body["warnings"])
         self.assertEqual(body["results"][0]["status"], "suppressed_low_support")
         self.assertIsNone(body["results"][0]["score"])
+        self.assertTrue(body["summary"]["summary_redacted"])
+        self.assertEqual(body["summary"]["redaction_reason"], "suppressed_low_support")
+        self.assertEqual(body["summary"]["suppressed_cells"], body["suppressed_cells"])
+        self.assertNotIn("component_means", body["summary"])
+
+    def test_aggregate_endpoint_redacts_numeric_summary_when_any_cell_is_suppressed(self):
+        response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "group_by": "unit",
+                "grain": "episode",
+                "date_from": self.episodes[0].admission_date.isoformat(),
+                "date_to": (self.episodes[0].admission_date + timezone.timedelta(seconds=1)).isoformat(),
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertGreater(body["suppressed_cells"], 0)
+        self.assertEqual(body["results"][0]["status"], "suppressed_low_support")
+        self.assertIsNone(body["results"][0]["score"])
+        self.assertEqual(
+            body["summary"],
+            {
+                "summary_redacted": True,
+                "redaction_reason": "suppressed_low_support",
+                "suppressed_cells": body["suppressed_cells"],
+                "min_cell_count": 10,
+                "min_staff_count": 5,
+                "aggregation_level": "unit",
+            },
+        )
+        forbidden_terms = {"component_means", "benefit", "attribution", "causal", "quality", "uncertainty"}
+        self.assertTrue(forbidden_terms.isdisjoint(set(body["summary"].keys())))
+
+    def test_aggregate_endpoint_preserves_numeric_summary_when_no_cells_are_suppressed(self):
+        response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {"model_id": str(self.episode_artifact.id), "group_by": "unit", "grain": "episode"},
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["suppressed_cells"], 0)
+        self.assertFalse(body["summary"].get("summary_redacted", False))
+        self.assertIn("component_means", body["summary"])
+        self.assertIn("benefit", body["summary"]["component_means"])
 
     def test_calibrate_endpoint_is_admin_only(self):
         with mock.patch.dict(

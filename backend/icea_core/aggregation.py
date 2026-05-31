@@ -85,6 +85,23 @@ def governance_export_metadata(
     }
 
 
+def redacted_low_support_summary(
+    *,
+    suppressed_cells: int,
+    aggregation_level: str,
+    min_cell_count: int = MIN_AGGREGATE_EPISODES,
+    min_staff_count: int = MIN_STAFF_FOR_STAFF_DIMENSION,
+) -> dict[str, Any]:
+    return {
+        "summary_redacted": True,
+        "redaction_reason": "suppressed_low_support",
+        "suppressed_cells": int(suppressed_cells),
+        "min_cell_count": int(min_cell_count),
+        "min_staff_count": int(min_staff_count),
+        "aggregation_level": aggregation_level,
+    }
+
+
 
 def aggregate_scored_rows(
     *,
