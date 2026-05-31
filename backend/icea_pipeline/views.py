@@ -66,6 +66,14 @@ from icea_pipeline.serializers import (
     TrainFromDBSerializer,
 )
 from icea_pipeline.target_trial import sha256_hex_of, validate_target_trial
+from icea_pipeline.temporal import (
+    LEGACY_OUTCOME_STATUS,
+    episode_legacy_temporal_spec,
+    validate_causal_temporal_order,
+    validate_case_mix_spec,
+    validate_temporal_frame,
+    window_temporal_spec,
+)
 from icea_pipeline.trial_report import generate_trial_protocol_report
 
 
@@ -373,12 +381,19 @@ class PipelineBuildDatasetView(APIView):
                 EpisodeFeatureRow.objects.all().delete()
 
         built = 0
+        legacy_outcome_rows = 0
         for ep in qs:
-            features: dict[str, Any] = {"ri_initial": float(ep.ri_initial)}
-            target: dict[str, Any] = {"delta_ri": float(ep.delta_ri)}
+            temporal_spec = episode_legacy_temporal_spec(ep)
+            feature_window_end = parse_datetime(str(temporal_spec["feature_window_end"]))
+            features: dict[str, Any] = {"ri_initial": float(ep.ri_initial), "temporal_spec": temporal_spec}
+            target: dict[str, Any] = {
+                "delta_ri": float(ep.delta_ri),
+                "temporal_spec": temporal_spec,
+                "outcome_status": LEGACY_OUTCOME_STATUS,
+            }
 
             # Procedures
-            procs = NormalizedProcedure.objects.filter(episode=ep)
+            procs = NormalizedProcedure.objects.filter(episode=ep, performed_dt__lte=feature_window_end)
             nurse_like = procs.filter(performer_role__iregex=r"(nurs|rn|enfermer|tcae|aux)")
             nurse_det = procs.filter(is_nursing=True)
             features["proc_count"] = procs.count()
@@ -387,7 +402,7 @@ class PipelineBuildDatasetView(APIView):
 
             # --- Roster-derived exposures (if available)
             start = ep.admission_date
-            end = ep.discharge_date or timezone.now()
+            end = feature_window_end
             shifts = RosterShift.objects.filter(unit=ep.unit, end_dt__gt=start, start_dt__lt=end)
 
             nurse_hours = 0.0
@@ -425,7 +440,11 @@ class PipelineBuildDatasetView(APIView):
                 "59408-5": "spo2",
                 "9279-1": "resp_rate",
             }
-            obs = NormalizedObservation.objects.filter(episode=ep, code_system__icontains="loinc").exclude(
+            obs = NormalizedObservation.objects.filter(
+                episode=ep,
+                code_system__icontains="loinc",
+                effective_dt__lte=feature_window_end,
+            ).exclude(
                 value_num__isnull=True
             )
             last_by_code: dict[str, float] = {}
@@ -450,6 +469,7 @@ class PipelineBuildDatasetView(APIView):
                 },
             )
             built += 1
+            legacy_outcome_rows += 1
 
         # Data quality snapshot (best effort; never break pipeline)
         try:
@@ -471,9 +491,25 @@ class PipelineBuildDatasetView(APIView):
         except Exception:
             pass
 
-        append_audit_event(event_type="build_dataset", payload={"episode_id": episode_id, "built": built, "truncate": truncate}, context="pipeline/build-dataset")
+        append_audit_event(
+            event_type="build_dataset",
+            payload={
+                "episode_id": episode_id,
+                "built": built,
+                "truncate": truncate,
+                "legacy_outcome_not_defensible_rows": legacy_outcome_rows,
+            },
+            context="pipeline/build-dataset",
+        )
 
-        return Response({"built": built, "episode_id": episode_id})
+        return Response(
+            {
+                "built": built,
+                "episode_id": episode_id,
+                "status": "legacy_outcome_not_defensible" if legacy_outcome_rows else "ok",
+                "warnings": ["legacy_outcome_not_defensible"] if legacy_outcome_rows else [],
+            }
+        )
 
 
 class PipelineBuildWindowsView(APIView):
@@ -572,11 +608,15 @@ class PipelineBuildWindowsView(APIView):
                 for idx, (ws, we) in enumerate(windows):
                     w = EpisodeWindow.objects.create(episode=ep, window_index=idx, start_dt=ws, end_dt=we)
 
+                    temporal_spec = window_temporal_spec(ep, ws=ws, we=we, follow_up_hours=int(follow_up_hours))
+                    outcome_start = parse_datetime(str(temporal_spec["outcome_window_start"]))
+                    outcome_end = parse_datetime(str(temporal_spec["outcome_window_end"])) if temporal_spec.get("outcome_window_end") else None
                     features: dict[str, Any] = {
                         "ri_initial": float(ep.ri_initial),
                         "window_index": int(idx),
                         "window_hours": float((we - ws).total_seconds() / 3600.0),
                         "follow_up_hours": float(follow_up_hours),
+                        "temporal_spec": temporal_spec,
                     }
 
                     # Procedures within window
@@ -643,16 +683,16 @@ class PipelineBuildWindowsView(APIView):
 
                     # Window target using RI observations if available.
                     # v0.5.3: target horizon can be decoupled from the window length via follow_up_hours.
-                    horizon_end = ws + timedelta(hours=follow_up_hours)
-                    # Cap to episode end.
-                    horizon_end = min(horizon_end, end)
-                    obs_t = obs.filter(effective_dt__gte=ws, effective_dt__lt=horizon_end).order_by("effective_dt")
+                    horizon_end = outcome_end
+                    obs_t = obs.none()
+                    if outcome_start is not None and horizon_end is not None:
+                        obs_t = obs.filter(effective_dt__gte=outcome_start, effective_dt__lte=horizon_end).order_by("effective_dt")
                     ri_series = _ri_obs(obs_t)
                     ri_start = None
                     ri_end = None
                     if len(ri_series) >= 2:
                         if ri_boundary == "nearest":
-                            ri_start = _pick_nearest(ri_series, ws, ri_tol_min)
+                            ri_start = _pick_nearest(ri_series, outcome_start, ri_tol_min)
                             ri_end = _pick_nearest(ri_series, horizon_end, ri_tol_min)
                         if ri_start is None or ri_end is None:
                             # Fallback to first/last (backwards compatible)
@@ -691,7 +731,7 @@ class PipelineBuildWindowsView(APIView):
                         for c in component_codes:
                             s_c = series_by_code.get(c) or []
                             if missing_t0:
-                                v0 = _pick_nearest(s_c, ws, ri_tol_min)
+                                v0 = _pick_nearest(s_c, outcome_start, ri_tol_min)
                                 features[f"missing_loinc_{c.replace('-', '_')}_t0"] = 1 if v0 is None else 0
                             if missing_t1:
                                 v1 = _pick_nearest(s_c, horizon_end, ri_tol_min)
@@ -701,10 +741,18 @@ class PipelineBuildWindowsView(APIView):
 
                     if ri_start is not None and ri_end is not None:
                         features["ri_window_start"] = float(ri_start)
-                        target = {"delta_ri": float(float(ri_end) - float(ri_start))}
+                        target = {
+                            "delta_ri": float(float(ri_end) - float(ri_start)),
+                            "temporal_spec": temporal_spec,
+                            "outcome_status": "defensible_fixed_horizon",
+                        }
                     else:
                         features["ri_window_start"] = 0.0
-                        target = {"delta_ri": 0.0}
+                        target = {
+                            "delta_ri": None,
+                            "temporal_spec": temporal_spec,
+                            "outcome_status": "insufficient_outcome_evidence",
+                        }
 
                     EpisodeWindowFeatureRow.objects.create(
                         window=w,
@@ -750,7 +798,7 @@ class PipelineBuildWindowsView(APIView):
         except Exception:
             pass
 
-        return Response({"built": built, "episode_id": episode_id, "grain": "window"})
+        return Response({"built": built, "episode_id": episode_id, "grain": "window", "temporal_spec_version": "icea_temporal_v1"})
 
 
 class PipelineTrainFromDBView(APIView):
@@ -776,16 +824,29 @@ class PipelineTrainFromDBView(APIView):
             return Response({"detail": "No dataset rows. Run build-dataset first."}, status=400)
 
         df = pd.DataFrame(dataset)
+        temporal_issues = validate_temporal_frame(df, feature_names=[c for c in df.columns if c != target], target=target)
+        if temporal_issues:
+            return Response(
+                {
+                    "detail": "dataset_not_temporally_defensible",
+                    "status": temporal_issues[0][1].status,
+                    "warnings": sorted({warning for _, issue in temporal_issues for warning in issue.warnings}),
+                    "blocked_rows": int(len(temporal_issues)),
+                },
+                status=400,
+            )
         df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-        # Feature distribution snapshot for drift monitoring (v0.5 governance)
-        feature_stats = {"mean": df.drop(columns=[target]).mean(numeric_only=True).to_dict(),
-                        "std": df.drop(columns=[target]).std(numeric_only=True, ddof=0).to_dict()}
+        metadata_cols = {"temporal_spec", "outcome_status", "feature_timestamps"}
+        features = [c for c in df.columns if c != target and c not in metadata_cols]
+        df_model = df[features + [target]].copy()
 
-        features = [c for c in df.columns if c != target]
+        # Feature distribution snapshot for drift monitoring (v0.5 governance)
+        feature_stats = {"mean": df_model.drop(columns=[target]).mean(numeric_only=True).to_dict(),
+                        "std": df_model.drop(columns=[target]).std(numeric_only=True, ddof=0).to_dict()}
 
         result = train_xgb_regressor(
-            df,
+            df_model,
             features=features,
             target=target,
             model_dir=settings.ICEA_MODEL_DIR,
@@ -1026,6 +1087,8 @@ class CausalRunView(APIView):
         effect_modifiers = list(spec.get("effect_modifiers") or [])
         dag_edges = spec.get("dag_edges") or []
         grain = str(spec.get("grain") or spec.get("dataset_grain") or "episode").strip().lower()
+        causal_temporal_issue = validate_causal_temporal_order(spec)
+        case_mix_issue = validate_case_mix_spec(spec.get("case_mix_spec"))
 
         if not treatment:
             return Response({"detail": "spec.treatment is required"}, status=400)
@@ -1152,7 +1215,44 @@ class CausalRunView(APIView):
                 row.update(r.target)
                 data.append(row)
 
-        df = pd.DataFrame(data).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df_raw = pd.DataFrame(data)
+        temporal_dataset_issues = validate_temporal_frame(df_raw, target=outcome)
+        if causal_temporal_issue or temporal_dataset_issues:
+            warnings = []
+            if causal_temporal_issue:
+                warnings.extend(causal_temporal_issue.warnings)
+            warnings.extend([warning for _, issue in temporal_dataset_issues for warning in issue.warnings])
+            if case_mix_issue:
+                warnings.extend(case_mix_issue.warnings)
+            summary = {
+                "spec": {
+                    "treatment": treatment,
+                    "outcome": outcome,
+                    "confounders": confounders,
+                    "effect_modifiers": effect_modifiers,
+                    "dag_edges": dag_edges,
+                    "grain": grain,
+                    "target_trial": spec.get("target_trial"),
+                    "protocol_hash": spec.get("protocol_hash"),
+                },
+                "n_rows": int(len(df_raw)),
+                "ate": None,
+                "causal_available": False,
+                "status": "temporal_leakage_blocked" if causal_temporal_issue else "insufficient_temporal_spec",
+                "warnings": sorted(set(warnings)),
+            }
+            spec_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()
+            cs_name = f"spec-{spec_hash[:32]}"
+            cs, _ = CausalSpec.objects.get_or_create(name=cs_name, defaults={"spec": spec})
+            run = CausalRun.objects.create(spec=cs, outcome=outcome, treatment=treatment, n_rows=int(len(df_raw)), summary=summary)
+            append_audit_event(
+                event_type="causal_run_blocked",
+                payload={"run_id": str(run.id), "treatment": treatment, "outcome": outcome, "grain": grain},
+                context="causal/run",
+            )
+            return Response({"run_id": str(run.id), "summary": summary})
+
+        df = df_raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         # v0.7: optional causal discovery (PC) to suggest dag_edges from observed unit data.
         # This never mutates the protocol unless explicitly requested (auto_update=true).
         dag_discovery_out = None
@@ -1542,6 +1642,8 @@ class CausalRunView(APIView):
                 has_path = [c, treatment] in dag_edges or [c, outcome] in dag_edges
                 if not has_path:
                     warnings.append(f"Confounder '{c}' not connected to treatment/outcome in dag_edges (check DAG).")
+        if case_mix_issue:
+            warnings.extend(case_mix_issue.warnings)
 
         summary = {
             "spec": {
@@ -1556,6 +1658,7 @@ class CausalRunView(APIView):
             },
             "n_rows": int(len(df)),
             "ate": ate,
+            "causal_available": True,
             "ate_ci": ate_ci,
             "cate": {
                 "mean": float(np.mean(cate)) if cate.size else 0.0,
@@ -1571,7 +1674,7 @@ class CausalRunView(APIView):
             "policy_learning": policy_learning,
             "fairness_audit": fairness_audit,
             "refuters": refuters,
-            "warnings": warnings,
+            "warnings": sorted(set(warnings)),
             "dag_discovery": dag_discovery_out,
         }
 
@@ -2012,6 +2115,34 @@ class CausalDiscoverView(APIView):
             data = list(p.get("rows") or [])
 
         df = pd.DataFrame(data).replace([np.inf, -np.inf], np.nan)
+        temporal_discovery_issues = validate_temporal_frame(pd.DataFrame(data), target="delta_ri")
+        if temporal_discovery_issues:
+            result = {
+                "available": False,
+                "causal_available": False,
+                "dag_edges": [],
+                "undirected_edges": [],
+                "p_values": {},
+                "notes": ["causal_discovery_blocked_by_temporal_guardrails"],
+                "warnings": sorted({warning for _, issue in temporal_discovery_issues for warning in issue.warnings}),
+                "n_rows": int(len(df)),
+            }
+            run = CausalDiscoveryRun.objects.create(
+                actor=actor,
+                method="pc",
+                alpha=alpha,
+                max_cond_set=max_cond_set,
+                grain=grain,
+                variables=variables,
+                spec={"alpha": alpha, "max_cond_set": max_cond_set, "forbid_edges": forbid_edges},
+                result=result,
+            )
+            append_audit_event(
+                event_type="causal_discover_blocked",
+                payload={"discovery_run_id": str(run.id), "method": "pc", "grain": grain, "n_rows": int(len(df))},
+                context="causal/discover",
+            )
+            return Response({"discovery_run_id": str(run.id), "result": run.result})
 
         # Optional filter by unit
         unit_id = p.get("unit_id")
@@ -2111,12 +2242,35 @@ class CausalSimulateView(APIView):
                 row["unit_id"] = int(r.episode.unit_id)
                 data.append(row)
 
-        df = pd.DataFrame(data).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df_raw = pd.DataFrame(data)
         treatment = str(spec.get("treatment") or "").strip()
         outcome = str(spec.get("outcome") or "delta_ri").strip()
         confounders = list(spec.get("confounders") or [])
         effect_modifiers = list(spec.get("effect_modifiers") or [])
         dag_edges = spec.get("dag_edges") or []
+        causal_temporal_issue = validate_causal_temporal_order(spec)
+        temporal_dataset_issues = validate_temporal_frame(df_raw, target=outcome)
+        if causal_temporal_issue or temporal_dataset_issues:
+            warnings = []
+            if causal_temporal_issue:
+                warnings.extend(causal_temporal_issue.warnings)
+            warnings.extend([warning for _, issue in temporal_dataset_issues for warning in issue.warnings])
+            result = {
+                "available": False,
+                "causal_available": False,
+                "status": "temporal_leakage_blocked" if causal_temporal_issue else "insufficient_temporal_spec",
+                "warnings": sorted(set(warnings)),
+                "n_rows": int(len(df_raw)),
+            }
+            sim = CounterfactualSimulationRun.objects.create(
+                actor=actor,
+                causal_run=run,
+                predictive_model_id=str(p.get("model_id")) if p.get("model_id") else None,
+                spec={"grain": grain, "spec": spec, "scenarios": list(p.get("scenarios") or [])},
+                result=result,
+            )
+            return Response({"simulation_run_id": str(sim.id), "result": result})
+        df = df_raw.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         dag_discovery = None
         # v0.7: optional causal discovery (PC) to suggest dag_edges from observed unit data.
         # This never mutates the protocol unless explicitly requested (auto_update=true).

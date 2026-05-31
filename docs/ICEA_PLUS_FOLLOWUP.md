@@ -38,9 +38,16 @@ The repo only triggers enriched rescoring when all of the following are true:
 - an initial ICEA+ episode record exists or can be bootstrapped from the current DB row
 - the episode has an outcome supported by the current repo state
 - there is new repo-backed follow-up evidence since the initial score or last rescore
+- the underlying row remains temporally defensible: follow-up features cannot be used
+  as baseline predictors for an earlier outcome window
 
 If those conditions are not met, the API returns an explicit non-enriched state instead
 of fabricating a later score.
+
+Episode-level follow-up remains legacy/provisional when the only available outcome is
+`ri_final`, discharge status, length of stay, or the last observation across the stay.
+Future datasets should prefer window-grain rows with an explicit lag:
+baseline/index -> feature window -> outcome window -> censoring.
 
 ## API
 

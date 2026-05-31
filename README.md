@@ -11,6 +11,7 @@ Core principles:
 - **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
 - **Shadow aggregate governance**: ICEA/ICEA+ dashboard and export surfaces are aggregate-only, non-punitive, and suppress low-support cells.
 - **Fail-closed high-risk APIs**: scoring, causal, writeback, federated, simulate, policy learning, and fairness require explicit auth/RBAC and feature flags outside dev-only mode.
+- **Temporal leakage guards**: defensible datasets, scoring, training, and causal runs require an explicit temporal spec with index time, feature window, outcome window, censoring, and case-mix warnings for aggregate comparisons.
 
 ## ICEA vs ICEA+
 
@@ -72,6 +73,10 @@ Services:
 ```json
 { "truncate": false }
 ```
+
+Episode-grain `delta_ri` based on discharge/final-stay values is retained only as
+legacy/provisional evidence and is marked `legacy_outcome_not_defensible`.
+Defensible training/scoring requires fixed-horizon temporal metadata.
 
 ### 3b) Build window-grain dataset (episode-windows)
 

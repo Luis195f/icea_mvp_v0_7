@@ -7,6 +7,7 @@ from django.core.management.base import BaseCommand
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import ModelArtifact
 from icea_pipeline.models import EpisodeFeatureRow, TrainingRun
+from icea_pipeline.temporal import validate_temporal_frame
 
 
 class Command(BaseCommand):
@@ -34,10 +35,20 @@ class Command(BaseCommand):
             return
 
         df = pd.DataFrame(dataset)
-        features = [c for c in df.columns if c != target]
+        temporal_issues = validate_temporal_frame(df, feature_names=[c for c in df.columns if c != target], target=target)
+        if temporal_issues:
+            self.stdout.write(
+                self.style.ERROR(
+                    f"Dataset not temporally defensible: {temporal_issues[0][1].status} ({len(temporal_issues)} rows blocked)"
+                )
+            )
+            return
+        metadata_cols = {"temporal_spec", "outcome_status", "feature_timestamps"}
+        features = [c for c in df.columns if c != target and c not in metadata_cols]
+        df_model = df[features + [target]].copy()
 
         result = train_xgb_regressor(
-            df,
+            df_model,
             features=features,
             target=target,
             model_dir=settings.ICEA_MODEL_DIR,

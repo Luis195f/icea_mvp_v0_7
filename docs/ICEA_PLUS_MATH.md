@@ -47,6 +47,37 @@ The repo already contains uncertainty and governance signals:
 
 ICEA+ v1 penalizes higher uncertainty instead of silently hiding it.
 
+## Temporal Defensibility
+
+An ICEA/ICEA+ row is numerically defensible only when it declares:
+
+- `index_time`
+- `feature_window_start`
+- `feature_window_end`
+- `outcome_window_start`
+- `outcome_window_end`
+- `censoring_reason`
+- `temporal_spec_version`
+
+The minimum rule is `feature_window_end <= outcome_window_start`. Features after the
+feature window are leakage and must be excluded or blocked. Outcomes must be observed
+after the feature window and within a fixed horizon. Episode-level `ri_final`,
+discharge status, length of stay, and last measurement across the whole stay are legacy
+or post-outcome signals unless a protocol explicitly governs them.
+
+Current explicit states:
+
+- `insufficient_temporal_spec`: the row cannot prove index, feature window, outcome window, and censoring.
+- `temporal_leakage_blocked`: feature and outcome timing overlap incorrectly or future features are present.
+- `legacy_outcome_not_defensible`: the target is based on discharge/final/last-stay information rather than a fixed future horizon.
+- `insufficient_outcome_evidence`: the outcome window is censored or unobserved; no outcome is fabricated.
+- `case_mix_insufficient`: aggregate comparison lacks explicit baseline adjustment domains.
+
+SHAP and feature importance remain predictive explanations only. They are not causal
+attribution for an individual patient, nurse, shift, or unit. Unit comparisons require
+support thresholds plus case-mix warnings unless age, severity, comorbidity,
+fragility/dependence, baseline risk, and baseline load are declared.
+
 ## Formal definition
 
 For each episode/window `i`:
