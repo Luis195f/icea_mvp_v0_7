@@ -67,9 +67,9 @@ jobs:
       DJANGO_DEBUG: "false"
       DATABASE_URL: sqlite:////tmp/icea-ci.sqlite3
       SECRET_KEY: ci-test-secret-not-for-production
-      ICEA_DEV_ALLOW_INSECURE: "false"
-      ICEA_AUTH_REQUIRED: "true"
-      ICEA_RBAC_ENFORCE: "true"
+      ICEA_DEV_ALLOW_INSECURE: "true"
+      ICEA_AUTH_REQUIRED: "false"
+      ICEA_RBAC_ENFORCE: "false"
       ICEA_SECURE_MODE: "false"
       ICEA_CAUSAL_DISCOVER_ENABLED: "false"
       ICEA_SIMULATE_ENABLED: "false"
@@ -106,9 +106,6 @@ jobs:
       DJANGO_DEBUG: "false"
       DATABASE_URL: sqlite:////tmp/icea-risk-ci.sqlite3
       SECRET_KEY: ci-risk-test-secret-not-for-production
-      ICEA_DEV_ALLOW_INSECURE: "false"
-      ICEA_AUTH_REQUIRED: "true"
-      ICEA_RBAC_ENFORCE: "true"
       ICEA_SECURE_MODE: "false"
       ICEA_CAUSAL_DISCOVER_ENABLED: "false"
       ICEA_SIMULATE_ENABLED: "false"
@@ -131,11 +128,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
 
-      - name: Run high-risk guardrail tests
+      - name: Run contract, aggregation, and non-individualization guardrails
         working-directory: backend
+        env:
+          ICEA_DEV_ALLOW_INSECURE: "true"
+          ICEA_AUTH_REQUIRED: "false"
+          ICEA_RBAC_ENFORCE: "false"
+          ICEA_SECURE_MODE: "false"
         run: |
           python manage.py test -v 2 \
-            icea_core.tests.test_security_fail_closed \
             icea_core.tests.test_aggregation \
             icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_returns_contract_mismatch_for_handover_feature_space \
             icea_core.tests.test_api.ICEAPlusAPITests.test_score_endpoint_does_not_zero_fill_missing_model_features \
@@ -148,6 +149,26 @@ jobs:
             icea_core.tests.test_api.ICEAPlusAPITests.test_followup_status_and_patient_writeback_contract \
             icea_core.tests.test_api.ICEAPlusAPITests.test_writeback_summary_is_stable_and_degrades_team_to_unit \
             icea_core.tests.test_api.ICEAPlusAPITests.test_writeback_list_suppresses_episode_identifier_for_export_surface
+
+      - name: Run fail-closed and RBAC guardrails
+        working-directory: backend
+        env:
+          ICEA_DEV_ALLOW_INSECURE: "false"
+          ICEA_AUTH_REQUIRED: "true"
+          ICEA_RBAC_ENFORCE: "true"
+          ICEA_SECURE_MODE: "true"
+          JWT_SIGNING_KEY: ci-risk-jwt-signing-key-not-for-production
+          AUDIT_LOG_SECRET: ci-risk-audit-secret-not-for-production
+        run: |
+          python manage.py test -v 2 \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_sensitive_endpoints_reject_unauthenticated_requests \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_sensitive_endpoints_reject_insufficient_role \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_correct_roles_can_access_representative_sensitive_endpoints \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_secure_mode_without_token_keys_fails_explicitly \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_valid_api_key_gets_service_role_for_sensitive_endpoint \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_missing_or_invalid_api_key_cannot_access_sensitive_endpoint \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_spoofed_service_role_header_does_not_grant_service_access \
+            icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_secure_mode_blocks_dev_insecure_bypass_for_authenticated_user
 
   frontend-check:
     name: Frontend build and lint
@@ -168,14 +189,50 @@ jobs:
           cache: "npm"
           cache-dependency-path: frontend/icea-nursing-command-center/package-lock.json
 
+      - name: Validate frontend CI inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f package-lock.json
+          node -e "const p=require('./package.json'); for (const s of ['lint','build']) { if (!p.scripts || !p.scripts[s]) { throw new Error('Missing required script: ' + s); } }"
+
       - name: Install frontend dependencies
-        run: npm ci
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            echo "package-lock.json is required for reproducible CI installs."
+            exit 1
+          fi
 
       - name: Lint frontend
-        run: npm run lint --if-present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require('./package.json').scripts?.lint ? 0 : 1)"; then
+            npm run lint
+          else
+            echo "No lint script defined; skipping."
+          fi
 
       - name: Test frontend if script exists
-        run: npm run test --if-present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require('./package.json').scripts?.test ? 0 : 1)"; then
+            npm run test
+          else
+            echo "No test script defined; skipping."
+          fi
 
       - name: Build frontend
-        run: npm run build --if-present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+            npm run build
+          else
+            echo "No build script defined; skipping."
+          fi

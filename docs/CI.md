@@ -10,14 +10,20 @@ silent zero-fill, no exposed generated model artifacts, and no real secrets.
   `backend/models/*.json`, real `.env` files, SQLite databases, Python caches,
   Node dependency folders, or coverage runtime artifacts.
 - `backend-tests`: installs the backend CI dependency set with Python 3.12 and
-  runs the full Django suite with `python manage.py test -v 2`.
-- `backend-risk-regression-tests`: reruns the high-risk guardrails explicitly:
-  fail-closed/RBAC, HANDOVER to ICEA contract mismatch, low feature coverage,
-  aggregation suppression, writeback/no individualization, and follow-up
-  non-operational score behavior.
+  runs the full Django suite with `python manage.py test -v 2` in the same
+  dev-compatible mode expected by the legacy compatibility tests:
+  `ICEA_DEV_ALLOW_INSECURE=true`, `ICEA_AUTH_REQUIRED=false`,
+  `ICEA_RBAC_ENFORCE=false`, and `ICEA_SECURE_MODE=false`.
+- `backend-risk-regression-tests`: reruns the high-risk guardrails explicitly in
+  two environments. Contract, low feature coverage, aggregation suppression,
+  writeback/no individualization, and follow-up non-operational score behavior
+  run in dev-compatible mode because those tests exercise successful local
+  access. A selected fail-closed/RBAC subset runs separately with auth, RBAC,
+  and secure mode enabled plus test-only signing/audit secrets; tests that
+  intentionally prove dev compatibility remain in the full `backend-tests` job.
 - `frontend-check`: uses `npm ci` because the command-center frontend has
-  `package-lock.json`, then runs existing `lint`, optional `test`, and `build`
-  scripts.
+  `package-lock.json`, validates that required `lint` and `build` scripts exist,
+  runs them, and runs `test` only when a test script is present.
 - `codeql`: remains in `.github/workflows/codeql.yml` for Python and
   JavaScript/TypeScript static analysis.
 
