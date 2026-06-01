@@ -20,12 +20,21 @@ from icea_pipeline.temporal import (
 
 
 class TemporalGuardrailUnitTests(SimpleTestCase):
-    def _spec(self, *, feature_end=None, outcome_start=None, outcome_status="defensible_fixed_horizon"):
-        index = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
-        feature_start = index
+    def _spec(
+        self,
+        *,
+        index_time=None,
+        feature_start=None,
+        feature_end=None,
+        outcome_start=None,
+        outcome_end=None,
+        outcome_status="defensible_fixed_horizon",
+    ):
+        index = index_time or timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        feature_start = feature_start or index
         feature_end = feature_end or timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc)
         outcome_start = outcome_start or feature_end
-        outcome_end = outcome_start + timezone.timedelta(hours=12)
+        outcome_end = outcome_end or outcome_start + timezone.timedelta(hours=12)
         spec = build_temporal_spec(
             index_time=index,
             feature_window_start=feature_start,
@@ -49,6 +58,49 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         self.assertIsNotNone(issue)
         self.assertEqual(issue.status, "insufficient_temporal_spec")
 
+    def test_valid_temporal_spec_with_target_passes(self):
+        issue = validate_temporal_row(
+            {"delta_ri": 1.0, "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNone(issue)
+
+    def test_feature_window_start_after_feature_window_end_blocks(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 14, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 15, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("feature_window_start_after_feature_window_end", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
+    def test_outcome_window_start_after_outcome_window_end_blocks(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    outcome_start=timezone.datetime(2026, 3, 2, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_end=timezone.datetime(2026, 3, 2, 8, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("outcome_window_start_after_outcome_window_end", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
     def test_feature_window_after_outcome_start_blocks_leakage(self):
         issue = validate_temporal_row(
             {
@@ -62,6 +114,27 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
             target="delta_ri",
         )
         self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("feature_window_end_after_outcome_window_start", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
+    def test_index_time_after_outcome_window_start_blocks(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    index_time=timezone.datetime(2026, 3, 1, 13, 0, tzinfo=dt_tz.utc),
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("index_time_after_outcome_window_start", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
 
     def test_legacy_last_measurement_outcome_is_not_defensible(self):
         issue = validate_temporal_row(

@@ -197,16 +197,27 @@ def validate_temporal_row(row: dict[str, Any], *, feature_names: list[str] | Non
         flags["insufficient_temporal_spec"] = True
         return TemporalIssue("insufficient_temporal_spec", sorted(set(warnings)), flags)
 
+    index_time = _parse_dt(spec.get("index_time"))
+    feature_start = _parse_dt(spec.get("feature_window_start"))
     feature_end = _parse_dt(spec.get("feature_window_end"))
     outcome_start = _parse_dt(spec.get("outcome_window_start"))
     outcome_end = _parse_dt(spec.get("outcome_window_end"))
-    if feature_end is None or outcome_start is None or outcome_end is None:
+    if index_time is None or feature_start is None or feature_end is None or outcome_start is None or outcome_end is None:
         warnings.append("insufficient_temporal_spec")
         flags["insufficient_temporal_spec"] = True
         return TemporalIssue("insufficient_temporal_spec", sorted(set(warnings)), flags)
 
+    temporal_order_warnings = []
+    if feature_start > feature_end:
+        temporal_order_warnings.append("feature_window_start_after_feature_window_end")
+    if outcome_start > outcome_end:
+        temporal_order_warnings.append("outcome_window_start_after_outcome_window_end")
     if feature_end > outcome_start:
-        warnings.append("feature_window_end_after_outcome_window_start")
+        temporal_order_warnings.append("feature_window_end_after_outcome_window_start")
+    if index_time > outcome_start:
+        temporal_order_warnings.append("index_time_after_outcome_window_start")
+    if temporal_order_warnings:
+        warnings.extend(temporal_order_warnings)
         flags["leakage_blocked"] = True
         return TemporalIssue("temporal_leakage_blocked", sorted(set(warnings)), flags)
 
