@@ -367,9 +367,9 @@ def validate_causal_temporal_order(spec: dict[str, Any]) -> TemporalIssue | None
     if spec.get("target_trial") and not target_trial_has_order:
         warnings.append("target_trial_temporal_order_not_demonstrated")
     warnings.extend(temporal_spec_warnings)
-    if not target_trial_has_order and not has_temporal_spec and not treatment_outcome_edge:
+    if not target_trial_has_order and not has_temporal_spec:
         warnings.append("insufficient_temporal_spec")
-    if not treatment_outcome_edge and not has_temporal_spec and not target_trial_has_order:
+    if not has_temporal_spec and not target_trial_has_order:
         warnings.append("treatment_outcome_temporal_order_not_proven")
     for c in confounders:
         if c in post_treatment or [treatment, c] in dag_edges:

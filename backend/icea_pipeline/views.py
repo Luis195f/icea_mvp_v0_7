@@ -1178,6 +1178,7 @@ class CausalRunView(APIView):
         spec["protocol_hash_alg"] = "sha256"
         spec["protocol_hash_input"] = "canonical_json_sorted"
 
+        causal_row_warnings: list[str] = []
         if grain == "window":
             rows = list(EpisodeWindowFeatureRow.objects.select_related("window", "window__episode").all())
             if not rows:
@@ -1250,25 +1251,6 @@ class CausalRunView(APIView):
                 if timezone.is_naive(index_time):
                     index_time = index_time.replace(tzinfo=dt_tz.utc)
 
-                if existing_outcome_start is not None or existing_outcome_end is not None:
-                    if (
-                        existing_outcome_start is None
-                        or existing_outcome_end is None
-                        or feature_end > existing_outcome_start
-                        or existing_outcome_start > existing_outcome_end
-                    ):
-                        return None, None, existing or {
-                            "temporal_spec_version": "icea_temporal_v1",
-                            "index_time": _iso_causal_dt(index_time),
-                            "feature_window_start": _iso_causal_dt(feature_start),
-                            "feature_window_end": _iso_causal_dt(feature_end),
-                            "outcome_window_start": _iso_causal_dt(existing_outcome_start),
-                            "outcome_window_end": _iso_causal_dt(existing_outcome_end),
-                            "censoring_reason": "invalid_temporal_spec",
-                            "outcome_status": "insufficient_outcome_evidence",
-                        }
-                    return existing_outcome_start, existing_outcome_end, existing
-
                 outcome_start = feature_end
                 outcome_end = outcome_start + timedelta(hours=int(horizon_hours))
                 censoring_reason = "not_censored"
@@ -1288,7 +1270,22 @@ class CausalRunView(APIView):
                     "censoring_reason": censoring_reason,
                     "outcome_status": "defensible_fixed_horizon",
                 }
-                return outcome_start, outcome_end, temporal_spec
+
+                if existing_outcome_start is not None or existing_outcome_end is not None:
+                    if (
+                        existing_outcome_start is not None
+                        and existing_outcome_end is not None
+                        and existing_outcome_start == outcome_start
+                        and existing_outcome_end == outcome_end
+                        and feature_end <= existing_outcome_start
+                        and existing_outcome_start <= existing_outcome_end
+                    ):
+                        return existing_outcome_start, existing_outcome_end, existing, True, []
+                    return outcome_start, outcome_end, temporal_spec, False, [
+                        "stored_outcome_window_mismatch_target_trial",
+                        "outcome_recomputed_for_target_trial_horizon",
+                    ]
+                return outcome_start, outcome_end, temporal_spec, False, []
 
             series_by_ep = {}
             if follow_up_h and outcome == "delta_ri":
@@ -1312,10 +1309,17 @@ class CausalRunView(APIView):
 
                 if follow_up_h and outcome == "delta_ri":
                     ep = r.window.episode
-                    outcome_start, horizon_end, temporal_spec = _causal_outcome_window(row, r.window, int(follow_up_h))
+                    outcome_start, horizon_end, temporal_spec, reuse_stored_outcome, row_warnings = _causal_outcome_window(
+                        row, r.window, int(follow_up_h)
+                    )
+                    causal_row_warnings.extend(row_warnings)
                     row["temporal_spec"] = temporal_spec
-                    series = series_by_ep.get(int(ep.id)) or []
-                    if outcome_start is not None and horizon_end is not None and len(series) >= 2:
+                    if reuse_stored_outcome:
+                        row["follow_up_hours_used"] = float(follow_up_h)
+                        row["outcome_status"] = str(row.get("outcome_status") or "defensible_fixed_horizon")
+                    else:
+                        series = series_by_ep.get(int(ep.id)) or []
+                    if not reuse_stored_outcome and outcome_start is not None and horizon_end is not None and len(series) >= 2:
                         ri_start = None
                         ri_end = None
                         if ri_boundary == "nearest":
@@ -1339,7 +1343,7 @@ class CausalRunView(APIView):
                         else:
                             row["delta_ri"] = None
                             row["outcome_status"] = "insufficient_outcome_evidence"
-                    else:
+                    elif not reuse_stored_outcome:
                         row["missing_loinc_85556_9_t0"] = 1
                         row["missing_loinc_85556_9_t1"] = 1
                         row["missing_delta_ri"] = 1
@@ -1357,11 +1361,13 @@ class CausalRunView(APIView):
                 data.append(row)
 
         df_raw = pd.DataFrame(data)
+        temporal_spec_used = data[0].get("temporal_spec") if grain == "window" and data else None
         temporal_dataset_issues = validate_temporal_frame(df_raw, target=outcome)
         if causal_temporal_issue or temporal_dataset_issues:
             warnings = []
             if causal_temporal_issue:
                 warnings.extend(causal_temporal_issue.warnings)
+            warnings.extend(causal_row_warnings)
             warnings.extend([warning for _, issue in temporal_dataset_issues for warning in issue.warnings])
             if case_mix_issue:
                 warnings.extend(case_mix_issue.warnings)
@@ -1381,6 +1387,7 @@ class CausalRunView(APIView):
                 "ate": None,
                 "causal_available": False,
                 "status": "temporal_leakage_blocked" if causal_temporal_issue else dataset_status,
+                "temporal_spec_used": temporal_spec_used,
                 "warnings": sorted(set(warnings)),
             }
             spec_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()
@@ -1778,6 +1785,7 @@ class CausalRunView(APIView):
                     return Response({"detail": "DoWhy is not installed/available", "refuters": refuters}, status=501)
 
         warnings = []
+        warnings.extend(causal_row_warnings)
         if confounders and dag_edges:
             # minimal sanity: encourage explicit confounder paths to treatment/outcome
             for c in confounders:
@@ -1816,6 +1824,7 @@ class CausalRunView(APIView):
             "policy_learning": policy_learning,
             "fairness_audit": fairness_audit,
             "refuters": refuters,
+            "temporal_spec_used": temporal_spec_used,
             "warnings": sorted(set(warnings)),
             "dag_discovery": dag_discovery_out,
         }
