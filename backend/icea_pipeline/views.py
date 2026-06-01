@@ -2086,6 +2086,7 @@ class CausalDiscoverView(APIView):
 
         grain = str(p.get("grain") or "episode").strip().lower()
         variables = list(p.get("variables") or [])
+        declared_outcome = str(p.get("outcome") or p.get("target") or "").strip()
         alpha = float(p.get("alpha") or 0.05)
         max_cond_set = int(p.get("max_cond_set") or 2)
         forbid_edges = p.get("forbid_edges") or []
@@ -2115,7 +2116,12 @@ class CausalDiscoverView(APIView):
             data = list(p.get("rows") or [])
 
         df = pd.DataFrame(data).replace([np.inf, -np.inf], np.nan)
-        temporal_discovery_issues = validate_temporal_frame(pd.DataFrame(data), target="delta_ri")
+        discovery_frame = pd.DataFrame(data)
+        has_row_temporal_spec = "temporal_spec" in discovery_frame.columns if not discovery_frame.empty else False
+        has_temporal_context = bool(declared_outcome or has_row_temporal_spec)
+        temporal_discovery_issues = []
+        if has_temporal_context:
+            temporal_discovery_issues = validate_temporal_frame(discovery_frame, target=declared_outcome)
         if temporal_discovery_issues:
             result = {
                 "available": False,

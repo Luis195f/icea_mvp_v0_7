@@ -90,6 +90,10 @@ class CausalDiscoverSerializer(serializers.Serializer):
 
     grain = serializers.ChoiceField(choices=["episode", "window"], required=False, default="episode")
     variables = serializers.ListField(child=serializers.CharField(), required=True)
+    outcome = serializers.CharField(required=False, allow_blank=True, default="")
+    target = serializers.CharField(required=False, allow_blank=True, default="")
+    treatment = serializers.CharField(required=False, allow_blank=True, default="")
+    target_trial = serializers.DictField(required=False)
     alpha = serializers.FloatField(required=False, default=0.05, min_value=0.001, max_value=0.5)
     max_cond_set = serializers.IntegerField(required=False, default=2, min_value=0, max_value=10)
     forbid_edges = serializers.ListField(child=serializers.ListField(child=serializers.CharField()), required=False, default=list)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timezone as dt_tz
 from unittest import mock
 
+from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -124,6 +125,32 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         self.assertEqual(issue.status, "insufficient_outcome_evidence")
         self.assertIn("missing_outcome_target", issue.warnings)
 
+    def test_naive_feature_timestamp_with_aware_temporal_spec_does_not_type_error_and_blocks_future_feature(self):
+        temporal_spec = {
+            "temporal_spec_version": "icea_temporal_v1",
+            "index_time": "2026-03-01T08:00:00Z",
+            "feature_window_start": "2026-03-01T08:00:00Z",
+            "feature_window_end": "2026-03-01T12:00:00Z",
+            "outcome_window_start": "2026-03-01T12:00:00Z",
+            "outcome_window_end": "2026-03-02T12:00:00Z",
+            "censoring_reason": "not_censored",
+            "outcome_status": "defensible_fixed_horizon",
+        }
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": temporal_spec,
+                "feature_timestamps": {
+                    "vs_hr_last": timezone.datetime(2026, 3, 1, 13, 0),
+                },
+            },
+            feature_names=["vs_hr_last"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("future_feature_timestamps_blocked:vs_hr_last", issue.warnings)
+
     def test_case_mix_spec_absent_is_marked_insufficient(self):
         issue = validate_case_mix_spec(None)
         self.assertEqual(issue.status, "case_mix_insufficient")
@@ -240,3 +267,74 @@ class TemporalBuildDatasetTests(TestCase):
         row = EpisodeFeatureRow.objects.get(episode=episode)
         self.assertEqual(row.features["vs_hr_last"], 77.0)
         self.assertEqual(row.target["outcome_status"], "legacy_outcome_not_defensible")
+
+
+class TemporalCausalDiscoverTests(TestCase):
+    def setUp(self):
+        self.dev_env = mock.patch.dict(
+            "os.environ",
+            {"ICEA_DEV_ALLOW_INSECURE": "true", "ICEA_CAUSAL_DISCOVER_ENABLED": "true"},
+            clear=False,
+        )
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
+        self.client = APIClient()
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(username="temporal-discover-admin", password="test-pass", is_superuser=True)
+        self.client.force_authenticate(user=self.user)
+
+    def _rows(self, *, include_delta_ri: bool = False, include_temporal_spec: bool = False):
+        rows = []
+        for i in range(12):
+            row = {
+                "row_id": f"row-{i}",
+                "ri_initial": 40.0 + float(i),
+                "nurse_hppd": 3.0 + float(i % 4),
+                "proc_count": 1.0 + float(i % 3),
+            }
+            if include_delta_ri:
+                row["delta_ri"] = 0.5 + float(i) * 0.1
+            if include_temporal_spec:
+                row["temporal_spec"] = build_temporal_spec(
+                    index_time=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_window_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_window_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_window_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_window_end=timezone.datetime(2026, 3, 2, 12, 0, tzinfo=dt_tz.utc),
+                )
+            rows.append(row)
+        return rows
+
+    def test_causal_discover_from_external_rows_without_delta_ri_does_not_fail_missing_outcome_target(self):
+        response = self.client.post(
+            "/api/v1/causal/discover/",
+            {
+                "from_db": False,
+                "variables": ["ri_initial", "nurse_hppd", "proc_count"],
+                "rows": self._rows(),
+                "max_cond_set": 1,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertNotEqual(result.get("available"), False)
+        self.assertNotIn("missing_outcome_target", result.get("warnings", []))
+        self.assertIn("n_rows", result)
+
+    def test_causal_discover_with_declared_outcome_and_missing_target_blocks_controlled(self):
+        response = self.client.post(
+            "/api/v1/causal/discover/",
+            {
+                "from_db": False,
+                "variables": ["ri_initial", "nurse_hppd", "proc_count"],
+                "outcome": "delta_ri",
+                "rows": self._rows(include_temporal_spec=True),
+                "max_cond_set": 1,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertFalse(result["available"])
+        self.assertIn("missing_outcome_target", result["warnings"])

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any
 
 import pandas as pd
@@ -59,13 +59,18 @@ def _iso(dt: datetime | None) -> str | None:
 
 def _parse_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
-        return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt_timezone.utc)
+        return value.astimezone(dt_timezone.utc)
     if _is_missing_value(value, empty_string=True):
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except Exception:
         return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt_timezone.utc)
+    return parsed.astimezone(dt_timezone.utc)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -223,10 +228,17 @@ def validate_temporal_row(row: dict[str, Any], *, feature_names: list[str] | Non
 
     feature_timestamps = _as_dict(row.get("feature_timestamps"))
     leaked_features = []
+    invalid_feature_timestamps = []
     for name, raw_dt in feature_timestamps.items():
         dt = _parse_dt(raw_dt)
-        if dt is not None and dt > feature_end:
+        if dt is None and not _is_missing_value(raw_dt, empty_string=True):
+            invalid_feature_timestamps.append(str(name))
+        elif dt is not None and dt > feature_end:
             leaked_features.append(str(name))
+    if invalid_feature_timestamps:
+        warnings.append(f"invalid_feature_timestamp:{','.join(sorted(invalid_feature_timestamps))}")
+        flags["leakage_blocked"] = True
+        return TemporalIssue("temporal_leakage_blocked", sorted(set(warnings)), flags)
     if leaked_features:
         warnings.append(f"future_feature_timestamps_blocked:{','.join(sorted(leaked_features))}")
         flags["leakage_blocked"] = True
