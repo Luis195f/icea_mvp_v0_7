@@ -4,9 +4,11 @@ from collections import defaultdict
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.utils.dateparse import parse_datetime
 
 from icea_core.models import PatientEpisode
 from icea_pipeline.models import EpisodeFeatureRow, NormalizedObservation, NormalizedProcedure
+from icea_pipeline.temporal import LEGACY_OUTCOME_STATUS, episode_legacy_temporal_spec
 
 
 VITAL_LOINC = {
@@ -54,23 +56,33 @@ class Command(BaseCommand):
 
             built = 0
             for ep in qs:
-                features = {}
+                temporal_spec = episode_legacy_temporal_spec(ep)
+                feature_window_end = parse_datetime(str(temporal_spec["feature_window_end"]))
+                features = {"temporal_spec": temporal_spec}
 
                 # Baseline (from episode table) — minimal but stable
                 features["ri_initial"] = float(ep.ri_initial)
 
                 # Outcomes
-                target = {"delta_ri": float(ep.delta_ri)}
+                target = {
+                    "delta_ri": float(ep.delta_ri),
+                    "temporal_spec": temporal_spec,
+                    "outcome_status": LEGACY_OUTCOME_STATUS,
+                }
 
                 # Nursing exposure proxy (from procedures)
-                procs = NormalizedProcedure.objects.filter(episode=ep)
+                procs = NormalizedProcedure.objects.filter(episode=ep, performed_dt__lte=feature_window_end)
                 nurse_like = procs.filter(performer_role__iregex=r"(nurs|rn)")
 
                 features["proc_count"] = procs.count()
                 features["nurse_proc_count"] = nurse_like.count()
 
                 # Vital sign features (LOINC) — last value during episode
-                obs = NormalizedObservation.objects.filter(episode=ep, code_system__icontains="loinc")
+                obs = NormalizedObservation.objects.filter(
+                    episode=ep,
+                    code_system__icontains="loinc",
+                    effective_dt__lte=feature_window_end,
+                )
                 last_by_code = {}
                 for o in obs.exclude(value_num__isnull=True).order_by("effective_dt"):
                     if o.code:
@@ -89,4 +101,4 @@ class Command(BaseCommand):
                 )
                 built += 1
 
-        self.stdout.write(self.style.SUCCESS(f"Built dataset rows: {built}"))
+        self.stdout.write(self.style.SUCCESS(f"Built dataset rows: {built} (legacy_outcome_not_defensible)"))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import timezone as dt_tz
 from pathlib import Path
 from unittest import mock
 
@@ -13,6 +14,7 @@ from rest_framework.test import APIClient
 from icea_core.models import ICEAPlusFollowupRecord
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_pipeline.models import FHIRWritebackRecord, NormalizedObservation, NormalizedProcedure
+from icea_pipeline.temporal import build_temporal_spec
 
 
 CONTRACT_FIXTURE = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "icea" / "handover_icea_feature_contract_v1.json"
@@ -98,6 +100,13 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         contract_version="handover-icea-feature-v1",
         source_repo="Luis195f/HANDOVER",
     ):
+        temporal_spec = build_temporal_spec(
+            index_time=timezone.datetime(2026, 3, 8, 8, 0, tzinfo=dt_tz.utc),
+            feature_window_start=timezone.datetime(2026, 3, 8, 8, 0, tzinfo=dt_tz.utc),
+            feature_window_end=timezone.datetime(2026, 3, 8, 14, 0, tzinfo=dt_tz.utc),
+            outcome_window_start=timezone.datetime(2026, 3, 8, 14, 0, tzinfo=dt_tz.utc),
+            outcome_window_end=timezone.datetime(2026, 3, 9, 14, 0, tzinfo=dt_tz.utc),
+        )
         return {
             "contract_version": contract_version,
             "source_repo": source_repo,
@@ -108,6 +117,8 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             "clinical_timestamp": "2026-03-08T15:00:00Z",
             "recorded_timestamp": "2026-03-08T15:03:00Z",
             "features": features,
+            "delta_ri": 1.0,
+            "temporal_spec": temporal_spec,
             "missingness_flags": missingness_flags or {key: False for key in features},
             "warnings": [],
             "shadow_mode": True,
@@ -235,6 +246,14 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
                         "recorded_timestamp": "2026-03-08T15:03:00Z",
                         "shadow_mode": True,
                         "non_individual_use": True,
+                        "delta_ri": 1.0,
+                        "temporal_spec": build_temporal_spec(
+                            index_time=timezone.datetime(2026, 3, 8, 8, 0, tzinfo=dt_tz.utc),
+                            feature_window_start=timezone.datetime(2026, 3, 8, 8, 0, tzinfo=dt_tz.utc),
+                            feature_window_end=timezone.datetime(2026, 3, 8, 14, 0, tzinfo=dt_tz.utc),
+                            outcome_window_start=timezone.datetime(2026, 3, 8, 14, 0, tzinfo=dt_tz.utc),
+                            outcome_window_end=timezone.datetime(2026, 3, 9, 14, 0, tzinfo=dt_tz.utc),
+                        ),
                         **self._native_feature_row(),
                     }
                 ],

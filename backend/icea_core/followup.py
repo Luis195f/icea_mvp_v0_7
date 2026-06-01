@@ -766,6 +766,7 @@ def build_summary_writeback(
         min_cell_count=MIN_AGGREGATE_EPISODES,
         min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
         require_staff_count=require_staff_count,
+        case_mix_spec=(artifact.metrics or {}).get("case_mix_spec") or (formula.spec or {}).get("case_mix_spec"),
     )
     suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
     state_counts = {

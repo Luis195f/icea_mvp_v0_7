@@ -31,6 +31,7 @@ from icea_core.formula import ICEAPlusComponentValue, ICEAPlusLineage, compute_r
 from icea_core.models import ICEAPlusFormulaVersion, ModelArtifact
 from icea_core.specs import build_default_icea_plus_spec, deep_merge_dict, formula_protocol_hash
 from icea_pipeline.models import CausalRun, EpisodeFeatureRow, EpisodeWindowFeatureRow, NormalizedProcedure
+from icea_pipeline.temporal import TEMPORAL_STATUSES, validate_causal_temporal_order, validate_temporal_frame
 
 FEATURE_CONTRACT_VERSION = "handover-icea-feature-v1"
 FEATURE_SOURCE_REPO = "Luis195f/HANDOVER"
@@ -132,6 +133,15 @@ def _normalize_external_rows(rows: list[dict[str, Any]] | None) -> list[dict[str
         features = _external_feature_payload(row)
         missingness = row.get("missingness_flags") if isinstance(row.get("missingness_flags"), dict) else {}
         flat = dict(features)
+        if isinstance(row.get("temporal_spec"), dict):
+            flat["temporal_spec"] = dict(row.get("temporal_spec") or {})
+        elif isinstance(features.get("temporal_spec"), dict):
+            flat["temporal_spec"] = dict(features.get("temporal_spec") or {})
+        if isinstance(row.get("feature_timestamps"), dict):
+            flat["feature_timestamps"] = dict(row.get("feature_timestamps") or {})
+        for target_key in ("delta_ri", "target", "outcome"):
+            if target_key in row and target_key not in flat:
+                flat[target_key] = row.get(target_key)
         for key, value in missingness.items():
             flag_name = str(key) if str(key).startswith("missing_") else f"missing_{key}"
             flat[flag_name] = 1.0 if _missingness_flag_is_true(value) else 0.0
@@ -495,6 +505,86 @@ def _feature_contract_failure_result(
     }
 
 
+def _temporal_guardrail_failure_result(
+    *,
+    formula: FormulaSelection,
+    model_artifact: ModelArtifact,
+    grain: str,
+    dataset: LoadedDataset,
+    issues: list[tuple[int, Any]],
+    reference_issues: list[tuple[int, Any]] | None = None,
+) -> dict[str, Any]:
+    issue_by_pos = {pos: issue for pos, issue in issues}
+    reference_issues = reference_issues or []
+    reference_warnings = sorted({warning for _, issue in reference_issues for warning in issue.warnings})
+    rows: list[dict[str, Any]] = []
+    for pos, meta in enumerate(dataset.meta_rows):
+        issue = issue_by_pos.get(pos)
+        if issue is None and reference_issues:
+            status = "blocked_by_reference_temporal_spec"
+            warnings = ["scoring_blocked_by_reference_rows_temporal_failure", *reference_warnings]
+            flags = {"leakage_blocked": True, "temporal_spec_valid": False, "insufficient_temporal_spec": True}
+        elif issue is not None:
+            status = issue.status
+            warnings = list(issue.warnings)
+            flags = dict(issue.flags)
+        else:
+            status = "temporal_leakage_blocked"
+            warnings = ["scoring_blocked_by_batch_temporal_failure"]
+            flags = {"leakage_blocked": True, "temporal_spec_valid": False}
+
+        rows.append(
+            {
+                "row_id": str(meta.get("row_id") or f"row:{pos}"),
+                "grain": grain,
+                "episode_id": meta.get("episode_id"),
+                "window_id": meta.get("window_id"),
+                "patient_key": meta.get("patient_key"),
+                "unit_id": meta.get("unit_id"),
+                "start_dt": meta.get("start_dt"),
+                "end_dt": meta.get("end_dt"),
+                "status": status,
+                "score": None,
+                "raw_score": None,
+                "components": {},
+                "flags": {**flags, "non_individual_use": True, "shadow_mode": True},
+                "warnings": sorted(set(warnings)),
+                "lineage": {
+                    "formula_version": formula.version,
+                    "formula_protocol_hash": formula.protocol_hash,
+                    "model_id": str(model_artifact.id),
+                    "model_version": str(model_artifact.version),
+                    "source": {"grain": grain, "temporal_status": status},
+                },
+            }
+        )
+
+    status_counts = {
+        "complete": 0,
+        "provisional": 0,
+        "insufficient_evidence": 0,
+        **{status: int(sum(1 for row in rows if row["status"] == status)) for status in sorted(TEMPORAL_STATUSES)},
+    }
+    return {
+        "formula_version": formula.version,
+        "formula_protocol_hash": formula.protocol_hash,
+        "formula_source": formula.source,
+        "model": {
+            "id": str(model_artifact.id),
+            "name": model_artifact.name,
+            "version": model_artifact.version,
+            "target": model_artifact.target,
+        },
+        "summary": {
+            "rows_requested": int(dataset.candidate_rows),
+            "rows_scored": 0,
+            "status_counts": status_counts,
+            "warnings": sorted({warning for row in rows for warning in row["warnings"]}),
+        },
+        "results": rows,
+    }
+
+
 
 def select_formula(version: str | None = None) -> FormulaSelection:
     qs = ICEAPlusFormulaVersion.objects.all()
@@ -789,6 +879,9 @@ def _compute_causal_effects(
     outcome = str(causal_spec.get("outcome") or "").strip()
     confounders = list(causal_spec.get("confounders") or [])
     effect_modifiers = list(causal_spec.get("effect_modifiers") or [])
+    temporal_issue = validate_causal_temporal_order(causal_spec)
+    if temporal_issue:
+        return ComponentBuildResult(raw=None, warnings=temporal_issue.warnings), None, treatment or None, outcome or None, None
     if not treatment or not outcome:
         return ComponentBuildResult(raw=None, warnings=["causal_spec_incomplete"]), None, treatment or None, outcome or None, None
 
@@ -881,6 +974,27 @@ def score_icea_plus(
             "formula_protocol_hash": formula.protocol_hash,
         }
 
+    if from_db:
+        temporal_issues = validate_temporal_frame(
+            dataset.selected_df,
+            feature_names=features,
+            target=str(model_artifact.target or "delta_ri"),
+        )
+        reference_temporal_issues = validate_temporal_frame(
+            dataset.reference_df,
+            feature_names=features,
+            target=str(model_artifact.target or "delta_ri"),
+        )
+        if temporal_issues or reference_temporal_issues:
+            return _temporal_guardrail_failure_result(
+                formula=formula,
+                model_artifact=model_artifact,
+                grain=grain,
+                dataset=dataset,
+                issues=temporal_issues,
+                reference_issues=reference_temporal_issues,
+            )
+
     if not from_db:
         contract_issues = _validate_external_feature_contract(
             rows=rows,
@@ -924,6 +1038,25 @@ def score_icea_plus(
                 input_rows=rows,
                 issues=contract_issues,
                 reference_issues=reference_contract_issues,
+            )
+        temporal_issues = validate_temporal_frame(
+            dataset.selected_df,
+            feature_names=features,
+            target=str(model_artifact.target or "delta_ri"),
+        )
+        reference_temporal_issues = validate_temporal_frame(
+            dataset.reference_df,
+            feature_names=features,
+            target=str(model_artifact.target or "delta_ri"),
+        )
+        if temporal_issues or reference_temporal_issues:
+            return _temporal_guardrail_failure_result(
+                formula=formula,
+                model_artifact=model_artifact,
+                grain=grain,
+                dataset=dataset,
+                issues=temporal_issues,
+                reference_issues=reference_temporal_issues,
             )
 
     selected_df = dataset.selected_df.copy()

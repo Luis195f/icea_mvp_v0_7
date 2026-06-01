@@ -1,0 +1,1158 @@
+from __future__ import annotations
+
+from datetime import timezone as dt_tz
+from types import SimpleNamespace
+from unittest import mock
+
+from django.contrib.auth import get_user_model
+from django.test import SimpleTestCase, TestCase
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from icea_core.aggregation import aggregate_scored_rows
+from icea_core.models import Hospital, PatientEpisode, Unit
+from icea_pipeline.models import EpisodeFeatureRow, EpisodeWindow, EpisodeWindowFeatureRow, NormalizedObservation, RosterShift
+from icea_pipeline.temporal import (
+    build_temporal_spec,
+    validate_case_mix_spec,
+    validate_causal_temporal_order,
+    validate_temporal_row,
+)
+
+
+class TemporalGuardrailUnitTests(SimpleTestCase):
+    def _spec(
+        self,
+        *,
+        index_time=None,
+        feature_start=None,
+        feature_end=None,
+        outcome_start=None,
+        outcome_end=None,
+        outcome_status="defensible_fixed_horizon",
+        treatment_start=None,
+        treatment_end=None,
+    ):
+        index = index_time or timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        feature_start = feature_start or index
+        feature_end = feature_end or timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc)
+        outcome_start = outcome_start or feature_end
+        outcome_end = outcome_end or outcome_start + timezone.timedelta(hours=12)
+        spec = build_temporal_spec(
+            index_time=index,
+            feature_window_start=feature_start,
+            feature_window_end=feature_end,
+            outcome_window_start=outcome_start,
+            outcome_window_end=outcome_end,
+        )
+        spec["outcome_status"] = outcome_status
+        if treatment_start is not None:
+            spec["treatment_window_start"] = treatment_start.isoformat()
+        if treatment_end is not None:
+            spec["treatment_window_end"] = treatment_end.isoformat()
+        return spec
+
+    def _valid_target_trial(self):
+        return {
+            "time_zero": "window_start",
+            "follow_up": {"horizon_hours": 12, "anchor": "time_zero", "mode": "fixed"},
+            "eligibility": [],
+            "estimand": "ATE",
+        }
+
+    def test_missing_index_time_blocks_defensible_scoring(self):
+        issue = validate_temporal_row({"delta_ri": 1.0}, feature_names=["ri_initial"], target="delta_ri")
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_temporal_spec")
+
+    def test_valid_temporal_spec_with_target_passes(self):
+        issue = validate_temporal_row(
+            {"delta_ri": 1.0, "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNone(issue)
+
+    def test_feature_window_start_after_feature_window_end_blocks(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 14, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 15, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("feature_window_start_after_feature_window_end", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
+    def test_outcome_window_start_after_outcome_window_end_blocks(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    outcome_start=timezone.datetime(2026, 3, 2, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_end=timezone.datetime(2026, 3, 2, 8, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("outcome_window_start_after_outcome_window_end", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
+    def test_feature_window_after_outcome_start_blocks_leakage(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    feature_end=timezone.datetime(2026, 3, 1, 16, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("feature_window_end_after_outcome_window_start", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
+    def test_index_time_after_outcome_window_start_blocks(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    index_time=timezone.datetime(2026, 3, 1, 13, 0, tzinfo=dt_tz.utc),
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("index_time_after_outcome_window_start", issue.warnings)
+        self.assertTrue(issue.flags["leakage_blocked"])
+
+    def test_legacy_last_measurement_outcome_is_not_defensible(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(outcome_status="legacy_outcome_not_defensible"),
+            },
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertEqual(issue.status, "legacy_outcome_not_defensible")
+
+    def test_same_window_exposure_outcome_without_lag_is_blocked(self):
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": self._spec(
+                    feature_end=timezone.datetime(2026, 3, 1, 20, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                ),
+            },
+            feature_names=["nurse_hppd"],
+            target="delta_ri",
+        )
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+
+    def test_none_outcome_target_is_insufficient_outcome_evidence(self):
+        issue = validate_temporal_row(
+            {"delta_ri": None, "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", issue.warnings)
+        self.assertTrue(issue.flags["insufficient_outcome_evidence"])
+
+    def test_float_nan_outcome_target_is_insufficient_outcome_evidence(self):
+        issue = validate_temporal_row(
+            {"delta_ri": float("nan"), "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", issue.warnings)
+        self.assertFalse(issue.flags["temporal_spec_valid"])
+
+    def test_numpy_nan_outcome_target_is_insufficient_outcome_evidence_when_available(self):
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy unavailable")
+
+        issue = validate_temporal_row(
+            {"delta_ri": np.nan, "temporal_spec": self._spec()},
+            feature_names=["ri_initial"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", issue.warnings)
+
+    def test_naive_feature_timestamp_with_aware_temporal_spec_does_not_type_error_and_blocks_future_feature(self):
+        temporal_spec = {
+            "temporal_spec_version": "icea_temporal_v1",
+            "index_time": "2026-03-01T08:00:00Z",
+            "feature_window_start": "2026-03-01T08:00:00Z",
+            "feature_window_end": "2026-03-01T12:00:00Z",
+            "outcome_window_start": "2026-03-01T12:00:00Z",
+            "outcome_window_end": "2026-03-02T12:00:00Z",
+            "censoring_reason": "not_censored",
+            "outcome_status": "defensible_fixed_horizon",
+        }
+        issue = validate_temporal_row(
+            {
+                "delta_ri": 1.0,
+                "temporal_spec": temporal_spec,
+                "feature_timestamps": {
+                    "vs_hr_last": timezone.datetime(2026, 3, 1, 13, 0),
+                },
+            },
+            feature_names=["vs_hr_last"],
+            target="delta_ri",
+        )
+        self.assertIsNotNone(issue)
+        self.assertEqual(issue.status, "temporal_leakage_blocked")
+        self.assertIn("future_feature_timestamps_blocked:vs_hr_last", issue.warnings)
+
+    def test_case_mix_spec_absent_is_marked_insufficient(self):
+        issue = validate_case_mix_spec(None)
+        self.assertEqual(issue.status, "case_mix_insufficient")
+
+    def test_causal_post_treatment_confounder_is_unavailable(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": ["proc_count"],
+                "dag_edges": [["nurse_hppd", "proc_count"], ["nurse_hppd", "delta_ri"]],
+                "target_trial": {"time_zero": "window_start"},
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertIn("confounder_post_treatment:proc_count", issue.warnings)
+
+    def test_incomplete_causal_temporal_spec_does_not_prove_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": {"temporal_spec_version": "icea_temporal_v1"},
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertIn("invalid_causal_temporal_spec", issue.warnings)
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_feature_window_ending_after_treatment_start_blocks_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertTrue(issue.flags["post_treatment_feature_leakage"])
+        self.assertIn("feature_window_end_after_treatment_window_start", issue.warnings)
+        self.assertIn("post_treatment_features_in_baseline_window", issue.warnings)
+
+    def test_feature_window_ending_at_treatment_start_passes_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_feature_window_ending_before_treatment_start_passes_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 9, 59, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_treatment_window_start_without_end_still_blocks_post_treatment_features(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 11, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertTrue(issue.flags["post_treatment_feature_leakage"])
+
+    def test_inverted_treatment_window_blocks_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 9, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 11, 0, tzinfo=dt_tz.utc),
+                    treatment_end=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("treatment_window_start_after_treatment_window_end", issue.warnings)
+
+    def test_dag_edge_only_does_not_prove_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "dag_edges": [["nurse_hppd", "delta_ri"]],
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_dag_edge_with_incomplete_temporal_spec_still_blocks(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "dag_edges": [["nurse_hppd", "delta_ri"]],
+                "temporal_spec": {"temporal_spec_version": "icea_temporal_v1"},
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertIn("invalid_causal_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_valid_causal_temporal_spec_proves_treatment_outcome_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_dag_edge_with_valid_causal_temporal_spec_passes(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "dag_edges": [["nurse_hppd", "delta_ri"]],
+                "temporal_spec": self._spec(),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_valid_target_trial_without_dag_edge_proves_treatment_outcome_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "target_trial": self._valid_target_trial(),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_dag_edge_with_valid_target_trial_passes(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "dag_edges": [["nurse_hppd", "delta_ri"]],
+                "target_trial": self._valid_target_trial(),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_empty_target_trial_without_dag_edge_is_blocked(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "target_trial": {},
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_missing_target_trial_temporal_spec_and_dag_edge_still_blocks(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "dag_edges": [],
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_unit_aggregation_without_case_mix_warns_not_comparable(self):
+        rows = []
+        for i in range(10):
+            rows.append(
+                {
+                    "row_id": f"r{i}",
+                    "episode_id": i,
+                    "unit_id": 1,
+                    "score": 70.0,
+                    "status": "complete",
+                    "warnings": [],
+                    "components": {},
+                    "aggregation": {"severity_weight": 1.0, "effective_exposure_share": 1.0},
+                }
+            )
+        aggregated = aggregate_scored_rows(rows=rows, group_by="unit", epsilon=1e-6, enforce_suppression=False)
+        self.assertIn("no_comparable_without_case_mix", aggregated[0]["warnings"])
+
+
+class TemporalBuildDatasetTests(TestCase):
+    def setUp(self):
+        self.dev_env = mock.patch.dict("os.environ", {"ICEA_DEV_ALLOW_INSECURE": "true"}, clear=False)
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
+        self.client = APIClient()
+        hospital = Hospital.objects.create(name="Hospital Temporal")
+        self.unit = Unit.objects.create(hospital=hospital, name="UCI")
+
+    def test_future_observation_is_excluded_and_legacy_outcome_is_flagged(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(days=3),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        NormalizedObservation.objects.create(
+            episode=episode,
+            code_system="LOINC",
+            code="8867-4",
+            display="Heart rate",
+            value_num=77.0,
+            effective_dt=admission + timezone.timedelta(hours=2),
+        )
+        NormalizedObservation.objects.create(
+            episode=episode,
+            code_system="LOINC",
+            code="8867-4",
+            display="Heart rate",
+            value_num=99.0,
+            effective_dt=admission + timezone.timedelta(days=2),
+        )
+
+        response = self.client.post("/api/v1/pipeline/build-dataset/", {"episode_id": episode.id}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "legacy_outcome_not_defensible")
+
+        row = EpisodeFeatureRow.objects.get(episode=episode)
+        self.assertEqual(row.features["vs_hr_last"], 77.0)
+        self.assertEqual(row.target["outcome_status"], "legacy_outcome_not_defensible")
+
+    def test_roster_shift_hours_are_clipped_to_feature_window(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        feature_end = admission + timezone.timedelta(hours=24)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(days=3),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission - timezone.timedelta(hours=4),
+            end_dt=admission + timezone.timedelta(hours=4),
+            rn_count=1,
+            na_count=0,
+            patient_census=2,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission + timezone.timedelta(hours=6),
+            end_dt=admission + timezone.timedelta(hours=10),
+            rn_count=5,
+            na_count=5,
+            patient_census=1,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=feature_end - timezone.timedelta(hours=6),
+            end_dt=feature_end + timezone.timedelta(hours=6),
+            rn_count=3,
+            na_count=1,
+            patient_census=1,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=feature_end + timezone.timedelta(hours=1),
+            end_dt=feature_end + timezone.timedelta(hours=5),
+            rn_count=20,
+            na_count=20,
+            patient_census=1,
+        )
+
+        response = self.client.post("/api/v1/pipeline/build-dataset/", {"episode_id": episode.id}, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        row = EpisodeFeatureRow.objects.get(episode=episode)
+        expected_nurse_hours = (1.0 * 4.0) + (10.0 * 4.0) + (4.0 * 6.0)
+        expected_rn_hours = (1.0 * 4.0) + (5.0 * 4.0) + (3.0 * 6.0)
+        expected_patient_hours = (2.0 * 4.0) + (1.0 * 4.0) + (1.0 * 6.0)
+        expected_hppd = expected_nurse_hours / (expected_patient_hours / 24.0)
+        expected_skillmix = expected_rn_hours / expected_nurse_hours
+        self.assertAlmostEqual(row.features["nurse_hppd"], expected_hppd, places=6)
+        self.assertAlmostEqual(row.features["nurse_skillmix"], expected_skillmix, places=6)
+
+    def _build_single_shift_window_with_ri(self, observations: list[tuple[object, float]], *, tolerance_minutes: int = 15):
+        admission = timezone.datetime(2026, 5, 1, 8, 0, tzinfo=dt_tz.utc)
+        outcome_start = admission + timezone.timedelta(hours=12)
+        horizon_end = outcome_start + timezone.timedelta(hours=12)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=horizon_end,
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission,
+            end_dt=outcome_start,
+            rn_count=2,
+            na_count=1,
+            patient_census=1,
+        )
+        for effective_dt, value in observations:
+            NormalizedObservation.objects.create(
+                episode=episode,
+                code_system="LOINC",
+                code="85556-9",
+                display="Rothman Index Calculated",
+                value_num=float(value),
+                effective_dt=effective_dt,
+            )
+
+        response = self.client.post(
+            "/api/v1/pipeline/build-windows/",
+            {
+                "episode_id": episode.id,
+                "truncate": True,
+                "align": "shift",
+                "follow_up_hours": 12,
+                "ri_boundary": "nearest",
+                "ri_boundary_tol_minutes": tolerance_minutes,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        return EpisodeWindowFeatureRow.objects.get(window__episode=episode), outcome_start, horizon_end
+
+    def test_build_windows_nearest_accepts_ri_before_outcome_start_within_tolerance(self):
+        row, outcome_start, horizon_end = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 19, 50, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 0, tzinfo=dt_tz.utc), 60.0),
+            ]
+        )
+
+        self.assertEqual(row.target["outcome_status"], "defensible_fixed_horizon")
+        self.assertEqual(row.target["delta_ri"], 10.0)
+        self.assertEqual(row.features["ri_window_start"], 50.0)
+        self.assertEqual(row.target["temporal_spec"]["outcome_window_start"], outcome_start.isoformat())
+        self.assertEqual(row.target["temporal_spec"]["outcome_window_end"], horizon_end.isoformat())
+
+    def test_build_windows_nearest_rejects_ri_before_outcome_start_outside_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 19, 40, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 0, tzinfo=dt_tz.utc), 60.0),
+            ]
+        )
+
+        self.assertIsNone(row.target["delta_ri"])
+        self.assertEqual(row.target["outcome_status"], "insufficient_outcome_evidence")
+        self.assertEqual(row.features["missing_delta_ri"], 1)
+
+    def test_build_windows_nearest_accepts_ri_after_horizon_end_within_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 20, 0, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 10, tzinfo=dt_tz.utc), 65.0),
+            ]
+        )
+
+        self.assertEqual(row.target["outcome_status"], "defensible_fixed_horizon")
+        self.assertEqual(row.target["delta_ri"], 15.0)
+
+    def test_build_windows_nearest_rejects_ri_after_horizon_end_outside_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 20, 0, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 20, tzinfo=dt_tz.utc), 65.0),
+            ]
+        )
+
+        self.assertIsNone(row.target["delta_ri"])
+        self.assertEqual(row.target["outcome_status"], "insufficient_outcome_evidence")
+        self.assertEqual(row.features["missing_delta_ri"], 1)
+
+    def test_build_windows_nearest_does_not_fabricate_delta_ri_without_ri_in_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 19, 40, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 20, tzinfo=dt_tz.utc), 65.0),
+            ]
+        )
+
+        self.assertIsNone(row.target["delta_ri"])
+        self.assertNotEqual(row.target["delta_ri"], 0.0)
+        self.assertEqual(row.target["outcome_status"], "insufficient_outcome_evidence")
+
+    def test_pipeline_train_prioritizes_defensible_windows_over_legacy_episode_rows(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(hours=36),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        legacy_spec = build_temporal_spec(
+            index_time=admission,
+            feature_window_start=admission,
+            feature_window_end=admission + timezone.timedelta(hours=24),
+            outcome_window_start=admission + timezone.timedelta(hours=24),
+            outcome_window_end=admission + timezone.timedelta(hours=36),
+            outcome_status="legacy_outcome_not_defensible",
+        )
+        EpisodeFeatureRow.objects.create(
+            episode=episode,
+            features={"ri_initial": 50.0, "nurse_hppd": 3.0, "temporal_spec": legacy_spec},
+            target={"delta_ri": 10.0, "temporal_spec": legacy_spec, "outcome_status": "legacy_outcome_not_defensible"},
+            schema_hash="legacy-row",
+            feature_version="v-test-legacy",
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission,
+            end_dt=admission + timezone.timedelta(hours=12),
+            rn_count=2,
+            na_count=1,
+            patient_census=1,
+        )
+        NormalizedObservation.objects.create(
+            episode=episode,
+            code_system="LOINC",
+            code="85556-9",
+            display="Rothman Index Calculated",
+            value_num=50.0,
+            effective_dt=admission + timezone.timedelta(hours=12),
+        )
+        NormalizedObservation.objects.create(
+            episode=episode,
+            code_system="LOINC",
+            code="85556-9",
+            display="Rothman Index Calculated",
+            value_num=55.0,
+            effective_dt=admission + timezone.timedelta(hours=24),
+        )
+        build_response = self.client.post(
+            "/api/v1/pipeline/build-windows/",
+            {"episode_id": episode.id, "truncate": True, "align": "shift", "follow_up_hours": 12},
+            format="json",
+        )
+        self.assertEqual(build_response.status_code, 200)
+        self.assertEqual(EpisodeWindowFeatureRow.objects.count(), 1)
+
+        with mock.patch("icea_pipeline.views.train_xgb_regressor") as train_mock:
+            train_mock.return_value = SimpleNamespace(
+                model_path="mock-window-model.json",
+                features=["ri_initial", "window_index"],
+                target="delta_ri",
+                metrics={"rmse": 0.0, "mae": 0.0, "n_rows": 1, "n_features": 2},
+            )
+            response = self.client.post("/api/v1/pipeline/train/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["dataset_grain"], "window")
+        self.assertIn("window_index", train_mock.call_args.kwargs["features"])
+
+    def test_pipeline_train_blocks_legacy_episode_rows_without_window_rows(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(days=3),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        legacy_spec = build_temporal_spec(
+            index_time=admission,
+            feature_window_start=admission,
+            feature_window_end=admission + timezone.timedelta(hours=24),
+            outcome_window_start=admission + timezone.timedelta(hours=24),
+            outcome_window_end=admission + timezone.timedelta(hours=48),
+            outcome_status="legacy_outcome_not_defensible",
+        )
+        EpisodeFeatureRow.objects.create(
+            episode=episode,
+            features={"ri_initial": 50.0, "nurse_hppd": 3.0, "temporal_spec": legacy_spec},
+            target={"delta_ri": 10.0, "temporal_spec": legacy_spec, "outcome_status": "legacy_outcome_not_defensible"},
+            schema_hash="legacy-only",
+            feature_version="v-test-legacy",
+        )
+
+        response = self.client.post("/api/v1/pipeline/train/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "dataset_not_temporally_defensible")
+        self.assertEqual(body["dataset_grain"], "episode")
+        self.assertEqual(body["status"], "legacy_outcome_not_defensible")
+        self.assertIn("legacy_outcome_not_defensible", body["warnings"])
+
+
+class TemporalCausalDiscoverTests(TestCase):
+    def setUp(self):
+        self.dev_env = mock.patch.dict(
+            "os.environ",
+            {"ICEA_DEV_ALLOW_INSECURE": "true", "ICEA_CAUSAL_DISCOVER_ENABLED": "true"},
+            clear=False,
+        )
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
+        self.client = APIClient()
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(username="temporal-discover-admin", password="test-pass", is_superuser=True)
+        self.client.force_authenticate(user=self.user)
+
+    def _rows(self, *, include_delta_ri: bool = False, include_temporal_spec: bool = False):
+        rows = []
+        for i in range(12):
+            row = {
+                "row_id": f"row-{i}",
+                "ri_initial": 40.0 + float(i),
+                "nurse_hppd": 3.0 + float(i % 4),
+                "proc_count": 1.0 + float(i % 3),
+            }
+            if include_delta_ri:
+                row["delta_ri"] = 0.5 + float(i) * 0.1
+            if include_temporal_spec:
+                row["temporal_spec"] = build_temporal_spec(
+                    index_time=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_window_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_window_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_window_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_window_end=timezone.datetime(2026, 3, 2, 12, 0, tzinfo=dt_tz.utc),
+                )
+            rows.append(row)
+        return rows
+
+    def test_causal_discover_from_external_rows_without_delta_ri_does_not_fail_missing_outcome_target(self):
+        response = self.client.post(
+            "/api/v1/causal/discover/",
+            {
+                "from_db": False,
+                "variables": ["ri_initial", "nurse_hppd", "proc_count"],
+                "rows": self._rows(),
+                "max_cond_set": 1,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertNotEqual(result.get("available"), False)
+        self.assertNotIn("missing_outcome_target", result.get("warnings", []))
+        self.assertIn("n_rows", result)
+
+    def test_causal_discover_with_declared_outcome_and_missing_target_blocks_controlled(self):
+        response = self.client.post(
+            "/api/v1/causal/discover/",
+            {
+                "from_db": False,
+                "variables": ["ri_initial", "nurse_hppd", "proc_count"],
+                "outcome": "delta_ri",
+                "rows": self._rows(include_temporal_spec=True),
+                "max_cond_set": 1,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["result"]
+        self.assertFalse(result["available"])
+        self.assertIn("missing_outcome_target", result["warnings"])
+
+
+class TemporalCausalRunWindowTests(TestCase):
+    def setUp(self):
+        self.dev_env = mock.patch.dict("os.environ", {"ICEA_DEV_ALLOW_INSECURE": "true"}, clear=False)
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
+        self.client = APIClient()
+        hospital = Hospital.objects.create(name="Hospital Causal Window")
+        self.unit = Unit.objects.create(hospital=hospital, name="UCI")
+
+    def _target_trial_spec(self, horizon_hours: int = 12):
+        return {
+            "time_zero": "window_start",
+            "follow_up": {"horizon_hours": horizon_hours, "anchor": "time_zero", "mode": "fixed"},
+            "eligibility": [],
+            "estimand": "ATE",
+        }
+
+    def _causal_spec(self, horizon_hours: int = 12):
+        return {
+            "grain": "window",
+            "treatment": "nurse_hppd",
+            "outcome": "delta_ri",
+            "confounders": ["ri_initial", "proc_count"],
+            "effect_modifiers": ["ri_initial"],
+            "dag_edges": [
+                ["ri_initial", "nurse_hppd"],
+                ["ri_initial", "delta_ri"],
+                ["proc_count", "nurse_hppd"],
+                ["proc_count", "delta_ri"],
+                ["nurse_hppd", "delta_ri"],
+            ],
+            "target_trial": self._target_trial_spec(horizon_hours),
+            "n_estimators": 20,
+        }
+
+    def _mock_causal(self):
+        causal = mock.Mock()
+        causal.effect.return_value = SimpleNamespace(cate=[1.0] * 12, shap_values=None)
+        return mock.patch("icea_pipeline.views.ICEACausal", return_value=causal)
+
+    def _create_window_rows(self, *, bad_temporal_spec: bool = False):
+        base = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        for i in range(12):
+            admission = base + timezone.timedelta(days=i)
+            episode = PatientEpisode.objects.create(
+                unit=self.unit,
+                admission_date=admission,
+                discharge_date=admission + timezone.timedelta(days=3),
+                ri_initial=50.0 + float(i),
+                ri_final=55.0 + float(i),
+            )
+            ws = admission
+            we = ws + timezone.timedelta(hours=12)
+            window = EpisodeWindow.objects.create(episode=episode, window_index=0, start_dt=ws, end_dt=we)
+            target = {"delta_ri": 999.0}
+            if bad_temporal_spec:
+                target["temporal_spec"] = build_temporal_spec(
+                    index_time=ws,
+                    feature_window_start=ws,
+                    feature_window_end=we,
+                    outcome_window_start=ws,
+                    outcome_window_end=we,
+                )
+            EpisodeWindowFeatureRow.objects.create(
+                window=window,
+                features={
+                    "ri_initial": 50.0 + float(i),
+                    "proc_count": 1.0 + float(i % 3),
+                    "nurse_hppd": 3.0 + float(i % 4),
+                },
+                target=target,
+                schema_hash=f"window-causal-{i}",
+                feature_version="v-test-window",
+            )
+            NormalizedObservation.objects.create(
+                episode=episode,
+                code_system="LOINC",
+                code="85556-9",
+                display="Rothman Index Calculated",
+                value_num=50.0 + float(i),
+                effective_dt=ws,
+            )
+            NormalizedObservation.objects.create(
+                episode=episode,
+                code_system="LOINC",
+                code="85556-9",
+                display="Rothman Index Calculated",
+                value_num=60.0 + float(i),
+                effective_dt=we,
+            )
+
+    def _create_stored_horizon_window_rows(
+        self,
+        *,
+        stored_horizon_hours: int,
+        observation_horizon_hours: int | None = None,
+        start_offset_minutes: int = 0,
+        end_offset_minutes: int = 0,
+    ):
+        base = timezone.datetime(2026, 4, 1, 8, 0, tzinfo=dt_tz.utc)
+        for i in range(12):
+            admission = base + timezone.timedelta(days=i)
+            episode = PatientEpisode.objects.create(
+                unit=self.unit,
+                admission_date=admission,
+                discharge_date=admission + timezone.timedelta(days=3),
+                ri_initial=50.0 + float(i),
+                ri_final=55.0 + float(i),
+            )
+            ws = admission
+            we = ws + timezone.timedelta(hours=12)
+            stored_outcome_end = we + timezone.timedelta(hours=stored_horizon_hours)
+            temporal_spec = build_temporal_spec(
+                index_time=ws,
+                feature_window_start=ws,
+                feature_window_end=we,
+                outcome_window_start=we,
+                outcome_window_end=stored_outcome_end,
+            )
+            window = EpisodeWindow.objects.create(episode=episode, window_index=0, start_dt=ws, end_dt=we)
+            EpisodeWindowFeatureRow.objects.create(
+                window=window,
+                features={
+                    "ri_initial": 50.0 + float(i),
+                    "proc_count": 1.0 + float(i % 3),
+                    "nurse_hppd": 3.0 + float(i % 4),
+                    "temporal_spec": temporal_spec,
+                },
+                target={
+                    "delta_ri": 12.0 + float(i),
+                    "temporal_spec": temporal_spec,
+                    "outcome_status": "defensible_fixed_horizon",
+                },
+                schema_hash=f"stored-horizon-{i}",
+                feature_version="v-test-window",
+            )
+            if observation_horizon_hours is not None:
+                NormalizedObservation.objects.create(
+                    episode=episode,
+                    code_system="LOINC",
+                    code="85556-9",
+                    display="Rothman Index Calculated",
+                    value_num=50.0 + float(i),
+                    effective_dt=we + timezone.timedelta(minutes=start_offset_minutes),
+                )
+                NormalizedObservation.objects.create(
+                    episode=episode,
+                    code_system="LOINC",
+                    code="85556-9",
+                    display="Rothman Index Calculated",
+                    value_num=70.0 + float(i),
+                    effective_dt=we + timezone.timedelta(hours=observation_horizon_hours, minutes=end_offset_minutes),
+                )
+
+    def test_causal_window_followup_does_not_use_feature_window_start_as_outcome_start(self):
+        self._create_window_rows()
+        response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec()}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+        self.assertNotEqual(summary.get("ate"), 0.0)
+
+    def test_causal_window_explicit_overlapping_outcome_window_is_blocked(self):
+        self._create_window_rows(bad_temporal_spec=True)
+        response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec()}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("stored_outcome_window_mismatch_target_trial", summary["warnings"])
+        self.assertIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
+        self.assertIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_target_trial_horizon_mismatch_blocks_without_outcome_evidence(self):
+        self._create_stored_horizon_window_rows(stored_horizon_hours=12)
+        response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec(horizon_hours=24)}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("stored_outcome_window_mismatch_target_trial", summary["warnings"])
+        self.assertIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
+        self.assertIn("missing_outcome_target", summary["warnings"])
+        self.assertNotEqual(summary.get("ate"), 0.0)
+        self.assertTrue(summary["temporal_spec_used"]["outcome_window_end"].startswith("2026-04-02T20:00:00"))
+
+    def test_causal_window_target_trial_horizon_mismatch_recomputes_to_requested_window(self):
+        self._create_stored_horizon_window_rows(stored_horizon_hours=12, observation_horizon_hours=24)
+        with self._mock_causal():
+            response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec(horizon_hours=24)}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertTrue(summary["causal_available"])
+        self.assertIn("stored_outcome_window_mismatch_target_trial", summary["warnings"])
+        self.assertIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
+        self.assertTrue(summary["temporal_spec_used"]["outcome_window_end"].startswith("2026-04-02T20:00:00"))
+
+    def test_causal_window_nearest_recalculation_uses_ri_within_boundary_tolerance(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=5,
+            end_offset_minutes=-5,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        with self._mock_causal():
+            response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertTrue(summary["causal_available"])
+        self.assertIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
+        self.assertNotIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_nearest_rejects_start_ri_far_from_boundary(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=120,
+            end_offset_minutes=0,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+        self.assertNotEqual(summary.get("ate"), 0.0)
+
+    def test_causal_window_nearest_rejects_end_ri_far_from_boundary(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=0,
+            end_offset_minutes=-120,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_nearest_does_not_mark_arbitrary_in_window_ri_defensible(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=120,
+            end_offset_minutes=-120,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_non_nearest_keeps_first_last_fallback_for_in_window_ri(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=120,
+            end_offset_minutes=-120,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "first_last"
+        spec["ri_boundary_tol_minutes"] = 15
+        with self._mock_causal():
+            response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertTrue(summary["causal_available"])
+        self.assertNotIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_matching_target_trial_horizon_reuses_stored_outcome(self):
+        self._create_stored_horizon_window_rows(stored_horizon_hours=12)
+        with self._mock_causal():
+            response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec(horizon_hours=12)}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertTrue(summary["causal_available"])
+        self.assertNotIn("stored_outcome_window_mismatch_target_trial", summary["warnings"])
+        self.assertNotIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
+        self.assertTrue(summary["temporal_spec_used"]["outcome_window_end"].startswith("2026-04-02T08:00:00"))

@@ -6,6 +6,13 @@
 
 Scores episode- or window-grain rows for governed research/service flows. Dashboard and export surfaces must treat row-level output as shadow-only and must not expose it as an operational patient, episode, nurse, team, or shift score.
 
+Scoring is fail-closed for temporal defensibility. DB rows and controlled external
+payloads must include `temporal_spec` with `index_time`, feature window, outcome
+window, censoring, and `temporal_spec_version`. Without that contract the response
+contains statuses such as `insufficient_temporal_spec`, `temporal_leakage_blocked`,
+`legacy_outcome_not_defensible`, or `insufficient_outcome_evidence`, and numeric
+`score` / `raw_score` are `null`.
+
 #### Request patterns
 
 1. DB-backed scoring
@@ -48,11 +55,28 @@ Scores episode- or window-grain rows for governed research/service flows. Dashbo
       "missing_loinc_85556_9_t1": 0,
       "missing_delta_ri": 0,
       "delta_ri": 8.1,
+      "temporal_spec": {
+        "temporal_spec_version": "icea_temporal_v1",
+        "index_time": "2026-03-08T08:00:00Z",
+        "feature_window_start": "2026-03-08T08:00:00Z",
+        "feature_window_end": "2026-03-08T14:00:00Z",
+        "outcome_window_start": "2026-03-08T14:00:00Z",
+        "outcome_window_end": "2026-03-09T14:00:00Z",
+        "censoring_reason": "not_censored"
+      },
       "nurse_shares": {"Practitioner/nurse-1": 0.6, "Practitioner/nurse-2": 0.4}
     }
   ]
 }
 ```
+
+### Temporal and Causal Guardrails
+
+- `/pipeline/build-dataset/` now materializes episode rows as legacy/provisional when the target is discharge or final-stay `delta_ri`.
+- `/pipeline/build-windows/` separates feature windows from outcome windows; same-window exposure/outcome without lag is not treated as defensible.
+- `/pipeline/train/` rejects rows that are not temporally defensible.
+- `/causal/run/` and `/causal/simulate/` return `causal_available=false` when treatment, confounders, and outcome ordering cannot be proven.
+- Aggregate endpoints warn `no_comparable_without_case_mix` when unit/date/shift comparisons lack explicit case-mix specification.
 
 #### Response sketch
 

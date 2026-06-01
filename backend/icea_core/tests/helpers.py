@@ -15,6 +15,7 @@ from icea_pipeline.models import (
     EpisodeWindowFeatureRow,
     NormalizedProcedure,
 )
+from icea_pipeline.temporal import build_temporal_spec
 
 
 class ICEAPlusFixtureMixin:
@@ -46,7 +47,11 @@ class ICEAPlusFixtureMixin:
             EpisodeFeatureRow.objects.create(
                 episode=episode,
                 features={k: float(v) for k, v in row.drop(labels=["delta_ri"]).to_dict().items()},
-                target={"delta_ri": float(row["delta_ri"])},
+                target={
+                    "delta_ri": float(row["delta_ri"]),
+                    "temporal_spec": cls._episode_temporal_spec(episode),
+                    "outcome_status": "defensible_fixed_horizon",
+                },
                 schema_hash=f"episode-{i}",
                 feature_version="v-test",
             )
@@ -79,7 +84,11 @@ class ICEAPlusFixtureMixin:
             EpisodeWindowFeatureRow.objects.create(
                 window=window,
                 features={k: float(v) for k, v in row.drop(labels=["delta_ri"]).to_dict().items()},
-                target={"delta_ri": float(row["delta_ri"])},
+                target={
+                    "delta_ri": float(row["delta_ri"]),
+                    "temporal_spec": cls._window_temporal_spec(window),
+                    "outcome_status": "defensible_fixed_horizon",
+                },
                 schema_hash=f"window-{i}",
                 feature_version="v-test-window",
             )
@@ -142,6 +151,31 @@ class ICEAPlusFixtureMixin:
                 }
             )
         return pd.DataFrame(rows)
+
+    @classmethod
+    def _episode_temporal_spec(cls, episode: PatientEpisode) -> dict:
+        feature_end = episode.admission_date + timezone.timedelta(hours=12)
+        outcome_start = feature_end
+        outcome_end = outcome_start + timezone.timedelta(hours=12)
+        return build_temporal_spec(
+            index_time=episode.admission_date,
+            feature_window_start=episode.admission_date,
+            feature_window_end=feature_end,
+            outcome_window_start=outcome_start,
+            outcome_window_end=outcome_end,
+        )
+
+    @classmethod
+    def _window_temporal_spec(cls, window: EpisodeWindow) -> dict:
+        outcome_start = window.end_dt
+        outcome_end = outcome_start + timezone.timedelta(hours=12)
+        return build_temporal_spec(
+            index_time=window.start_dt,
+            feature_window_start=window.start_dt,
+            feature_window_end=window.end_dt,
+            outcome_window_start=outcome_start,
+            outcome_window_end=outcome_end,
+        )
 
     @classmethod
     def _build_window_frame(cls, n_rows: int) -> pd.DataFrame:

@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from icea_pipeline.temporal import validate_case_mix_spec
+
 
 MIN_AGGREGATE_EPISODES = 10
 MIN_STAFF_FOR_STAFF_DIMENSION = 5
@@ -112,6 +114,7 @@ def aggregate_scored_rows(
     min_cell_count: int = MIN_AGGREGATE_EPISODES,
     min_staff_count: int = MIN_STAFF_FOR_STAFF_DIMENSION,
     require_staff_count: bool = False,
+    case_mix_spec: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"rows": [], "weights": [], "component_vectors": defaultdict(list)}
@@ -191,6 +194,9 @@ def aggregate_scored_rows(
             suppression_reasons.append("n_episodes_below_min_cell_count")
         if enforce_suppression and require_staff_count and n_staff < int(min_staff_count):
             suppression_reasons.append("n_staff_below_min_staff_count")
+        case_mix_issue = validate_case_mix_spec(case_mix_spec)
+        if group_by in {"unit", "date", "shift"} and case_mix_issue:
+            warnings = sorted(set(warnings + case_mix_issue.warnings + ["no_comparable_without_case_mix"]))
         suppressed = bool(suppression_reasons)
         if suppressed:
             agg_score = None
