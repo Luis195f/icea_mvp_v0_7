@@ -1332,7 +1332,7 @@ class CausalRunView(APIView):
                         if ri_boundary == "nearest":
                             ri_start = _pick_nearest(series, outcome_start, ri_tol_min)
                             ri_end = _pick_nearest(series, horizon_end, ri_tol_min)
-                        if ri_start is None or ri_end is None:
+                        elif ri_start is None or ri_end is None:
                             # fallback: first point >= outcome_start and last point <= horizon_end
                             within = [(dt, v) for dt, v in series if dt >= outcome_start and dt <= horizon_end]
                             if len(within) >= 2:

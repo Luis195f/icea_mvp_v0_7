@@ -941,7 +941,14 @@ class TemporalCausalRunWindowTests(TestCase):
                 effective_dt=we,
             )
 
-    def _create_stored_horizon_window_rows(self, *, stored_horizon_hours: int, observation_horizon_hours: int | None = None):
+    def _create_stored_horizon_window_rows(
+        self,
+        *,
+        stored_horizon_hours: int,
+        observation_horizon_hours: int | None = None,
+        start_offset_minutes: int = 0,
+        end_offset_minutes: int = 0,
+    ):
         base = timezone.datetime(2026, 4, 1, 8, 0, tzinfo=dt_tz.utc)
         for i in range(12):
             admission = base + timezone.timedelta(days=i)
@@ -986,7 +993,7 @@ class TemporalCausalRunWindowTests(TestCase):
                     code="85556-9",
                     display="Rothman Index Calculated",
                     value_num=50.0 + float(i),
-                    effective_dt=we,
+                    effective_dt=we + timezone.timedelta(minutes=start_offset_minutes),
                 )
                 NormalizedObservation.objects.create(
                     episode=episode,
@@ -994,7 +1001,7 @@ class TemporalCausalRunWindowTests(TestCase):
                     code="85556-9",
                     display="Rothman Index Calculated",
                     value_num=70.0 + float(i),
-                    effective_dt=we + timezone.timedelta(hours=observation_horizon_hours),
+                    effective_dt=we + timezone.timedelta(hours=observation_horizon_hours, minutes=end_offset_minutes),
                 )
 
     def test_causal_window_followup_does_not_use_feature_window_start_as_outcome_start(self):
@@ -1045,6 +1052,98 @@ class TemporalCausalRunWindowTests(TestCase):
         self.assertIn("stored_outcome_window_mismatch_target_trial", summary["warnings"])
         self.assertIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
         self.assertTrue(summary["temporal_spec_used"]["outcome_window_end"].startswith("2026-04-02T20:00:00"))
+
+    def test_causal_window_nearest_recalculation_uses_ri_within_boundary_tolerance(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=5,
+            end_offset_minutes=-5,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        with self._mock_causal():
+            response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertTrue(summary["causal_available"])
+        self.assertIn("outcome_recomputed_for_target_trial_horizon", summary["warnings"])
+        self.assertNotIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_nearest_rejects_start_ri_far_from_boundary(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=120,
+            end_offset_minutes=0,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+        self.assertNotEqual(summary.get("ate"), 0.0)
+
+    def test_causal_window_nearest_rejects_end_ri_far_from_boundary(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=0,
+            end_offset_minutes=-120,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_nearest_does_not_mark_arbitrary_in_window_ri_defensible(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=120,
+            end_offset_minutes=-120,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "nearest"
+        spec["ri_boundary_tol_minutes"] = 15
+        response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+
+    def test_causal_window_non_nearest_keeps_first_last_fallback_for_in_window_ri(self):
+        self._create_stored_horizon_window_rows(
+            stored_horizon_hours=12,
+            observation_horizon_hours=24,
+            start_offset_minutes=120,
+            end_offset_minutes=-120,
+        )
+        spec = self._causal_spec(horizon_hours=24)
+        spec["ri_boundary"] = "first_last"
+        spec["ri_boundary_tol_minutes"] = 15
+        with self._mock_causal():
+            response = self.client.post("/api/v1/causal/run/", {"spec": spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertTrue(summary["causal_available"])
+        self.assertNotIn("missing_outcome_target", summary["warnings"])
 
     def test_causal_window_matching_target_trial_horizon_reuses_stored_outcome(self):
         self._create_stored_horizon_window_rows(stored_horizon_hours=12)
