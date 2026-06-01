@@ -10,7 +10,7 @@ from rest_framework.test import APIClient
 
 from icea_core.aggregation import aggregate_scored_rows
 from icea_core.models import Hospital, PatientEpisode, Unit
-from icea_pipeline.models import EpisodeFeatureRow, EpisodeWindow, EpisodeWindowFeatureRow, NormalizedObservation
+from icea_pipeline.models import EpisodeFeatureRow, EpisodeWindow, EpisodeWindowFeatureRow, NormalizedObservation, RosterShift
 from icea_pipeline.temporal import (
     build_temporal_spec,
     validate_case_mix_spec,
@@ -267,6 +267,61 @@ class TemporalBuildDatasetTests(TestCase):
         row = EpisodeFeatureRow.objects.get(episode=episode)
         self.assertEqual(row.features["vs_hr_last"], 77.0)
         self.assertEqual(row.target["outcome_status"], "legacy_outcome_not_defensible")
+
+    def test_roster_shift_hours_are_clipped_to_feature_window(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        feature_end = admission + timezone.timedelta(hours=24)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(days=3),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission - timezone.timedelta(hours=4),
+            end_dt=admission + timezone.timedelta(hours=4),
+            rn_count=1,
+            na_count=0,
+            patient_census=2,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission + timezone.timedelta(hours=6),
+            end_dt=admission + timezone.timedelta(hours=10),
+            rn_count=5,
+            na_count=5,
+            patient_census=1,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=feature_end - timezone.timedelta(hours=6),
+            end_dt=feature_end + timezone.timedelta(hours=6),
+            rn_count=3,
+            na_count=1,
+            patient_census=1,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=feature_end + timezone.timedelta(hours=1),
+            end_dt=feature_end + timezone.timedelta(hours=5),
+            rn_count=20,
+            na_count=20,
+            patient_census=1,
+        )
+
+        response = self.client.post("/api/v1/pipeline/build-dataset/", {"episode_id": episode.id}, format="json")
+        self.assertEqual(response.status_code, 200)
+
+        row = EpisodeFeatureRow.objects.get(episode=episode)
+        expected_nurse_hours = (1.0 * 4.0) + (10.0 * 4.0) + (4.0 * 6.0)
+        expected_rn_hours = (1.0 * 4.0) + (5.0 * 4.0) + (3.0 * 6.0)
+        expected_patient_hours = (2.0 * 4.0) + (1.0 * 4.0) + (1.0 * 6.0)
+        expected_hppd = expected_nurse_hours / (expected_patient_hours / 24.0)
+        expected_skillmix = expected_rn_hours / expected_nurse_hours
+        self.assertAlmostEqual(row.features["nurse_hppd"], expected_hppd, places=6)
+        self.assertAlmostEqual(row.features["nurse_skillmix"], expected_skillmix, places=6)
 
 
 class TemporalCausalDiscoverTests(TestCase):

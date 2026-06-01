@@ -89,6 +89,35 @@ def _stable_schema_hash(features: dict[str, Any], target: dict[str, Any]) -> str
     return hashlib.sha256(("|".join(sorted(features.keys())) + "#" + "|".join(sorted(target.keys()))).encode("utf-8")).hexdigest()
 
 
+def _to_utc_aware(value: Any):
+    if isinstance(value, datetime):
+        dt = value
+    elif value:
+        dt = parse_datetime(str(value))
+    else:
+        dt = None
+    if dt is None:
+        return None
+    if timezone.is_naive(dt):
+        return dt.replace(tzinfo=dt_tz.utc)
+    return dt.astimezone(dt_tz.utc)
+
+
+def _positive_overlap(start: Any, end: Any, window_start: Any, window_end: Any):
+    start_dt = _to_utc_aware(start)
+    end_dt = _to_utc_aware(end)
+    window_start_dt = _to_utc_aware(window_start)
+    window_end_dt = _to_utc_aware(window_end)
+    if not all([start_dt, end_dt, window_start_dt, window_end_dt]):
+        return None, None, 0.0
+    overlap_start = max(start_dt, window_start_dt)
+    overlap_end = min(end_dt, window_end_dt)
+    overlap_hours = max((overlap_end - overlap_start).total_seconds() / 3600.0, 0.0)
+    if overlap_hours <= 0:
+        return overlap_start, overlap_end, 0.0
+    return overlap_start, overlap_end, overlap_hours
+
+
 class PipelineIngestView(APIView):
     """FHIR ingestion.
 
@@ -411,13 +440,15 @@ class PipelineBuildDatasetView(APIView):
 
             if shifts.exists():
                 for s in shifts:
-                    dur_h = max((s.end_dt - s.start_dt).total_seconds() / 3600.0, 0.0)
+                    overlap_start, overlap_end, dur_h = _positive_overlap(s.start_dt, s.end_dt, start, end)
+                    if dur_h <= 0:
+                        continue
                     n = float(max(s.rn_count + s.na_count, 0))
                     rn = float(max(s.rn_count, 0))
                     census = s.patient_census
                     if census is None:
-                        census = PatientEpisode.objects.filter(unit=ep.unit, admission_date__lte=s.end_dt).filter(
-                            Q(discharge_date__isnull=True) | Q(discharge_date__gte=s.start_dt)
+                        census = PatientEpisode.objects.filter(unit=ep.unit, admission_date__lte=overlap_end).filter(
+                            Q(discharge_date__isnull=True) | Q(discharge_date__gte=overlap_start)
                         ).count()
                     census = max(int(census or 0), 1)
                     nurse_hours += n * dur_h
@@ -635,9 +666,9 @@ class PipelineBuildWindowsView(APIView):
                     patient_hours = 0.0
                     if shifts.exists():
                         for s in shifts:
-                            ss = max(s.start_dt, ws)
-                            se = min(s.end_dt, we)
-                            dur_h = max((se - ss).total_seconds() / 3600.0, 0.0)
+                            ss, se, dur_h = _positive_overlap(s.start_dt, s.end_dt, ws, we)
+                            if dur_h <= 0:
+                                continue
                             n = float(max(s.rn_count + s.na_count, 0))
                             rn = float(max(s.rn_count, 0))
                             census = s.patient_census
