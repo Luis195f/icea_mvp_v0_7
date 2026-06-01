@@ -127,16 +127,18 @@ def _causal_temporal_spec_warnings(spec: dict[str, Any]) -> list[str]:
     feature_end = _parse_dt(temporal_spec.get("feature_window_end"))
     outcome_start = _parse_dt(temporal_spec.get("outcome_window_start"))
     outcome_end = _parse_dt(temporal_spec.get("outcome_window_end"))
-    treatment_start = _parse_dt(
+    treatment_start_value = (
         temporal_spec.get("treatment_window_start")
         or temporal_spec.get("treatment_start")
         or temporal_spec.get("treatment_time")
     )
-    treatment_end = _parse_dt(
+    treatment_end_value = (
         temporal_spec.get("treatment_window_end")
         or temporal_spec.get("treatment_end")
         or temporal_spec.get("treatment_time")
     )
+    treatment_start = _parse_dt(treatment_start_value)
+    treatment_end = _parse_dt(treatment_end_value)
 
     warnings: list[str] = []
     if feature_start is None or feature_end is None or outcome_start is None or outcome_end is None:
@@ -148,11 +150,12 @@ def _causal_temporal_spec_warnings(spec: dict[str, Any]) -> list[str]:
         warnings.append("outcome_window_start_after_outcome_window_end")
 
     exposure_start = treatment_start or feature_start
-    exposure_end = treatment_end or feature_end
+    exposure_end = treatment_end or treatment_start or feature_end
     if exposure_start > exposure_end:
         warnings.append("treatment_window_start_after_treatment_window_end")
-    if feature_start > exposure_start:
-        warnings.append("feature_window_start_after_treatment_window_start")
+    if treatment_start is not None and feature_end > treatment_start:
+        warnings.append("feature_window_end_after_treatment_window_start")
+        warnings.append("post_treatment_features_in_baseline_window")
     if exposure_end > outcome_start:
         warnings.append("treatment_outcome_temporal_order_not_proven")
     if warnings:
@@ -378,9 +381,12 @@ def validate_causal_temporal_order(spec: dict[str, Any]) -> TemporalIssue | None
             warnings.append(f"confounder_not_pre_treatment_in_dag:{c}")
 
     if warnings:
+        flags = {"causal_available": False, "leakage_blocked": True}
+        if any(w in warnings for w in ("feature_window_end_after_treatment_window_start", "post_treatment_features_in_baseline_window")):
+            flags["post_treatment_feature_leakage"] = True
         return TemporalIssue(
             "temporal_leakage_blocked",
             sorted(set(warnings)),
-            {"causal_available": False, "leakage_blocked": True},
+            flags,
         )
     return None

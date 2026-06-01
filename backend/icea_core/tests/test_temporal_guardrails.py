@@ -30,6 +30,8 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         outcome_start=None,
         outcome_end=None,
         outcome_status="defensible_fixed_horizon",
+        treatment_start=None,
+        treatment_end=None,
     ):
         index = index_time or timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
         feature_start = feature_start or index
@@ -44,6 +46,10 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
             outcome_window_end=outcome_end,
         )
         spec["outcome_status"] = outcome_status
+        if treatment_start is not None:
+            spec["treatment_window_start"] = treatment_start.isoformat()
+        if treatment_end is not None:
+            spec["treatment_window_end"] = treatment_end.isoformat()
         return spec
 
     def _valid_target_trial(self):
@@ -257,6 +263,93 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         self.assertIn("invalid_causal_temporal_spec", issue.warnings)
         self.assertIn("insufficient_temporal_spec", issue.warnings)
         self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_feature_window_ending_after_treatment_start_blocks_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertTrue(issue.flags["post_treatment_feature_leakage"])
+        self.assertIn("feature_window_end_after_treatment_window_start", issue.warnings)
+        self.assertIn("post_treatment_features_in_baseline_window", issue.warnings)
+
+    def test_feature_window_ending_at_treatment_start_passes_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_feature_window_ending_before_treatment_start_passes_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 9, 59, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNone(issue)
+
+    def test_treatment_window_start_without_end_still_blocks_post_treatment_features(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 11, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertTrue(issue.flags["post_treatment_feature_leakage"])
+
+    def test_inverted_treatment_window_blocks_causal_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(
+                    feature_start=timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc),
+                    feature_end=timezone.datetime(2026, 3, 1, 9, 0, tzinfo=dt_tz.utc),
+                    outcome_start=timezone.datetime(2026, 3, 1, 12, 0, tzinfo=dt_tz.utc),
+                    treatment_start=timezone.datetime(2026, 3, 1, 11, 0, tzinfo=dt_tz.utc),
+                    treatment_end=timezone.datetime(2026, 3, 1, 10, 0, tzinfo=dt_tz.utc),
+                ),
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertIn("treatment_window_start_after_treatment_window_end", issue.warnings)
 
     def test_dag_edge_only_does_not_prove_temporal_order(self):
         issue = validate_causal_temporal_order(
