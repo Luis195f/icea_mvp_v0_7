@@ -118,6 +118,52 @@ def _target_trial_has_temporal_order(spec: dict[str, Any]) -> bool:
     return True
 
 
+def _causal_temporal_spec_warnings(spec: dict[str, Any]) -> list[str]:
+    temporal_spec = _as_dict(spec.get("temporal_spec"))
+    if not temporal_spec:
+        return ["insufficient_temporal_spec", "invalid_causal_temporal_spec"]
+
+    feature_start = _parse_dt(temporal_spec.get("feature_window_start"))
+    feature_end = _parse_dt(temporal_spec.get("feature_window_end"))
+    outcome_start = _parse_dt(temporal_spec.get("outcome_window_start"))
+    outcome_end = _parse_dt(temporal_spec.get("outcome_window_end"))
+    treatment_start = _parse_dt(
+        temporal_spec.get("treatment_window_start")
+        or temporal_spec.get("treatment_start")
+        or temporal_spec.get("treatment_time")
+    )
+    treatment_end = _parse_dt(
+        temporal_spec.get("treatment_window_end")
+        or temporal_spec.get("treatment_end")
+        or temporal_spec.get("treatment_time")
+    )
+
+    warnings: list[str] = []
+    if feature_start is None or feature_end is None or outcome_start is None or outcome_end is None:
+        warnings.extend(["insufficient_temporal_spec", "invalid_causal_temporal_spec"])
+        return warnings
+    if feature_start > feature_end:
+        warnings.append("feature_window_start_after_feature_window_end")
+    if outcome_start > outcome_end:
+        warnings.append("outcome_window_start_after_outcome_window_end")
+
+    exposure_start = treatment_start or feature_start
+    exposure_end = treatment_end or feature_end
+    if exposure_start > exposure_end:
+        warnings.append("treatment_window_start_after_treatment_window_end")
+    if feature_start > exposure_start:
+        warnings.append("feature_window_start_after_treatment_window_start")
+    if exposure_end > outcome_start:
+        warnings.append("treatment_outcome_temporal_order_not_proven")
+    if warnings:
+        warnings.append("invalid_causal_temporal_spec")
+    return warnings
+
+
+def _has_valid_causal_temporal_spec(spec: dict[str, Any]) -> bool:
+    return bool(_as_dict(spec.get("temporal_spec"))) and not _causal_temporal_spec_warnings(spec)
+
+
 def build_temporal_spec(
     *,
     index_time: datetime,
@@ -309,17 +355,21 @@ def validate_causal_temporal_order(spec: dict[str, Any]) -> TemporalIssue | None
     confounders = [str(c) for c in (spec.get("confounders") or []) if str(c)]
     dag_edges = [list(edge) for edge in (spec.get("dag_edges") or []) if isinstance(edge, (list, tuple)) and len(edge) == 2]
     post_treatment = {str(v) for v in (spec.get("post_treatment_variables") or []) if str(v)}
-    has_temporal_spec = bool(spec.get("temporal_spec"))
+    has_temporal_spec = _has_valid_causal_temporal_spec(spec)
+    temporal_spec_supplied = bool(_as_dict(spec.get("temporal_spec")))
+    temporal_spec_warnings = _causal_temporal_spec_warnings(spec) if temporal_spec_supplied else []
     target_trial_has_order = _target_trial_has_temporal_order(spec)
+    treatment_outcome_edge = [treatment, outcome] in dag_edges
 
     warnings: list[str] = []
     if not treatment:
         warnings.append("treatment_missing")
     if spec.get("target_trial") and not target_trial_has_order:
         warnings.append("target_trial_temporal_order_not_demonstrated")
-    if not target_trial_has_order and not has_temporal_spec:
+    warnings.extend(temporal_spec_warnings)
+    if not target_trial_has_order and not has_temporal_spec and not treatment_outcome_edge:
         warnings.append("insufficient_temporal_spec")
-    if [treatment, outcome] not in dag_edges and not has_temporal_spec and not target_trial_has_order:
+    if not treatment_outcome_edge and not has_temporal_spec and not target_trial_has_order:
         warnings.append("treatment_outcome_temporal_order_not_proven")
     for c in confounders:
         if c in post_treatment or [treatment, c] in dag_edges:

@@ -843,8 +843,17 @@ class PipelineTrainFromDBView(APIView):
         name = payload.get("name", "icea-xgb")
         version = payload.get("version", "v0.5.1")
         target = payload.get("target", "delta_ri")
+        grain = str(payload.get("grain") or "auto").strip().lower()
 
-        rows = list(EpisodeFeatureRow.objects.all())
+        window_rows = []
+        if grain in {"auto", "window"}:
+            window_rows = list(EpisodeWindowFeatureRow.objects.select_related("window", "window__episode").all())
+        if grain == "window" or (grain == "auto" and window_rows):
+            rows = window_rows
+            dataset_grain = "window"
+        else:
+            rows = list(EpisodeFeatureRow.objects.select_related("episode").all())
+            dataset_grain = "episode"
         dataset: list[dict[str, Any]] = []
         for r in rows:
             row = dict(r.features)
@@ -852,7 +861,9 @@ class PipelineTrainFromDBView(APIView):
             dataset.append(row)
 
         if not dataset:
-            return Response({"detail": "No dataset rows. Run build-dataset first."}, status=400)
+            if dataset_grain == "window":
+                return Response({"detail": "No window dataset rows. Run build-windows first.", "dataset_grain": dataset_grain}, status=400)
+            return Response({"detail": "No dataset rows. Run build-dataset first.", "dataset_grain": dataset_grain}, status=400)
 
         df = pd.DataFrame(dataset)
         temporal_issues = validate_temporal_frame(df, feature_names=[c for c in df.columns if c != target], target=target)
@@ -860,6 +871,7 @@ class PipelineTrainFromDBView(APIView):
             return Response(
                 {
                     "detail": "dataset_not_temporally_defensible",
+                    "dataset_grain": dataset_grain,
                     "status": temporal_issues[0][1].status,
                     "warnings": sorted({warning for _, issue in temporal_issues for warning in issue.warnings}),
                     "blocked_rows": int(len(temporal_issues)),
@@ -897,8 +909,27 @@ class PipelineTrainFromDBView(APIView):
         )
 
         TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
-        append_audit_event(event_type="train_model", payload={"model_id": str(artifact.id), "name": name, "version": version, "target": target, "rows": int(len(df))}, context="pipeline/train")
-        return Response({"model_id": str(artifact.id), "name": name, "version": version, "metrics": result.metrics})
+        append_audit_event(
+            event_type="train_model",
+            payload={
+                "model_id": str(artifact.id),
+                "name": name,
+                "version": version,
+                "target": target,
+                "rows": int(len(df)),
+                "dataset_grain": dataset_grain,
+            },
+            context="pipeline/train",
+        )
+        return Response(
+            {
+                "model_id": str(artifact.id),
+                "name": name,
+                "version": version,
+                "dataset_grain": dataset_grain,
+                "metrics": result.metrics,
+            }
+        )
 
 
 class DashboardSummaryView(APIView):

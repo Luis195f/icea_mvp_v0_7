@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timezone as dt_tz
+from types import SimpleNamespace
 from unittest import mock
 
 from django.contrib.auth import get_user_model
@@ -242,6 +243,32 @@ class TemporalGuardrailUnitTests(SimpleTestCase):
         self.assertFalse(issue.flags["causal_available"])
         self.assertIn("confounder_post_treatment:proc_count", issue.warnings)
 
+    def test_incomplete_causal_temporal_spec_does_not_prove_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": {"temporal_spec_version": "icea_temporal_v1"},
+            }
+        )
+        self.assertIsNotNone(issue)
+        self.assertFalse(issue.flags["causal_available"])
+        self.assertIn("invalid_causal_temporal_spec", issue.warnings)
+        self.assertIn("insufficient_temporal_spec", issue.warnings)
+        self.assertIn("treatment_outcome_temporal_order_not_proven", issue.warnings)
+
+    def test_valid_causal_temporal_spec_proves_treatment_outcome_temporal_order(self):
+        issue = validate_causal_temporal_order(
+            {
+                "treatment": "nurse_hppd",
+                "outcome": "delta_ri",
+                "confounders": [],
+                "temporal_spec": self._spec(),
+            }
+        )
+        self.assertIsNone(issue)
+
     def test_valid_target_trial_without_dag_edge_proves_treatment_outcome_temporal_order(self):
         issue = validate_causal_temporal_order(
             {
@@ -395,6 +422,110 @@ class TemporalBuildDatasetTests(TestCase):
         expected_skillmix = expected_rn_hours / expected_nurse_hours
         self.assertAlmostEqual(row.features["nurse_hppd"], expected_hppd, places=6)
         self.assertAlmostEqual(row.features["nurse_skillmix"], expected_skillmix, places=6)
+
+    def test_pipeline_train_prioritizes_defensible_windows_over_legacy_episode_rows(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(hours=36),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        legacy_spec = build_temporal_spec(
+            index_time=admission,
+            feature_window_start=admission,
+            feature_window_end=admission + timezone.timedelta(hours=24),
+            outcome_window_start=admission + timezone.timedelta(hours=24),
+            outcome_window_end=admission + timezone.timedelta(hours=36),
+            outcome_status="legacy_outcome_not_defensible",
+        )
+        EpisodeFeatureRow.objects.create(
+            episode=episode,
+            features={"ri_initial": 50.0, "nurse_hppd": 3.0, "temporal_spec": legacy_spec},
+            target={"delta_ri": 10.0, "temporal_spec": legacy_spec, "outcome_status": "legacy_outcome_not_defensible"},
+            schema_hash="legacy-row",
+            feature_version="v-test-legacy",
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission,
+            end_dt=admission + timezone.timedelta(hours=12),
+            rn_count=2,
+            na_count=1,
+            patient_census=1,
+        )
+        NormalizedObservation.objects.create(
+            episode=episode,
+            code_system="LOINC",
+            code="85556-9",
+            display="Rothman Index Calculated",
+            value_num=50.0,
+            effective_dt=admission + timezone.timedelta(hours=12),
+        )
+        NormalizedObservation.objects.create(
+            episode=episode,
+            code_system="LOINC",
+            code="85556-9",
+            display="Rothman Index Calculated",
+            value_num=55.0,
+            effective_dt=admission + timezone.timedelta(hours=24),
+        )
+        build_response = self.client.post(
+            "/api/v1/pipeline/build-windows/",
+            {"episode_id": episode.id, "truncate": True, "align": "shift", "follow_up_hours": 12},
+            format="json",
+        )
+        self.assertEqual(build_response.status_code, 200)
+        self.assertEqual(EpisodeWindowFeatureRow.objects.count(), 1)
+
+        with mock.patch("icea_pipeline.views.train_xgb_regressor") as train_mock:
+            train_mock.return_value = SimpleNamespace(
+                model_path="mock-window-model.json",
+                features=["ri_initial", "window_index"],
+                target="delta_ri",
+                metrics={"rmse": 0.0, "mae": 0.0, "n_rows": 1, "n_features": 2},
+            )
+            response = self.client.post("/api/v1/pipeline/train/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["dataset_grain"], "window")
+        self.assertIn("window_index", train_mock.call_args.kwargs["features"])
+
+    def test_pipeline_train_blocks_legacy_episode_rows_without_window_rows(self):
+        admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=admission + timezone.timedelta(days=3),
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        legacy_spec = build_temporal_spec(
+            index_time=admission,
+            feature_window_start=admission,
+            feature_window_end=admission + timezone.timedelta(hours=24),
+            outcome_window_start=admission + timezone.timedelta(hours=24),
+            outcome_window_end=admission + timezone.timedelta(hours=48),
+            outcome_status="legacy_outcome_not_defensible",
+        )
+        EpisodeFeatureRow.objects.create(
+            episode=episode,
+            features={"ri_initial": 50.0, "nurse_hppd": 3.0, "temporal_spec": legacy_spec},
+            target={"delta_ri": 10.0, "temporal_spec": legacy_spec, "outcome_status": "legacy_outcome_not_defensible"},
+            schema_hash="legacy-only",
+            feature_version="v-test-legacy",
+        )
+
+        response = self.client.post("/api/v1/pipeline/train/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "dataset_not_temporally_defensible")
+        self.assertEqual(body["dataset_grain"], "episode")
+        self.assertEqual(body["status"], "legacy_outcome_not_defensible")
+        self.assertIn("legacy_outcome_not_defensible", body["warnings"])
 
 
 class TemporalCausalDiscoverTests(TestCase):
