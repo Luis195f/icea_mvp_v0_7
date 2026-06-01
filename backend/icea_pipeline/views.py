@@ -717,7 +717,14 @@ class PipelineBuildWindowsView(APIView):
                     horizon_end = outcome_end
                     obs_t = obs.none()
                     if outcome_start is not None and horizon_end is not None:
-                        obs_t = obs.filter(effective_dt__gte=outcome_start, effective_dt__lte=horizon_end).order_by("effective_dt")
+                        if ri_boundary == "nearest":
+                            tolerance = timedelta(minutes=ri_tol_min)
+                            obs_t = obs.filter(
+                                effective_dt__gte=outcome_start - tolerance,
+                                effective_dt__lte=horizon_end + tolerance,
+                            ).order_by("effective_dt")
+                        else:
+                            obs_t = obs.filter(effective_dt__gte=outcome_start, effective_dt__lte=horizon_end).order_by("effective_dt")
                     ri_series = _ri_obs(obs_t)
                     ri_start = None
                     ri_end = None
@@ -725,7 +732,7 @@ class PipelineBuildWindowsView(APIView):
                         if ri_boundary == "nearest":
                             ri_start = _pick_nearest(ri_series, outcome_start, ri_tol_min)
                             ri_end = _pick_nearest(ri_series, horizon_end, ri_tol_min)
-                        if ri_start is None or ri_end is None:
+                        elif ri_start is None or ri_end is None:
                             # Fallback to first/last (backwards compatible)
                             ri_start = float(ri_series[0][1])
                             ri_end = float(ri_series[-1][1])

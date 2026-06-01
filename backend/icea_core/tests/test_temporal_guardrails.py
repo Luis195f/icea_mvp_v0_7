@@ -569,6 +569,111 @@ class TemporalBuildDatasetTests(TestCase):
         self.assertAlmostEqual(row.features["nurse_hppd"], expected_hppd, places=6)
         self.assertAlmostEqual(row.features["nurse_skillmix"], expected_skillmix, places=6)
 
+    def _build_single_shift_window_with_ri(self, observations: list[tuple[object, float]], *, tolerance_minutes: int = 15):
+        admission = timezone.datetime(2026, 5, 1, 8, 0, tzinfo=dt_tz.utc)
+        outcome_start = admission + timezone.timedelta(hours=12)
+        horizon_end = outcome_start + timezone.timedelta(hours=12)
+        episode = PatientEpisode.objects.create(
+            unit=self.unit,
+            admission_date=admission,
+            discharge_date=horizon_end,
+            ri_initial=50.0,
+            ri_final=60.0,
+        )
+        RosterShift.objects.create(
+            unit=self.unit,
+            start_dt=admission,
+            end_dt=outcome_start,
+            rn_count=2,
+            na_count=1,
+            patient_census=1,
+        )
+        for effective_dt, value in observations:
+            NormalizedObservation.objects.create(
+                episode=episode,
+                code_system="LOINC",
+                code="85556-9",
+                display="Rothman Index Calculated",
+                value_num=float(value),
+                effective_dt=effective_dt,
+            )
+
+        response = self.client.post(
+            "/api/v1/pipeline/build-windows/",
+            {
+                "episode_id": episode.id,
+                "truncate": True,
+                "align": "shift",
+                "follow_up_hours": 12,
+                "ri_boundary": "nearest",
+                "ri_boundary_tol_minutes": tolerance_minutes,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        return EpisodeWindowFeatureRow.objects.get(window__episode=episode), outcome_start, horizon_end
+
+    def test_build_windows_nearest_accepts_ri_before_outcome_start_within_tolerance(self):
+        row, outcome_start, horizon_end = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 19, 50, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 0, tzinfo=dt_tz.utc), 60.0),
+            ]
+        )
+
+        self.assertEqual(row.target["outcome_status"], "defensible_fixed_horizon")
+        self.assertEqual(row.target["delta_ri"], 10.0)
+        self.assertEqual(row.features["ri_window_start"], 50.0)
+        self.assertEqual(row.target["temporal_spec"]["outcome_window_start"], outcome_start.isoformat())
+        self.assertEqual(row.target["temporal_spec"]["outcome_window_end"], horizon_end.isoformat())
+
+    def test_build_windows_nearest_rejects_ri_before_outcome_start_outside_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 19, 40, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 0, tzinfo=dt_tz.utc), 60.0),
+            ]
+        )
+
+        self.assertIsNone(row.target["delta_ri"])
+        self.assertEqual(row.target["outcome_status"], "insufficient_outcome_evidence")
+        self.assertEqual(row.features["missing_delta_ri"], 1)
+
+    def test_build_windows_nearest_accepts_ri_after_horizon_end_within_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 20, 0, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 10, tzinfo=dt_tz.utc), 65.0),
+            ]
+        )
+
+        self.assertEqual(row.target["outcome_status"], "defensible_fixed_horizon")
+        self.assertEqual(row.target["delta_ri"], 15.0)
+
+    def test_build_windows_nearest_rejects_ri_after_horizon_end_outside_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 20, 0, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 20, tzinfo=dt_tz.utc), 65.0),
+            ]
+        )
+
+        self.assertIsNone(row.target["delta_ri"])
+        self.assertEqual(row.target["outcome_status"], "insufficient_outcome_evidence")
+        self.assertEqual(row.features["missing_delta_ri"], 1)
+
+    def test_build_windows_nearest_does_not_fabricate_delta_ri_without_ri_in_tolerance(self):
+        row, _, _ = self._build_single_shift_window_with_ri(
+            [
+                (timezone.datetime(2026, 5, 1, 19, 40, tzinfo=dt_tz.utc), 50.0),
+                (timezone.datetime(2026, 5, 2, 8, 20, tzinfo=dt_tz.utc), 65.0),
+            ]
+        )
+
+        self.assertIsNone(row.target["delta_ri"])
+        self.assertNotEqual(row.target["delta_ri"], 0.0)
+        self.assertEqual(row.target["outcome_status"], "insufficient_outcome_evidence")
+
     def test_pipeline_train_prioritizes_defensible_windows_over_legacy_episode_rows(self):
         admission = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
         episode = PatientEpisode.objects.create(
