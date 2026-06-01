@@ -4,7 +4,7 @@ import hashlib
 import json
 import base64
 import os
-from datetime import timedelta, timezone as dt_tz
+from datetime import datetime, timedelta, timezone as dt_tz
 from typing import Any
 
 import numpy as np
@@ -1157,6 +1157,77 @@ class CausalRunView(APIView):
                     return best_v
                 return best_v if best <= (tol_minutes * 60) else None
 
+            def _parse_causal_dt(value):
+                if isinstance(value, datetime):
+                    dt = value
+                elif value:
+                    dt = parse_datetime(str(value))
+                else:
+                    dt = None
+                if dt is None:
+                    return None
+                if timezone.is_naive(dt):
+                    return dt.replace(tzinfo=dt_tz.utc)
+                return dt.astimezone(dt_tz.utc)
+
+            def _iso_causal_dt(value):
+                return value.isoformat() if value else None
+
+            def _causal_outcome_window(row: dict[str, Any], window, horizon_hours: int):
+                existing = dict(row.get("temporal_spec") or {})
+                feature_start = _parse_causal_dt(existing.get("feature_window_start")) or window.start_dt
+                feature_end = _parse_causal_dt(existing.get("feature_window_end")) or window.end_dt
+                index_time = _parse_causal_dt(existing.get("index_time")) or window.start_dt
+                existing_outcome_start = _parse_causal_dt(existing.get("outcome_window_start"))
+                existing_outcome_end = _parse_causal_dt(existing.get("outcome_window_end"))
+
+                if timezone.is_naive(feature_start):
+                    feature_start = feature_start.replace(tzinfo=dt_tz.utc)
+                if timezone.is_naive(feature_end):
+                    feature_end = feature_end.replace(tzinfo=dt_tz.utc)
+                if timezone.is_naive(index_time):
+                    index_time = index_time.replace(tzinfo=dt_tz.utc)
+
+                if existing_outcome_start is not None or existing_outcome_end is not None:
+                    if (
+                        existing_outcome_start is None
+                        or existing_outcome_end is None
+                        or feature_end > existing_outcome_start
+                        or existing_outcome_start > existing_outcome_end
+                    ):
+                        return None, None, existing or {
+                            "temporal_spec_version": "icea_temporal_v1",
+                            "index_time": _iso_causal_dt(index_time),
+                            "feature_window_start": _iso_causal_dt(feature_start),
+                            "feature_window_end": _iso_causal_dt(feature_end),
+                            "outcome_window_start": _iso_causal_dt(existing_outcome_start),
+                            "outcome_window_end": _iso_causal_dt(existing_outcome_end),
+                            "censoring_reason": "invalid_temporal_spec",
+                            "outcome_status": "insufficient_outcome_evidence",
+                        }
+                    return existing_outcome_start, existing_outcome_end, existing
+
+                outcome_start = feature_end
+                outcome_end = outcome_start + timedelta(hours=int(horizon_hours))
+                censoring_reason = "not_censored"
+                ep_end = window.episode.discharge_date
+                if ep_end is not None:
+                    ep_end = _parse_causal_dt(ep_end)
+                    if ep_end is not None and ep_end < outcome_end:
+                        outcome_end = ep_end
+                        censoring_reason = "discharged_before_outcome_window_end"
+                temporal_spec = {
+                    "temporal_spec_version": "icea_temporal_v1",
+                    "index_time": _iso_causal_dt(index_time),
+                    "feature_window_start": _iso_causal_dt(feature_start),
+                    "feature_window_end": _iso_causal_dt(feature_end),
+                    "outcome_window_start": _iso_causal_dt(outcome_start),
+                    "outcome_window_end": _iso_causal_dt(outcome_end),
+                    "censoring_reason": censoring_reason,
+                    "outcome_status": "defensible_fixed_horizon",
+                }
+                return outcome_start, outcome_end, temporal_spec
+
             series_by_ep = {}
             if follow_up_h and outcome == "delta_ri":
                 ep_ids = sorted({int(r.window.episode_id) for r in rows})
@@ -1179,20 +1250,18 @@ class CausalRunView(APIView):
 
                 if follow_up_h and outcome == "delta_ri":
                     ep = r.window.episode
-                    ws = r.window.start_dt
-                    ep_end = ep.discharge_date or timezone.now()
-                    horizon_end = ws + timedelta(hours=int(follow_up_h))
-                    horizon_end = min(horizon_end, ep_end)
+                    outcome_start, horizon_end, temporal_spec = _causal_outcome_window(row, r.window, int(follow_up_h))
+                    row["temporal_spec"] = temporal_spec
                     series = series_by_ep.get(int(ep.id)) or []
-                    if len(series) >= 2:
+                    if outcome_start is not None and horizon_end is not None and len(series) >= 2:
                         ri_start = None
                         ri_end = None
                         if ri_boundary == "nearest":
-                            ri_start = _pick_nearest(series, ws, ri_tol_min)
+                            ri_start = _pick_nearest(series, outcome_start, ri_tol_min)
                             ri_end = _pick_nearest(series, horizon_end, ri_tol_min)
                         if ri_start is None or ri_end is None:
-                            # fallback: first point >= ws and last point <= horizon_end
-                            within = [(dt, v) for dt, v in series if dt >= ws and dt <= horizon_end]
+                            # fallback: first point >= outcome_start and last point <= horizon_end
+                            within = [(dt, v) for dt, v in series if dt >= outcome_start and dt <= horizon_end]
                             if len(within) >= 2:
                                 ri_start = float(within[0][1])
                                 ri_end = float(within[-1][1])
@@ -1204,6 +1273,16 @@ class CausalRunView(APIView):
                         if ri_start is not None and ri_end is not None:
                             row["delta_ri"] = float(float(ri_end) - float(ri_start))
                             row["follow_up_hours_used"] = float(follow_up_h)
+                            row["outcome_status"] = "defensible_fixed_horizon"
+                        else:
+                            row["delta_ri"] = None
+                            row["outcome_status"] = "insufficient_outcome_evidence"
+                    else:
+                        row["missing_loinc_85556_9_t0"] = 1
+                        row["missing_loinc_85556_9_t1"] = 1
+                        row["missing_delta_ri"] = 1
+                        row["delta_ri"] = None
+                        row["outcome_status"] = "insufficient_outcome_evidence"
                 data.append(row)
         else:
             rows = list(EpisodeFeatureRow.objects.all())
@@ -1224,6 +1303,7 @@ class CausalRunView(APIView):
             warnings.extend([warning for _, issue in temporal_dataset_issues for warning in issue.warnings])
             if case_mix_issue:
                 warnings.extend(case_mix_issue.warnings)
+            dataset_status = temporal_dataset_issues[0][1].status if temporal_dataset_issues else "insufficient_temporal_spec"
             summary = {
                 "spec": {
                     "treatment": treatment,
@@ -1238,7 +1318,7 @@ class CausalRunView(APIView):
                 "n_rows": int(len(df_raw)),
                 "ate": None,
                 "causal_available": False,
-                "status": "temporal_leakage_blocked" if causal_temporal_issue else "insufficient_temporal_spec",
+                "status": "temporal_leakage_blocked" if causal_temporal_issue else dataset_status,
                 "warnings": sorted(set(warnings)),
             }
             spec_hash = hashlib.sha256(json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()

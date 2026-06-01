@@ -10,7 +10,7 @@ from rest_framework.test import APIClient
 
 from icea_core.aggregation import aggregate_scored_rows
 from icea_core.models import Hospital, PatientEpisode, Unit
-from icea_pipeline.models import EpisodeFeatureRow, NormalizedObservation
+from icea_pipeline.models import EpisodeFeatureRow, EpisodeWindow, EpisodeWindowFeatureRow, NormalizedObservation
 from icea_pipeline.temporal import (
     build_temporal_spec,
     validate_case_mix_spec,
@@ -338,3 +338,111 @@ class TemporalCausalDiscoverTests(TestCase):
         result = response.json()["result"]
         self.assertFalse(result["available"])
         self.assertIn("missing_outcome_target", result["warnings"])
+
+
+class TemporalCausalRunWindowTests(TestCase):
+    def setUp(self):
+        self.dev_env = mock.patch.dict("os.environ", {"ICEA_DEV_ALLOW_INSECURE": "true"}, clear=False)
+        self.dev_env.start()
+        self.addCleanup(self.dev_env.stop)
+        self.client = APIClient()
+        hospital = Hospital.objects.create(name="Hospital Causal Window")
+        self.unit = Unit.objects.create(hospital=hospital, name="UCI")
+
+    def _target_trial_spec(self):
+        return {
+            "time_zero": "window_start",
+            "follow_up": {"horizon_hours": 12, "anchor": "time_zero", "mode": "fixed"},
+            "eligibility": [],
+            "estimand": "ATE",
+        }
+
+    def _causal_spec(self):
+        return {
+            "grain": "window",
+            "treatment": "nurse_hppd",
+            "outcome": "delta_ri",
+            "confounders": ["ri_initial", "proc_count"],
+            "effect_modifiers": ["ri_initial"],
+            "dag_edges": [
+                ["ri_initial", "nurse_hppd"],
+                ["ri_initial", "delta_ri"],
+                ["proc_count", "nurse_hppd"],
+                ["proc_count", "delta_ri"],
+                ["nurse_hppd", "delta_ri"],
+            ],
+            "target_trial": self._target_trial_spec(),
+            "n_estimators": 20,
+        }
+
+    def _create_window_rows(self, *, bad_temporal_spec: bool = False):
+        base = timezone.datetime(2026, 3, 1, 8, 0, tzinfo=dt_tz.utc)
+        for i in range(12):
+            admission = base + timezone.timedelta(days=i)
+            episode = PatientEpisode.objects.create(
+                unit=self.unit,
+                admission_date=admission,
+                discharge_date=admission + timezone.timedelta(days=3),
+                ri_initial=50.0 + float(i),
+                ri_final=55.0 + float(i),
+            )
+            ws = admission
+            we = ws + timezone.timedelta(hours=12)
+            window = EpisodeWindow.objects.create(episode=episode, window_index=0, start_dt=ws, end_dt=we)
+            target = {"delta_ri": 999.0}
+            if bad_temporal_spec:
+                target["temporal_spec"] = build_temporal_spec(
+                    index_time=ws,
+                    feature_window_start=ws,
+                    feature_window_end=we,
+                    outcome_window_start=ws,
+                    outcome_window_end=we,
+                )
+            EpisodeWindowFeatureRow.objects.create(
+                window=window,
+                features={
+                    "ri_initial": 50.0 + float(i),
+                    "proc_count": 1.0 + float(i % 3),
+                    "nurse_hppd": 3.0 + float(i % 4),
+                },
+                target=target,
+                schema_hash=f"window-causal-{i}",
+                feature_version="v-test-window",
+            )
+            NormalizedObservation.objects.create(
+                episode=episode,
+                code_system="LOINC",
+                code="85556-9",
+                display="Rothman Index Calculated",
+                value_num=50.0 + float(i),
+                effective_dt=ws,
+            )
+            NormalizedObservation.objects.create(
+                episode=episode,
+                code_system="LOINC",
+                code="85556-9",
+                display="Rothman Index Calculated",
+                value_num=60.0 + float(i),
+                effective_dt=we,
+            )
+
+    def test_causal_window_followup_does_not_use_feature_window_start_as_outcome_start(self):
+        self._create_window_rows()
+        response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec()}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "insufficient_outcome_evidence")
+        self.assertIn("missing_outcome_target", summary["warnings"])
+        self.assertNotEqual(summary.get("ate"), 0.0)
+
+    def test_causal_window_explicit_overlapping_outcome_window_is_blocked(self):
+        self._create_window_rows(bad_temporal_spec=True)
+        response = self.client.post("/api/v1/causal/run/", {"spec": self._causal_spec()}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        summary = response.json()["summary"]
+        self.assertFalse(summary["causal_available"])
+        self.assertEqual(summary["status"], "temporal_leakage_blocked")
+        self.assertIn("feature_window_end_after_outcome_window_start", summary["warnings"])
