@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from icea_core.models import ModelArtifact
+from icea_pipeline.temporal import CASE_MIX_REQUIRED_DOMAINS, validate_case_mix_spec
 
 
 INTENDED_USE_SHADOW_AGGREGATE = "shadow_aggregate_research"
@@ -17,6 +18,14 @@ MINIMUM_LIMITATIONS = [
     "not_clinically_validated",
     "not_mdr_production_ready",
 ]
+CASE_MIX_DERIVATION_CANDIDATES = {
+    "age": ["age", "patient_age", "age_years"],
+    "severity": ["ri_initial", "baseline_severity", "severity", "rothman_index_initial"],
+    "comorbidity": ["charlson", "charlson_index", "comorbidity_index", "comorbidity_count"],
+    "fragility_or_dependency": ["frailty", "frailty_score", "fragility", "dependency", "dependency_score", "adl", "barthel"],
+    "baseline_risk": ["baseline_risk", "predicted_baseline_risk", "ri_initial"],
+    "baseline_load": ["baseline_load", "patient_census", "unit_census", "census", "nurse_hppd"],
+}
 
 
 @dataclass(frozen=True)
@@ -107,12 +116,39 @@ def _case_mix_spec(metrics: dict[str, Any], evidence: dict[str, Any]) -> Any:
     return _first_non_empty(evidence.get("case_mix_spec"), metrics.get("case_mix_spec"))
 
 
+def derive_case_mix_spec_from_columns(columns: list[str]) -> dict[str, Any] | None:
+    normalized = {str(column).lower(): str(column) for column in columns if str(column)}
+    domains: dict[str, list[str]] = {}
+    variables: list[str] = []
+    for domain in sorted(CASE_MIX_REQUIRED_DOMAINS):
+        matched = []
+        for candidate in CASE_MIX_DERIVATION_CANDIDATES.get(domain, []):
+            candidate_lower = candidate.lower()
+            for normalized_name, original_name in normalized.items():
+                if normalized_name == candidate_lower or normalized_name.startswith(f"{candidate_lower}_"):
+                    matched.append(original_name)
+        matched = sorted(set(matched))
+        if matched:
+            domains[domain] = matched
+            variables.extend(matched)
+    if set(domains.keys()) != set(CASE_MIX_REQUIRED_DOMAINS):
+        return None
+    return {
+        "source": "derived_from_training_data",
+        "derivation_method": "column_domain_name_match",
+        "domains": domains,
+        "variables": sorted(set(variables)),
+        "limitations": ["derived_case_mix_requires_clinical_review_before_any_claim"],
+    }
+
+
 def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     metrics = dict(artifact.metrics or {})
     evidence = _metrics_evidence(metrics)
     validation_metrics = _validation_metrics(metrics, evidence)
     calibration_summary = _calibration_summary(metrics, evidence)
     case_mix_spec = _case_mix_spec(metrics, evidence)
+    case_mix_issue = validate_case_mix_spec(case_mix_spec if isinstance(case_mix_spec, dict) else None)
 
     dataset_fingerprint = _first_non_empty(
         evidence.get("dataset_fingerprint"),
@@ -193,6 +229,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         missing.append("calibration_summary_or_unavailable_reason")
     if not pack.get("case_mix_spec") and not pack.get("case_mix_unavailable_reason"):
         missing.append("case_mix_spec_or_unavailable_reason")
+    if case_mix_issue:
+        missing.append("case_mix_spec_sufficient")
     if not pack.get("provenance") and not pack.get("source_commit") and not pack.get("source_commit_unavailable_reason"):
         missing.append("provenance_or_source_commit_or_unavailable_reason")
 
@@ -205,7 +243,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         statuses.append("shadow_mode_missing")
     if pack.get("intended_use") != INTENDED_USE_SHADOW_AGGREGATE:
         statuses.append("intended_use_not_shadow_aggregate_research")
-    if not pack.get("case_mix_spec"):
+    if case_mix_issue:
         statuses.append("case_mix_insufficient")
     if not pack.get("calibration_summary"):
         statuses.append("calibration_unavailable")
@@ -220,7 +258,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     if not defensible and "model_not_defensible" not in statuses:
         statuses.append("model_not_defensible")
 
-    case_mix_status = "case_mix_available" if pack.get("case_mix_spec") else "case_mix_insufficient"
+    case_mix_status = "case_mix_available" if not case_mix_issue else "case_mix_insufficient"
     calibration_status = "calibration_available" if pack.get("calibration_summary") else "calibration_unavailable"
     validation_status = "validation_available" if pack.get("validation_metrics") else "validation_unavailable"
 
@@ -271,6 +309,13 @@ def build_training_evidence_metadata(
     validation_metrics = {key: metrics.get(key) for key in ("rmse", "mae", "r2", "auc") if metrics.get(key) is not None}
     conformal = metrics.get("conformal") if isinstance(metrics.get("conformal"), dict) else None
     validation_row_count = conformal.get("calibration_size") if conformal else None
+    effective_case_mix_spec = dict(case_mix_spec) if isinstance(case_mix_spec, dict) else None
+    if effective_case_mix_spec is None:
+        effective_case_mix_spec = derive_case_mix_spec_from_columns(list(features))
+    case_mix_issue = validate_case_mix_spec(effective_case_mix_spec)
+    case_mix_unavailable_reason = None
+    if case_mix_issue:
+        case_mix_unavailable_reason = ";".join(case_mix_issue.warnings)
 
     evidence = {
         "dataset_fingerprint": dataset_fingerprint,
@@ -289,8 +334,8 @@ def build_training_evidence_metadata(
         }
         if temporal_specs
         else None,
-        "case_mix_spec": case_mix_spec,
-        "case_mix_unavailable_reason": None if case_mix_spec else "case_mix_spec_not_declared_for_training_dataset",
+        "case_mix_spec": effective_case_mix_spec,
+        "case_mix_unavailable_reason": case_mix_unavailable_reason,
         "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
         "non_individual_use": True,
         "shadow_mode": True,
@@ -299,7 +344,7 @@ def build_training_evidence_metadata(
         "validation_metrics": validation_metrics or None,
         "validation_unavailable_reason": None if validation_metrics else "validation_metrics_not_computed",
         "limitations": MINIMUM_LIMITATIONS
-        + ([] if case_mix_spec else ["case_mix_spec_absent"])
+        + ([] if not case_mix_issue else ["case_mix_insufficient"])
         + ([] if conformal else ["calibration_unavailable"]),
         "source_commit_unavailable_reason": "source_commit_not_captured_by_training_runtime",
     }

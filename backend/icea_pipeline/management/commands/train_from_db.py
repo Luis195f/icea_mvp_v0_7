@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -18,11 +20,27 @@ class Command(BaseCommand):
         parser.add_argument("--name", default="icea-xgb")
         parser.add_argument("--version", default="v0.3")
         parser.add_argument("--target", default="delta_ri")
+        parser.add_argument(
+            "--case-mix-spec-json",
+            default="",
+            help="Optional JSON case_mix_spec with required domains for model evidence governance.",
+        )
 
     def handle(self, *args, **opts):
         name = str(opts["name"])
         version = str(opts["version"])
         target = str(opts["target"])
+        case_mix_spec = None
+        if str(opts.get("case_mix_spec_json") or "").strip():
+            try:
+                parsed_case_mix_spec = json.loads(str(opts["case_mix_spec_json"]))
+            except json.JSONDecodeError as exc:
+                self.stdout.write(self.style.ERROR(f"Invalid --case-mix-spec-json: {exc}"))
+                return
+            if not isinstance(parsed_case_mix_spec, dict):
+                self.stdout.write(self.style.ERROR("--case-mix-spec-json must decode to an object"))
+                return
+            case_mix_spec = parsed_case_mix_spec
 
         rows = list(EpisodeFeatureRow.objects.select_related("episode").all())
         dataset = []
@@ -62,6 +80,7 @@ class Command(BaseCommand):
             dataset_grain="episode",
             metrics=result.metrics,
             temporal_guardrail_status="passed",
+            case_mix_spec=case_mix_spec,
         )
 
         artifact = ModelArtifact.objects.create(

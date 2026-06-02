@@ -30,6 +30,7 @@ class TrainFromDBSerializer(serializers.Serializer):
     version = serializers.CharField(required=False, default="v0.7.0")
     target = serializers.CharField(required=False, default="delta_ri")
     grain = serializers.ChoiceField(choices=["auto", "episode", "window"], required=False, default="auto")
+    case_mix_spec = serializers.DictField(required=False)
 
 
 class RosterUploadSerializer(serializers.Serializer):

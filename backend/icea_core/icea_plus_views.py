@@ -40,7 +40,7 @@ from icea_core.permissions import (
     ICEABackwardCompatiblePermission,
     ICEAResearcherPermission,
 )
-from icea_core.scoring import score_icea_plus, select_formula, upsert_formula_version
+from icea_core.scoring import redact_shadow_score_response, score_icea_plus, select_formula, upsert_formula_version
 from icea_pipeline.audit import append_audit_event
 
 
@@ -191,11 +191,11 @@ class ICEAPlusScoreView(APIView):
         if bool(payload.get("from_db", True)) and str(payload.get("grain") or "episode") == "episode":
             persist_initial_followup_records(
                 artifact=artifact,
-                result=result,
+                result=redact_shadow_score_response(result),
                 computation=computation,
                 request_config=dict(payload),
             )
-        return Response(result)
+        return Response(redact_shadow_score_response(result))
 
 
 class ICEAPlusAggregateView(APIView):
@@ -227,7 +227,7 @@ class ICEAPlusAggregateView(APIView):
         requested_group_by = str(params.get("group_by") or "unit")
         effective_group_by = requested_group_by
         warnings: list[str] = []
-        rows = list(score_result.get("results") or [])
+        rows = list(score_result.get("_aggregate_rows") or score_result.get("results") or [])
 
         formula = select_formula((params.get("formula_version") or "").strip() or None)
         min_rel = float((((formula.spec).get("aggregation") or {}).get("min_nurse_reliability")) or 0.60)
@@ -242,6 +242,8 @@ class ICEAPlusAggregateView(APIView):
         if requested_group_by in {"team", "shift", "nurse"} and min_rel > 0:
             warnings.append("staff_dimension_requires_minimum_support_and_non_punitive_use")
 
+        artifact_metrics = artifact.metrics or {}
+        artifact_evidence = artifact_metrics.get("evidence_pack") if isinstance(artifact_metrics.get("evidence_pack"), dict) else {}
         aggregated = aggregate_scored_rows(
             rows=rows,
             group_by=effective_group_by,
@@ -250,7 +252,9 @@ class ICEAPlusAggregateView(APIView):
             min_cell_count=MIN_AGGREGATE_EPISODES,
             min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
             require_staff_count=require_staff_count,
-            case_mix_spec=(artifact.metrics or {}).get("case_mix_spec") or (formula.spec or {}).get("case_mix_spec"),
+            case_mix_spec=artifact_evidence.get("case_mix_spec")
+            or artifact_metrics.get("case_mix_spec")
+            or (formula.spec or {}).get("case_mix_spec"),
         )
         suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
         response_summary = score_result.get("summary")

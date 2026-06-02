@@ -108,6 +108,12 @@ Artifacts with `model_not_defensible`, `calibration_unavailable`,
 `validation_unavailable`, or `case_mix_insufficient` must not be treated as
 clinically validated or MDR production-ready.
 
+Provide `case_mix_spec` on `/api/v1/pipeline/train/` or `/api/v1/models/train/`
+when the dataset cannot prove all required domains from columns alone. Training
+may derive `case_mix_spec` only from real columns covering age, severity,
+comorbidity, fragility/dependency, baseline risk, and baseline load; otherwise
+the artifact remains non-defensible instead of inventing case-mix support.
+
 ### 4.1) ICEA+ v1 score, explain, aggregate
 
 - `POST /api/v1/icea-plus/score/`

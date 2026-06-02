@@ -97,6 +97,11 @@ positive evidence. A model with `calibration_unavailable`,
 This prevents a score or model card from quietly converting missing evidence
 into a validity claim.
 
+For aggregate shadow reports, ICEA+ may use internal row-level numeric values
+only as an intermediate input to suppressed, k-anonymous aggregate cells. Public
+row responses remain `shadow_only` with `score=null` and `raw_score=null`; the
+internal values are not a patient, episode, nurse, team, or shift score.
+
 ## Formal definition
 
 For each episode/window `i`:

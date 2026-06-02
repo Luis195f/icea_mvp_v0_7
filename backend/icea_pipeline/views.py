@@ -913,6 +913,7 @@ class PipelineTrainFromDBView(APIView):
             dataset_grain=dataset_grain,
             metrics=result.metrics,
             temporal_guardrail_status="passed",
+            case_mix_spec=payload.get("case_mix_spec"),
         )
 
         artifact = ModelArtifact.objects.create(

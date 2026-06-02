@@ -21,7 +21,7 @@ from icea_core.models import (
     ModelArtifact,
     PatientEpisode,
 )
-from icea_core.scoring import score_icea_plus, select_formula
+from icea_core.scoring import redact_shadow_score_response, score_icea_plus, select_formula
 from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import EpisodeWindow, FHIRWritebackRecord, NormalizedObservation, NormalizedProcedure
 
@@ -347,9 +347,10 @@ def _score_episode_from_request(
         "date_from": None,
         "date_to": None,
     }
-    result = score_icea_plus(**score_kwargs)
-    if result.get("detail"):
-        raise ValueError(str(result.get("detail")))
+    raw_result = score_icea_plus(**score_kwargs)
+    if raw_result.get("detail"):
+        raise ValueError(str(raw_result.get("detail")))
+    result = redact_shadow_score_response(raw_result)
     row = next((candidate for candidate in (result.get("results") or []) if int(candidate.get("episode_id") or 0) == int(episode.id)), None)
     if row is None:
         raise ValueError("episode_not_returned_by_score")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -52,6 +53,16 @@ def _apply_shadow_row_governance(row: dict[str, Any], *, suppress_numeric_score:
         row["raw_score"] = None
         row["status"] = "shadow_only"
     return row
+
+
+def redact_shadow_score_response(result: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(result)
+    public.pop("_aggregate_rows", None)
+    public["results"] = [
+        _apply_shadow_row_governance(dict(row), suppress_numeric_score=bool(row.get("score") is not None))
+        for row in list(public.get("results") or [])
+    ]
+    return public
 
 
 @dataclass
@@ -1284,6 +1295,7 @@ def score_icea_plus(
         }
     )
 
+    aggregate_rows = []
     results = []
     for pos, meta in enumerate(dataset.meta_rows):
         idx = selected_df.index[pos]
@@ -1395,10 +1407,10 @@ def score_icea_plus(
         if score_dict["flags"]["ood_detected"] and "ood_detected" not in score_dict["warnings"]:
             score_dict["warnings"].append("ood_detected")
         score_dict["warnings"] = sorted(set(score_dict["warnings"]))
-        score_dict = _apply_shadow_row_governance(score_dict, suppress_numeric_score=True)
-        results.append(score_dict)
+        aggregate_rows.append(_apply_shadow_row_governance(deepcopy(score_dict), suppress_numeric_score=False))
+        results.append(_apply_shadow_row_governance(score_dict, suppress_numeric_score=True))
 
-    scored_rows = [row for row in results if row.get("score") is not None]
+    scored_rows = [row for row in aggregate_rows if row.get("score") is not None]
     component_means = {}
     for name in ("benefit", "attribution", "causal", "quality", "uncertainty"):
         vals = [row["components"][name]["normalized"] for row in scored_rows if row["components"][name]["normalized"] is not None]
@@ -1411,7 +1423,7 @@ def score_icea_plus(
         "formula_protocol_hash": formula.protocol_hash,
         "default_pilot_weights": dict(formula.spec.get("weights") or {}),
         "baseline_mode": baseline_mode,
-        "causal_available": bool(any(row["flags"].get("causal_available") for row in results)),
+        "causal_available": bool(any(row["flags"].get("causal_available") for row in aggregate_rows)),
         "status_counts": {
             "complete": int(sum(1 for row in results if row.get("status") == "complete")),
             "provisional": int(sum(1 for row in results if row.get("status") == "provisional")),
@@ -1439,4 +1451,5 @@ def score_icea_plus(
         },
         "summary": summary,
         "results": results,
+        "_aggregate_rows": aggregate_rows,
     }

@@ -117,6 +117,16 @@ prevent a model from being presented as defendible. `shadow_aggregate_research`
 means aggregate, exploratory monitoring only; it is not clinical validation and
 is not MDR production readiness.
 
+Training endpoints accept an optional `case_mix_spec` object. A sufficient spec
+must declare the required case-mix domains consumed by
+`validate_case_mix_spec`: `age`, `severity`, `comorbidity`,
+`fragility_or_dependency`, `baseline_risk`, and `baseline_load`, either through
+`domains` or `variables`. If `case_mix_spec` is omitted, training derives one
+only when training columns clearly cover every required domain; derived specs are
+marked `source=derived_from_training_data`. If the domains cannot be derived,
+the model is still registered for auditability but remains
+`model_not_defensible` / `case_mix_insufficient`.
+
 #### Response sketch
 
 ```json

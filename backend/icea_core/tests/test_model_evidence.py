@@ -23,7 +23,18 @@ def complete_evidence_pack(**overrides):
         "temporal_guardrail_status": "passed",
         "outcome_definition": "delta_ri",
         "outcome_window": {"horizon_hours": 12, "source": "fixed_future_horizon"},
-        "case_mix_spec": {"baseline_adjustment_domains": ["ri_initial"]},
+        "case_mix_spec": {
+            "source": "test_declared",
+            "domains": {
+                "age": ["age_years"],
+                "severity": ["ri_initial"],
+                "comorbidity": ["charlson_index"],
+                "fragility_or_dependency": ["frailty_score"],
+                "baseline_risk": ["ri_initial"],
+                "baseline_load": ["nurse_hppd"],
+            },
+            "variables": ["age_years", "ri_initial", "charlson_index", "frailty_score", "nurse_hppd"],
+        },
         "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
         "non_individual_use": True,
         "shadow_mode": True,
@@ -164,8 +175,59 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(evidence["intended_use"], INTENDED_USE_SHADOW_AGGREGATE)
         self.assertTrue(evidence["non_individual_use"])
         self.assertTrue(evidence["shadow_mode"])
-        self.assertEqual(evidence["case_mix_unavailable_reason"], "case_mix_spec_not_declared_for_training_dataset")
+        self.assertIn("case_mix_insufficient", evidence["case_mix_unavailable_reason"])
         self.assertEqual(evidence["calibration_unavailable_reason"], "insufficient_calibration_sample_or_not_computed")
+
+    def test_training_with_sufficient_case_mix_spec_is_defensible_shadow_research(self):
+        case_mix_spec = complete_evidence_pack()["case_mix_spec"]
+        with mock.patch("icea_pipeline.views.train_xgb_regressor") as train_mock:
+            train_mock.return_value = SimpleNamespace(
+                model_path="mock-window-model.json",
+                features=["ri_initial", "window_index"],
+                target="delta_ri",
+                metrics={
+                    "rmse": 0.0,
+                    "mae": 0.0,
+                    "n_rows": 12,
+                    "n_features": 2,
+                    "conformal": {"method": "split_abs_residual", "alpha": 0.05, "q_hat": 0.1, "calibration_size": 6},
+                },
+            )
+            response = self.client.post("/api/v1/pipeline/train/", {"case_mix_spec": case_mix_spec}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        model_id = response.json()["model_id"]
+        models_response = self.client.get("/api/v1/models/")
+        self.assertEqual(models_response.status_code, 200)
+        model = next(item for item in models_response.json() if item["id"] == model_id)
+        self.assertEqual(model["evidence_status"], "evidence_complete")
+        self.assertTrue(model["defensible"])
+        self.assertEqual(model["case_mix_status"], "case_mix_available")
+        self.assertEqual(model["intended_use"], INTENDED_USE_SHADOW_AGGREGATE)
+
+    def test_training_without_case_mix_spec_and_without_derivable_domains_is_not_defensible(self):
+        with mock.patch("icea_pipeline.views.train_xgb_regressor") as train_mock:
+            train_mock.return_value = SimpleNamespace(
+                model_path="mock-window-model.json",
+                features=["ri_initial", "window_index"],
+                target="delta_ri",
+                metrics={
+                    "rmse": 0.0,
+                    "mae": 0.0,
+                    "n_rows": 12,
+                    "n_features": 2,
+                    "conformal": {"method": "split_abs_residual", "alpha": 0.05, "q_hat": 0.1, "calibration_size": 6},
+                },
+            )
+            response = self.client.post("/api/v1/pipeline/train/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        model_id = response.json()["model_id"]
+        models_response = self.client.get("/api/v1/models/")
+        model = next(item for item in models_response.json() if item["id"] == model_id)
+        self.assertFalse(model["defensible"])
+        self.assertEqual(model["case_mix_status"], "case_mix_insufficient")
+        self.assertIn("case_mix_spec_sufficient", model["missing_evidence"])
 
     def test_shadow_scoring_does_not_reintroduce_individual_score(self):
         response = self.client.post(
@@ -200,3 +262,99 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(row["status"], "shadow_only")
         self.assertIsNone(row["score"])
         self.assertIsNone(row["raw_score"])
+
+    def test_aggregate_uses_internal_scores_while_public_rows_stay_redacted(self):
+        aggregate_rows = []
+        public_rows = []
+        for i in range(10):
+            aggregate_rows.append(
+                {
+                    "row_id": f"row-{i}",
+                    "grain": "episode",
+                    "episode_id": i + 1,
+                    "unit_id": int(self.unit.id),
+                    "start_dt": "2026-03-01T08:00:00+00:00",
+                    "end_dt": "2026-03-01T20:00:00+00:00",
+                    "status": "complete",
+                    "score": 60.0 + i,
+                    "raw_score": 0.1,
+                    "shadow_mode": True,
+                    "non_individual_use": True,
+                    "flags": {"shadow_mode": True, "non_individual_use": True},
+                    "warnings": [],
+                    "components": {
+                        "benefit": {"normalized": 0.2},
+                        "attribution": {"normalized": 0.3},
+                        "causal": {"normalized": 0.4},
+                        "quality": {"normalized": 0.5},
+                        "uncertainty": {"normalized": 0.1},
+                    },
+                    "aggregation": {"severity_weight": 1.0, "effective_exposure_share": 1.0},
+                }
+            )
+            public_rows.append({**aggregate_rows[-1], "status": "shadow_only", "score": None, "raw_score": None})
+
+        score_result = {
+            "formula_version": "icea_plus_v1",
+            "formula_protocol_hash": "hash",
+            "formula_source": "test",
+            "shadow_mode": True,
+            "non_individual_use": True,
+            "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
+            "model": {"id": str(self.episode_artifact.id), "version": self.episode_artifact.version},
+            "summary": {"rows_requested": 10, "rows_scored": 10, "status_counts": {}},
+            "results": public_rows,
+            "_aggregate_rows": aggregate_rows,
+        }
+        with mock.patch("icea_core.icea_plus_views.score_icea_plus", return_value=score_result):
+            response = self.client.get(
+                "/api/v1/icea-plus/aggregate/",
+                {"model_id": str(self.episode_artifact.id), "grain": "episode", "group_by": "unit"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body["results"]), 1)
+        self.assertEqual(body["results"][0]["status"], "scored_aggregate")
+        self.assertIsNotNone(body["results"][0]["score"])
+        self.assertNotIn("_aggregate_rows", body)
+        self.assertNotIn("rows", body["results"][0])
+
+    def test_aggregate_still_suppresses_low_support_internal_scores(self):
+        aggregate_rows = [
+            {
+                "row_id": f"row-{i}",
+                "grain": "episode",
+                "episode_id": i + 1,
+                "unit_id": int(self.unit.id),
+                "status": "complete",
+                "score": 70.0,
+                "raw_score": 0.1,
+                "shadow_mode": True,
+                "non_individual_use": True,
+                "flags": {"shadow_mode": True, "non_individual_use": True},
+                "warnings": [],
+                "components": {},
+                "aggregation": {"severity_weight": 1.0, "effective_exposure_share": 1.0},
+            }
+            for i in range(9)
+        ]
+        score_result = {
+            "formula_version": "icea_plus_v1",
+            "formula_protocol_hash": "hash",
+            "formula_source": "test",
+            "summary": {"rows_requested": 9, "rows_scored": 9, "status_counts": {}},
+            "results": [{**row, "status": "shadow_only", "score": None, "raw_score": None} for row in aggregate_rows],
+            "_aggregate_rows": aggregate_rows,
+        }
+        with mock.patch("icea_core.icea_plus_views.score_icea_plus", return_value=score_result):
+            response = self.client.get(
+                "/api/v1/icea-plus/aggregate/",
+                {"model_id": str(self.episode_artifact.id), "grain": "episode", "group_by": "unit"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()["results"][0]
+        self.assertEqual(result["status"], "suppressed_low_support")
+        self.assertIsNone(result["score"])
+        self.assertTrue(result["suppressed"])

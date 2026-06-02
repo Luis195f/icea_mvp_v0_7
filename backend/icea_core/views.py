@@ -67,6 +67,7 @@ class ModelTrainView(APIView):
             dataset_grain="external_payload",
             metrics=result.metrics,
             temporal_guardrail_status="not_evaluated_external_payload",
+            case_mix_spec=payload.get("case_mix_spec"),
         )
         result.metrics["evidence_pack"] = evidence_pack
 

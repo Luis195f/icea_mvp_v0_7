@@ -246,8 +246,16 @@ class ICEAPlusFixtureMixin:
             "outcome_definition": "delta_ri",
             "outcome_window": {"horizon": "fixture_fixed_future_horizon", "source": "test_fixture"},
             "case_mix_spec": {
-                "baseline_adjustment_domains": ["ri_initial"],
-                "nursing_exposure_domains": ["nurse_hppd", "nurse_skillmix", "nurse_proc_count_det"],
+                "source": "test_fixture_declared",
+                "domains": {
+                    "age": ["age_years"],
+                    "severity": ["ri_initial"],
+                    "comorbidity": ["charlson_index"],
+                    "fragility_or_dependency": ["frailty_score"],
+                    "baseline_risk": ["ri_initial"],
+                    "baseline_load": ["nurse_hppd"],
+                },
+                "variables": ["age_years", "ri_initial", "charlson_index", "frailty_score", "nurse_hppd"],
             },
             "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
             "non_individual_use": True,

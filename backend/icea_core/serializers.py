@@ -79,6 +79,7 @@ class TrainRequestSerializer(serializers.Serializer):
     features = serializers.ListField(child=serializers.CharField(), allow_empty=False)
     dataset = serializers.ListField(child=serializers.DictField(), allow_empty=False)
     params = serializers.DictField(required=False, default=dict)
+    case_mix_spec = serializers.DictField(required=False)
 
 
 class ComputeRequestSerializer(serializers.Serializer):
