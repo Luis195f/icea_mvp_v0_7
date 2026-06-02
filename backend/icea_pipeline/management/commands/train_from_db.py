@@ -4,6 +4,7 @@ import pandas as pd
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
+from icea_core.evidence import build_training_evidence_metadata
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import ModelArtifact
 from icea_pipeline.models import EpisodeFeatureRow, TrainingRun
@@ -52,6 +53,15 @@ class Command(BaseCommand):
             features=features,
             target=target,
             model_dir=settings.ICEA_MODEL_DIR,
+        )
+        result.metrics["evidence_pack"] = build_training_evidence_metadata(
+            raw_df=df,
+            model_df=df_model,
+            features=result.features,
+            target=result.target,
+            dataset_grain="episode",
+            metrics=result.metrics,
+            temporal_guardrail_status="passed",
         )
 
         artifact = ModelArtifact.objects.create(

@@ -44,6 +44,13 @@ The repo only triggers enriched rescoring when all of the following are true:
 If those conditions are not met, the API returns an explicit non-enriched state instead
 of fabricating a later score.
 
+Follow-up ingestion, rescoring, and writeback summaries use the same model
+evidence gate as ICEA+ scoring because they all flow through
+`score_icea_plus()`. If the referenced `ModelArtifact` is
+`model_not_defensible`, follow-up cannot bootstrap or rescore from that model.
+The failure is provisional/shadow governance, not a clinical conclusion about
+the patient or staff.
+
 Episode-level follow-up remains legacy/provisional when the only available outcome is
 `ri_final`, discharge status, length of stay, or the last observation across the stay.
 Future datasets should prefer window-grain rows with an explicit lag:

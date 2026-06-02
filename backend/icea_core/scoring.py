@@ -26,6 +26,7 @@ from icea_core.components import (
     robust_z,
     utility_transform,
 )
+from icea_core.evidence import summarize_model_evidence
 from icea_core.engine import ICEAEngine
 from icea_core.formula import ICEAPlusComponentValue, ICEAPlusLineage, compute_row_score
 from icea_core.models import ICEAPlusFormulaVersion, ModelArtifact
@@ -36,6 +37,21 @@ from icea_pipeline.temporal import TEMPORAL_STATUSES, validate_causal_temporal_o
 FEATURE_CONTRACT_VERSION = "handover-icea-feature-v1"
 FEATURE_SOURCE_REPO = "Luis195f/HANDOVER"
 DEFAULT_MIN_FEATURE_COVERAGE = 0.95
+
+
+def _apply_shadow_row_governance(row: dict[str, Any], *, suppress_numeric_score: bool) -> dict[str, Any]:
+    row["shadow_mode"] = True
+    row["non_individual_use"] = True
+    row["intended_use"] = "shadow_aggregate_research"
+    flags = dict(row.get("flags") or {})
+    flags["shadow_mode"] = True
+    flags["non_individual_use"] = True
+    row["flags"] = flags
+    if suppress_numeric_score:
+        row["score"] = None
+        row["raw_score"] = None
+        row["status"] = "shadow_only"
+    return row
 
 
 @dataclass
@@ -455,24 +471,27 @@ def _feature_contract_failure_result(
 
     for issue in result_issues:
         rows.append(
-            {
-                "row_id": issue.row_id,
-                "grain": grain,
-                "status": issue.status,
-                "score": None,
-                "raw_score": None,
-                "components": {},
-                "flags": issue.flags,
-                "warnings": issue.warnings,
-                "feature_contract": _feature_contract_issue_payload(issue),
-                "lineage": {
-                    "formula_version": formula.version,
-                    "formula_protocol_hash": formula.protocol_hash,
-                    "model_id": str(model_artifact.id),
-                    "model_version": str(model_artifact.version),
-                    "source": {"grain": grain, "feature_contract_status": issue.status},
+            _apply_shadow_row_governance(
+                {
+                    "row_id": issue.row_id,
+                    "grain": grain,
+                    "status": issue.status,
+                    "score": None,
+                    "raw_score": None,
+                    "components": {},
+                    "flags": issue.flags,
+                    "warnings": issue.warnings,
+                    "feature_contract": _feature_contract_issue_payload(issue),
+                    "lineage": {
+                        "formula_version": formula.version,
+                        "formula_protocol_hash": formula.protocol_hash,
+                        "model_id": str(model_artifact.id),
+                        "model_version": str(model_artifact.version),
+                        "source": {"grain": grain, "feature_contract_status": issue.status},
+                    },
                 },
-            }
+                suppress_numeric_score=False,
+            )
         )
 
     status_counts = {
@@ -489,6 +508,9 @@ def _feature_contract_failure_result(
         "formula_version": formula.version,
         "formula_protocol_hash": formula.protocol_hash,
         "formula_source": formula.source,
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": "shadow_aggregate_research",
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,
@@ -534,29 +556,32 @@ def _temporal_guardrail_failure_result(
             flags = {"leakage_blocked": True, "temporal_spec_valid": False}
 
         rows.append(
-            {
-                "row_id": str(meta.get("row_id") or f"row:{pos}"),
-                "grain": grain,
-                "episode_id": meta.get("episode_id"),
-                "window_id": meta.get("window_id"),
-                "patient_key": meta.get("patient_key"),
-                "unit_id": meta.get("unit_id"),
-                "start_dt": meta.get("start_dt"),
-                "end_dt": meta.get("end_dt"),
-                "status": status,
-                "score": None,
-                "raw_score": None,
-                "components": {},
-                "flags": {**flags, "non_individual_use": True, "shadow_mode": True},
-                "warnings": sorted(set(warnings)),
-                "lineage": {
-                    "formula_version": formula.version,
-                    "formula_protocol_hash": formula.protocol_hash,
-                    "model_id": str(model_artifact.id),
-                    "model_version": str(model_artifact.version),
-                    "source": {"grain": grain, "temporal_status": status},
+            _apply_shadow_row_governance(
+                {
+                    "row_id": str(meta.get("row_id") or f"row:{pos}"),
+                    "grain": grain,
+                    "episode_id": meta.get("episode_id"),
+                    "window_id": meta.get("window_id"),
+                    "patient_key": meta.get("patient_key"),
+                    "unit_id": meta.get("unit_id"),
+                    "start_dt": meta.get("start_dt"),
+                    "end_dt": meta.get("end_dt"),
+                    "status": status,
+                    "score": None,
+                    "raw_score": None,
+                    "components": {},
+                    "flags": flags,
+                    "warnings": sorted(set(warnings)),
+                    "lineage": {
+                        "formula_version": formula.version,
+                        "formula_protocol_hash": formula.protocol_hash,
+                        "model_id": str(model_artifact.id),
+                        "model_version": str(model_artifact.version),
+                        "source": {"grain": grain, "temporal_status": status},
+                    },
                 },
-            }
+                suppress_numeric_score=False,
+            )
         )
 
     status_counts = {
@@ -569,6 +594,9 @@ def _temporal_guardrail_failure_result(
         "formula_version": formula.version,
         "formula_protocol_hash": formula.protocol_hash,
         "formula_source": formula.source,
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": "shadow_aggregate_research",
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,
@@ -947,6 +975,17 @@ def score_icea_plus(
     date_to: datetime | None = None,
 ) -> dict[str, Any]:
     formula = select_formula(formula_version)
+    evidence = summarize_model_evidence(model_artifact)
+    if not evidence.defensible:
+        return {
+            "detail": "model_not_defensible",
+            "model_id": str(model_artifact.id),
+            "formula_version": formula.version,
+            "formula_protocol_hash": formula.protocol_hash,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            **evidence.to_dict(),
+        }
     dataset = load_dataset(
         grain=grain,
         from_db=from_db,
@@ -1356,6 +1395,7 @@ def score_icea_plus(
         if score_dict["flags"]["ood_detected"] and "ood_detected" not in score_dict["warnings"]:
             score_dict["warnings"].append("ood_detected")
         score_dict["warnings"] = sorted(set(score_dict["warnings"]))
+        score_dict = _apply_shadow_row_governance(score_dict, suppress_numeric_score=True)
         results.append(score_dict)
 
     scored_rows = [row for row in results if row.get("score") is not None]
@@ -1385,11 +1425,17 @@ def score_icea_plus(
         "formula_version": formula.version,
         "formula_protocol_hash": formula.protocol_hash,
         "formula_source": formula.source,
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": "shadow_aggregate_research",
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,
             "version": model_artifact.version,
             "target": model_artifact.target,
+            "evidence_status": evidence.evidence_status,
+            "defensible": evidence.defensible,
+            "intended_use": evidence.intended_use,
         },
         "summary": summary,
         "results": results,

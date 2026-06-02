@@ -8,6 +8,11 @@ Core principles:
 - **Traceability first**: raw FHIR JSON is stored for audit/replay.
 - **Semantic interoperability**: resources are normalized into canonical tables for analytics.
 - **Model governance**: models are versioned artifacts (features + target + metrics).
+- **Model evidence gate**: ICEA/ICEA+ scoring fails closed when a `ModelArtifact`
+  lacks dataset fingerprint/hash, temporal spec version, guardrail status,
+  outcome window, case-mix evidence, intended use, validation/calibration
+  evidence or explicit unavailable reasons, limitations, and provenance/source
+  traceability.
 - **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
 - **Shadow aggregate governance**: ICEA/ICEA+ dashboard and export surfaces are aggregate-only, non-punitive, and suppress low-support cells.
 - **Fail-closed high-risk APIs**: scoring, causal, writeback, federated, simulate, policy learning, and fairness require explicit auth/RBAC and feature flags outside dev-only mode.
@@ -93,6 +98,15 @@ Defensible training/scoring requires fixed-horizon temporal metadata.
 ```json
 { "name": "icea-xgb", "version": "v0.7.4", "target": "delta_ri" }
 ```
+
+Training persists `ModelArtifact.metrics.evidence_pack` when the dataset is
+temporally defensible. The default intended use is
+`shadow_aggregate_research` with `non_individual_use=true` and
+`shadow_mode=true`. Missing calibration, validation, case-mix, or provenance is
+recorded as an explicit unavailable reason rather than fabricated evidence.
+Artifacts with `model_not_defensible`, `calibration_unavailable`,
+`validation_unavailable`, or `case_mix_insufficient` must not be treated as
+clinically validated or MDR production-ready.
 
 ### 4.1) ICEA+ v1 score, explain, aggregate
 

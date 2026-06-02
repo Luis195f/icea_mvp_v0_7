@@ -30,6 +30,7 @@ from icea_core.permissions import (
 from fhir_integration.facade import FHIRFacade
 from fhir_integration.service import FHIRClient
 from icea_core.engine import ICEAEngine
+from icea_core.evidence import build_training_evidence_metadata
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import ICEAComputation, ModelArtifact, PatientEpisode
 
@@ -904,6 +905,15 @@ class PipelineTrainFromDBView(APIView):
 
         # attach governance metrics
         result.metrics["feature_stats"] = feature_stats
+        result.metrics["evidence_pack"] = build_training_evidence_metadata(
+            raw_df=pd.DataFrame(dataset),
+            model_df=df_model,
+            features=result.features,
+            target=result.target,
+            dataset_grain=dataset_grain,
+            metrics=result.metrics,
+            temporal_guardrail_status="passed",
+        )
 
         artifact = ModelArtifact.objects.create(
             name=name,

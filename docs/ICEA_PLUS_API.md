@@ -78,6 +78,45 @@ contains statuses such as `insufficient_temporal_spec`, `temporal_leakage_blocke
 - `/causal/run/` and `/causal/simulate/` return `causal_available=false` when treatment, confounders, and outcome ordering cannot be proven.
 - Aggregate endpoints warn `no_comparable_without_case_mix` when unit/date/shift comparisons lack explicit case-mix specification.
 
+### Model Evidence Governance
+
+`/api/v1/models/` enriches each `ModelArtifact` with `evidence_status`,
+`defensible`, `missing_evidence`, `intended_use`, `limitations`,
+`temporal_spec_version`, `case_mix_status`, `calibration_status`, and
+`validation_status`. It does not label incomplete artifacts as `ready`,
+`validated`, or `production`.
+
+`/api/v1/icea-plus/score/` and the legacy `/api/v1/icea/compute/` fail closed
+with `detail=model_not_defensible` before computing scores when the selected
+model lacks the minimum evidence pack. The response includes `missing_evidence`
+and statuses such as `evidence_incomplete`, `calibration_unavailable`,
+`validation_unavailable`, and `case_mix_insufficient`; it does not include row
+results or numeric score claims.
+
+The minimum model evidence pack is stored in `ModelArtifact.metrics.evidence_pack`
+when available and must trace:
+
+- `model_id` and `artifact_created_at`
+- `dataset_fingerprint` or `dataset_hash`
+- `training_row_count`
+- `validation_row_count` or `validation_unavailable_reason`
+- `feature_names`
+- `temporal_spec_version` and `temporal_guardrail_status`
+- `outcome_definition` and `outcome_window`
+- `case_mix_spec` or `case_mix_unavailable_reason`
+- `intended_use=shadow_aggregate_research`
+- `non_individual_use=true` and `shadow_mode=true`
+- `calibration_summary` or `calibration_unavailable_reason`
+- `validation_metrics` or `validation_unavailable_reason`
+- `limitations`
+- provenance/source commit or an explicit unavailable reason
+
+`calibration_unavailable`, `validation_unavailable`, and
+`case_mix_insufficient` are not validation claims. They are audit statuses that
+prevent a model from being presented as defendible. `shadow_aggregate_research`
+means aggregate, exploratory monitoring only; it is not clinical validation and
+is not MDR production readiness.
+
 #### Response sketch
 
 ```json

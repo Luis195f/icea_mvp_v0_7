@@ -7,6 +7,7 @@ from django.conf import settings
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .evidence import build_training_evidence_metadata, summarize_model_evidence
 from .engine import ICEAEngine, compute_basic_summary, stable_json_dumps
 from .ml import train_xgb_regressor
 from .models import ICEAComputation, ModelArtifact
@@ -58,6 +59,16 @@ class ModelTrainView(APIView):
             model_dir=settings.ICEA_MODEL_DIR,
             params=payload.get("params") or None,
         )
+        evidence_pack = build_training_evidence_metadata(
+            raw_df=df,
+            model_df=df,
+            features=result.features,
+            target=result.target,
+            dataset_grain="external_payload",
+            metrics=result.metrics,
+            temporal_guardrail_status="not_evaluated_external_payload",
+        )
+        result.metrics["evidence_pack"] = evidence_pack
 
         artifact = ModelArtifact.objects.create(
             name=payload.get("name", "icea-xgb"),
@@ -80,6 +91,18 @@ class ICEAComputeView(APIView):
         payload = ser.validated_data
 
         artifact = ModelArtifact.objects.get(id=payload["model_id"])
+        evidence = summarize_model_evidence(artifact)
+        if not evidence.defensible:
+            return Response(
+                {
+                    "detail": "model_not_defensible",
+                    "model_id": str(artifact.id),
+                    "non_individual_use": True,
+                    "shadow_mode": True,
+                    **evidence.to_dict(),
+                },
+                status=400,
+            )
         df = pd.DataFrame(payload["data"])
 
         features = payload.get("features") or artifact.features
