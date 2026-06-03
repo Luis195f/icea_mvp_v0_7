@@ -8,7 +8,7 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from icea_core.evidence import INTENDED_USE_SHADOW_AGGREGATE, summarize_model_evidence
-from icea_core.models import ModelArtifact
+from icea_core.models import ICEAPlusComputation, ModelArtifact
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 
 
@@ -431,6 +431,19 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(row["status"], "shadow_only")
         self.assertIsNone(row["score"])
         self.assertIsNone(row["raw_score"])
+        summary = body["summary"]
+        self.assertGreater(summary["rows_scored"], 0)
+        self.assertEqual(
+            summary["rows_scored"],
+            summary["status_counts"]["complete"] + summary["status_counts"]["provisional"],
+        )
+        self.assertGreater(
+            summary["status_counts"]["complete"] + summary["status_counts"]["provisional"],
+            0,
+        )
+        computation = ICEAPlusComputation.objects.filter(model=self.episode_artifact).order_by("-created_at").first()
+        self.assertIsNotNone(computation)
+        self.assertEqual(computation.summary, summary)
 
     def test_aggregate_uses_internal_scores_while_public_rows_stay_redacted(self):
         aggregate_rows = []
@@ -471,7 +484,11 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
             "non_individual_use": True,
             "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
             "model": {"id": str(self.episode_artifact.id), "version": self.episode_artifact.version},
-            "summary": {"rows_requested": 10, "rows_scored": 10, "status_counts": {}},
+            "summary": {
+                "rows_requested": 10,
+                "rows_scored": 10,
+                "status_counts": {"complete": 10, "provisional": 0, "insufficient_evidence": 0},
+            },
             "results": public_rows,
             "_aggregate_rows": aggregate_rows,
         }
@@ -486,6 +503,8 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(len(body["results"]), 1)
         self.assertEqual(body["results"][0]["status"], "scored_aggregate")
         self.assertIsNotNone(body["results"][0]["score"])
+        self.assertEqual(body["summary"]["rows_scored"], 10)
+        self.assertEqual(body["summary"]["status_counts"]["complete"], 10)
         self.assertNotIn("_aggregate_rows", body)
         self.assertNotIn("rows", body["results"][0])
 

@@ -1425,12 +1425,12 @@ def score_icea_plus(
         "baseline_mode": baseline_mode,
         "causal_available": bool(any(row["flags"].get("causal_available") for row in aggregate_rows)),
         "status_counts": {
-            "complete": int(sum(1 for row in results if row.get("status") == "complete")),
-            "provisional": int(sum(1 for row in results if row.get("status") == "provisional")),
-            "insufficient_evidence": int(sum(1 for row in results if row.get("status") == "insufficient_evidence")),
+            "complete": int(sum(1 for row in aggregate_rows if row.get("status") == "complete")),
+            "provisional": int(sum(1 for row in aggregate_rows if row.get("status") == "provisional")),
+            "insufficient_evidence": int(sum(1 for row in aggregate_rows if row.get("status") == "insufficient_evidence")),
         },
         "component_means": component_means,
-        "warnings": sorted({warning for row in results for warning in (row.get("warnings") or [])}),
+        "warnings": sorted({warning for row in aggregate_rows for warning in (row.get("warnings") or [])}),
     }
 
     return {
