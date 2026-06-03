@@ -191,7 +191,7 @@ class ICEAPlusScoreView(APIView):
         if bool(payload.get("from_db", True)) and str(payload.get("grain") or "episode") == "episode":
             persist_initial_followup_records(
                 artifact=artifact,
-                result=redact_shadow_score_response(result),
+                result=result,
                 computation=computation,
                 request_config=dict(payload),
             )

@@ -127,6 +127,13 @@ marked `source=derived_from_training_data`. If the domains cannot be derived,
 the model is still registered for auditability but remains
 `model_not_defensible` / `case_mix_insufficient`.
 
+Case-mix derivation and validation use only columns that are actually present in
+the training payload/model frame and contain at least one observed value.
+Declared features that are absent from every row, entirely empty, or introduced
+only by model zero-fill do not count as case-mix evidence. Such declarations are
+recorded with `declared_feature_missing_from_payload` and leave the artifact
+non-defensible when required domains lack real support.
+
 `/api/v1/models/train/` validates external dataset rows with the same temporal
 frame guardrails used by governed scoring and DB training. Only explicit passing
 statuses such as `temporal_guardrails_passed`, `temporal_spec_valid`, or

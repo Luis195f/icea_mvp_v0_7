@@ -26,6 +26,9 @@ from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import EpisodeWindow, FHIRWritebackRecord, NormalizedObservation, NormalizedProcedure
 
 
+INTERNAL_AGGREGATE_ROW_KEY = "_aggregate_row"
+
+
 @dataclass
 class FollowupEvaluation:
     evidence_types: list[str]
@@ -172,6 +175,45 @@ def _compact_score_payload(result_row: dict[str, Any], *, scored_at: datetime | 
     }
 
 
+def _row_identity(row: dict[str, Any]) -> str:
+    return str(row.get("row_id") or row.get("episode_id") or "")
+
+
+def _aggregate_rows_by_identity(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        _row_identity(row): dict(row)
+        for row in list(result.get("_aggregate_rows") or [])
+        if isinstance(row, dict) and _row_identity(row)
+    }
+
+
+def _with_internal_aggregate_row(public_row: dict[str, Any], aggregate_row: dict[str, Any] | None) -> dict[str, Any]:
+    stored = dict(public_row)
+    if isinstance(aggregate_row, dict):
+        stored[INTERNAL_AGGREGATE_ROW_KEY] = dict(aggregate_row)
+    return stored
+
+
+def _public_stored_result(result_row: dict[str, Any]) -> dict[str, Any]:
+    public = dict(result_row or {})
+    public.pop(INTERNAL_AGGREGATE_ROW_KEY, None)
+    return public
+
+
+def _aggregate_stored_result(result_row: dict[str, Any]) -> dict[str, Any]:
+    aggregate_row = (result_row or {}).get(INTERNAL_AGGREGATE_ROW_KEY)
+    if isinstance(aggregate_row, dict):
+        return dict(aggregate_row)
+    return _public_stored_result(result_row)
+
+
+def _artifact_case_mix_spec(artifact: ModelArtifact) -> dict[str, Any] | None:
+    metrics = artifact.metrics or {}
+    evidence = metrics.get("evidence_pack") if isinstance(metrics.get("evidence_pack"), dict) else {}
+    value = evidence.get("case_mix_spec") or metrics.get("case_mix_spec")
+    return dict(value) if isinstance(value, dict) else None
+
+
 def _computation_from_result(
     *,
     artifact: ModelArtifact,
@@ -299,7 +341,9 @@ def persist_initial_followup_records(
     computation: ICEAPlusComputation,
     request_config: dict[str, Any],
 ) -> list[ICEAPlusFollowupRecord]:
-    rows = [row for row in (result.get("results") or []) if row.get("episode_id") is not None]
+    public_result = redact_shadow_score_response(result)
+    aggregate_rows = _aggregate_rows_by_identity(result)
+    rows = [row for row in (public_result.get("results") or []) if row.get("episode_id") is not None]
     if not rows:
         return []
     episode_ids = sorted({int(row["episode_id"]) for row in rows})
@@ -312,12 +356,13 @@ def persist_initial_followup_records(
         episode = episodes.get(int(row["episode_id"]))
         if episode is None:
             continue
+        stored_row = _with_internal_aggregate_row(row, aggregate_rows.get(_row_identity(row)))
         records.append(
             _upsert_initial_record(
                 episode=episode,
                 artifact=artifact,
                 computation=computation,
-                row=row,
+                row=stored_row,
                 request_config=request_config,
             )
         )
@@ -354,7 +399,8 @@ def _score_episode_from_request(
     row = next((candidate for candidate in (result.get("results") or []) if int(candidate.get("episode_id") or 0) == int(episode.id)), None)
     if row is None:
         raise ValueError("episode_not_returned_by_score")
-    return result, row
+    aggregate_row = _aggregate_rows_by_identity(raw_result).get(_row_identity(row))
+    return result, _with_internal_aggregate_row(row, aggregate_row)
 
 
 def ensure_followup_record(
@@ -663,8 +709,14 @@ def rescore_followup(
 
 def _effective_result(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
     if record.followup_status == "enriched_followup" and record.enriched_result:
-        return dict(record.enriched_result or {})
-    return dict(record.initial_result or {})
+        return _public_stored_result(record.enriched_result or {})
+    return _public_stored_result(record.initial_result or {})
+
+
+def _effective_aggregate_result(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
+    if record.followup_status == "enriched_followup" and record.enriched_result:
+        return _aggregate_stored_result(record.enriched_result or {})
+    return _aggregate_stored_result(record.initial_result or {})
 
 
 def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
@@ -758,7 +810,7 @@ def build_summary_writeback(
         warnings.append("shift_writeback_requires_window_followup_falling_back_to_unit")
     require_staff_count = requested_group_by in {"team", "shift"}
 
-    rows = [_effective_result(record) for record in qs if _effective_result(record)]
+    rows = [_effective_aggregate_result(record) for record in qs if _effective_aggregate_result(record)]
     aggregated = aggregate_scored_rows(
         rows=rows,
         group_by=effective_group_by,
@@ -767,7 +819,7 @@ def build_summary_writeback(
         min_cell_count=MIN_AGGREGATE_EPISODES,
         min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
         require_staff_count=require_staff_count,
-        case_mix_spec=(artifact.metrics or {}).get("case_mix_spec") or (formula.spec or {}).get("case_mix_spec"),
+        case_mix_spec=_artifact_case_mix_spec(artifact) or (formula.spec or {}).get("case_mix_spec"),
     )
     suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
     state_counts = {

@@ -179,6 +179,64 @@ def derive_case_mix_spec_from_columns(columns: list[str]) -> dict[str, Any] | No
     }
 
 
+def _is_observed_training_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    try:
+        return not bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return True
+
+
+def _observed_training_columns(raw_df: pd.DataFrame, model_df: pd.DataFrame) -> list[str]:
+    model_columns = {str(column) for column in model_df.columns}
+    observed = []
+    for column in raw_df.columns:
+        name = str(column)
+        if name not in model_columns:
+            continue
+        series = raw_df[column]
+        has_observed_value = any(_is_observed_training_value(value) for value in series.tolist())
+        if has_observed_value:
+            observed.append(name)
+    return sorted(set(observed))
+
+
+def _case_mix_domain_columns(case_mix_spec: dict[str, Any] | None) -> dict[str, list[str]]:
+    if not isinstance(case_mix_spec, dict):
+        return {}
+    mappings: dict[str, list[str]] = {}
+    for container_name in ("domains", "variables"):
+        container = case_mix_spec.get(container_name)
+        if not isinstance(container, dict):
+            continue
+        for domain, raw_values in container.items():
+            if isinstance(raw_values, str):
+                values = [raw_values]
+            elif isinstance(raw_values, (list, tuple, set)):
+                values = [str(value) for value in raw_values if str(value)]
+            else:
+                values = []
+            if values:
+                mappings[str(domain)] = sorted(set(values))
+    return mappings
+
+
+def _case_mix_support_issue(case_mix_spec: dict[str, Any] | None, observed_columns: list[str]) -> list[str]:
+    domain_columns = _case_mix_domain_columns(case_mix_spec)
+    observed = set(observed_columns)
+    warnings: list[str] = []
+    for domain in sorted(CASE_MIX_REQUIRED_DOMAINS):
+        columns = domain_columns.get(domain) or []
+        if not columns:
+            warnings.append(f"case_mix_domain_without_observed_columns:{domain}")
+            continue
+        unsupported = sorted(set(columns) - observed)
+        if unsupported:
+            warnings.append(f"case_mix_columns_missing_or_empty:{domain}:{','.join(unsupported)}")
+    return warnings
+
+
 def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     metrics = dict(artifact.metrics or {})
     evidence = _metrics_evidence(metrics)
@@ -377,13 +435,20 @@ def build_training_evidence_metadata(
     validation_metrics = {key: metrics.get(key) for key in ("rmse", "mae", "r2", "auc") if metrics.get(key) is not None}
     conformal = metrics.get("conformal") if isinstance(metrics.get("conformal"), dict) else None
     validation_row_count = conformal.get("calibration_size") if conformal else None
+    feature_names = {str(feature) for feature in features}
+    observed_columns = [column for column in _observed_training_columns(raw_df, model_df) if column in feature_names]
+    declared_feature_missing = sorted(set(str(feature) for feature in features) - set(str(column) for column in raw_df.columns))
     effective_case_mix_spec = dict(case_mix_spec) if isinstance(case_mix_spec, dict) else None
     if effective_case_mix_spec is None:
-        effective_case_mix_spec = derive_case_mix_spec_from_columns(list(features))
+        effective_case_mix_spec = derive_case_mix_spec_from_columns(observed_columns)
     case_mix_issue = validate_case_mix_spec(effective_case_mix_spec)
+    case_mix_support_warnings = _case_mix_support_issue(effective_case_mix_spec, observed_columns)
     case_mix_unavailable_reason = None
-    if case_mix_issue:
-        case_mix_unavailable_reason = ";".join(case_mix_issue.warnings)
+    if case_mix_issue or case_mix_support_warnings:
+        case_mix_unavailable_reason = ";".join(
+            sorted(set(list(case_mix_issue.warnings if case_mix_issue else []) + case_mix_support_warnings))
+        )
+        effective_case_mix_spec = None
 
     evidence = {
         "dataset_fingerprint": dataset_fingerprint,
@@ -391,6 +456,9 @@ def build_training_evidence_metadata(
         "training_row_count": int(len(model_df) - int(validation_row_count or 0)) if validation_row_count is not None else int(len(model_df)),
         "validation_row_count": validation_row_count,
         "feature_names": list(features),
+        "observed_feature_columns": observed_columns,
+        "feature_warnings": ["declared_feature_missing_from_payload"] if declared_feature_missing else [],
+        "declared_features_missing_from_payload": declared_feature_missing,
         "temporal_spec_version": temporal_versions[0] if len(temporal_versions) == 1 else None,
         "temporal_guardrail_status": temporal_guardrail_status,
         "temporal_guardrail_warnings": sorted(set(temporal_guardrail_warnings or [])),
@@ -413,7 +481,7 @@ def build_training_evidence_metadata(
         "validation_metrics": validation_metrics or None,
         "validation_unavailable_reason": None if validation_metrics else "validation_metrics_not_computed",
         "limitations": MINIMUM_LIMITATIONS
-        + ([] if not case_mix_issue else ["case_mix_insufficient"])
+        + ([] if not case_mix_issue and not case_mix_support_warnings else ["case_mix_insufficient"])
         + ([] if conformal else ["calibration_unavailable"]),
         "source_commit_unavailable_reason": "source_commit_not_captured_by_training_runtime",
     }

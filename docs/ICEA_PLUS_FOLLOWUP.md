@@ -95,6 +95,11 @@ Each longitudinal record persists:
 - `last_followup_at`
 - `last_rescore_at`
 
+The stored result keeps a private aggregate-only row alongside the public
+redacted row so later follow-up summaries can calculate supported aggregate
+cells. Patient-facing summaries never expose that internal row or an individual
+numeric score, and aggregate outputs still apply minimum-cell suppression.
+
 ## Prudence and governance
 
 - Follow-up rescoring remains observational and exploratory.

@@ -53,6 +53,7 @@ class ModelTrainView(APIView):
         payload = ser.validated_data
 
         df = pd.DataFrame(payload["dataset"])
+        evidence_model_df = df.reindex(columns=list(payload["features"]) + [str(payload["target"])])
         temporal_issues = validate_temporal_frame(
             df,
             feature_names=list(payload["features"]),
@@ -75,7 +76,7 @@ class ModelTrainView(APIView):
         )
         evidence_pack = build_training_evidence_metadata(
             raw_df=df,
-            model_df=df,
+            model_df=evidence_model_df,
             features=result.features,
             target=result.target,
             dataset_grain="external_payload",
