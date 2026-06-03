@@ -6,6 +6,7 @@ import pandas as pd
 from django.conf import settings
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from icea_pipeline.temporal import validate_temporal_frame
 
 from .evidence import build_training_evidence_metadata, summarize_model_evidence
 from .engine import ICEAEngine, compute_basic_summary, stable_json_dumps
@@ -52,6 +53,19 @@ class ModelTrainView(APIView):
         payload = ser.validated_data
 
         df = pd.DataFrame(payload["dataset"])
+        temporal_issues = validate_temporal_frame(
+            df,
+            feature_names=list(payload["features"]),
+            target=str(payload["target"]),
+        )
+        temporal_guardrail_status = "temporal_guardrails_passed"
+        temporal_guardrail_warnings: list[str] = []
+        if temporal_issues:
+            temporal_guardrail_status = str(temporal_issues[0][1].status or "external_payload_temporal_not_defensible")
+            temporal_guardrail_warnings = sorted(
+                {warning for _, issue in temporal_issues for warning in issue.warnings}
+            )
+
         result = train_xgb_regressor(
             df,
             features=payload["features"],
@@ -66,7 +80,8 @@ class ModelTrainView(APIView):
             target=result.target,
             dataset_grain="external_payload",
             metrics=result.metrics,
-            temporal_guardrail_status="not_evaluated_external_payload",
+            temporal_guardrail_status=temporal_guardrail_status,
+            temporal_guardrail_warnings=temporal_guardrail_warnings,
             case_mix_spec=payload.get("case_mix_spec"),
         )
         result.metrics["evidence_pack"] = evidence_pack

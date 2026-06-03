@@ -40,7 +40,12 @@ def complete_evidence_pack(**overrides):
         "shadow_mode": True,
         "calibration_summary": {"method": "split_conformal", "calibration_size": 20},
         "validation_metrics": {"rmse": 1.2, "mae": 0.9},
-        "limitations": ["shadow_aggregate_research_only", "not_clinically_validated", "not_for_individual_decisioning"],
+        "limitations": [
+            "shadow_aggregate_research_only",
+            "not_clinically_validated",
+            "not_for_individual_decisioning",
+            "not_mdr_production_ready",
+        ],
         "source_commit_unavailable_reason": "not_captured_in_test",
     }
     pack.update(overrides)
@@ -111,6 +116,52 @@ class ModelEvidenceUnitTests(TestCase):
         self.assertEqual(evidence.calibration_status, "calibration_unavailable")
         self.assertIn("calibration_unavailable", evidence.statuses)
 
+    def test_not_evaluated_external_payload_is_not_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(temporal_guardrail_status="not_evaluated_external_payload")
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertIn("temporal_guardrail_not_evaluated", evidence.missing_evidence)
+        self.assertIn("temporal_spec_required", evidence.missing_evidence)
+        self.assertIn("model_not_defensible", evidence.statuses)
+
+    def test_arbitrary_limitation_note_is_not_sufficient(self):
+        artifact = create_artifact(evidence_pack=complete_evidence_pack(limitations=["some_note"]))
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertEqual(evidence.limitations_status, "limitations_incomplete")
+        self.assertIn("required_limitations", evidence.missing_evidence)
+
+    def test_each_required_limitation_is_blocking_when_missing(self):
+        required = [
+            "not_for_individual_decisioning",
+            "not_mdr_production_ready",
+            "shadow_aggregate_research_only",
+        ]
+        for missing_limitation in required:
+            with self.subTest(missing_limitation=missing_limitation):
+                limitations = [value for value in complete_evidence_pack()["limitations"] if value != missing_limitation]
+                artifact = create_artifact(evidence_pack=complete_evidence_pack(limitations=limitations))
+
+                evidence = summarize_model_evidence(artifact)
+
+                self.assertFalse(evidence.defensible)
+                self.assertEqual(evidence.limitations_status, "limitations_incomplete")
+                self.assertIn(f"missing_required_limitations:{missing_limitation}", evidence.missing_evidence)
+
+    def test_complete_required_limitations_allow_evidence_to_advance(self):
+        artifact = create_artifact(evidence_pack=complete_evidence_pack())
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertTrue(evidence.defensible)
+        self.assertEqual(evidence.limitations_status, "limitations_complete")
+
 
 class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
     def setUp(self):
@@ -157,6 +208,124 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(item["evidence_status"], "evidence_incomplete")
         self.assertNotIn("ready", item)
         self.assertNotIn("validated", item)
+
+    def test_models_endpoint_exposes_incomplete_limitations_status(self):
+        artifact = create_artifact(evidence_pack=complete_evidence_pack(limitations=["some_note"]))
+
+        response = self.client.get("/api/v1/models/")
+
+        self.assertEqual(response.status_code, 200)
+        item = next(row for row in response.json() if row["id"] == str(artifact.id))
+        self.assertFalse(item["defensible"])
+        self.assertEqual(item["limitations_status"], "limitations_incomplete")
+        self.assertIn("required_limitations", item["missing_evidence"])
+
+    def _external_training_payload(self, *, temporal_spec=True, invalid_temporal_spec=False):
+        rows = []
+        for i in range(8):
+            row = {
+                "ri_initial": 50.0 + i,
+                "nurse_hppd": 3.0 + (i * 0.1),
+                "delta_ri": 2.0 + (i * 0.2),
+            }
+            if temporal_spec:
+                feature_end = "2026-03-01T20:00:00Z"
+                outcome_start = "2026-03-01T18:00:00Z" if invalid_temporal_spec else "2026-03-01T20:00:00Z"
+                row["temporal_spec"] = {
+                    "temporal_spec_version": "icea_temporal_v1",
+                    "index_time": "2026-03-01T08:00:00Z",
+                    "feature_window_start": "2026-03-01T08:00:00Z",
+                    "feature_window_end": feature_end,
+                    "outcome_window_start": outcome_start,
+                    "outcome_window_end": "2026-03-02T08:00:00Z",
+                    "censoring_reason": "not_censored",
+                }
+            rows.append(row)
+        return {
+            "name": "external-evidence-test",
+            "version": "v-external",
+            "target": "delta_ri",
+            "features": ["ri_initial", "nurse_hppd"],
+            "dataset": rows,
+            "case_mix_spec": complete_evidence_pack()["case_mix_spec"],
+        }
+
+    def _mock_external_train_result(self):
+        return SimpleNamespace(
+            model_path="mock-external-model.json",
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            metrics={
+                "rmse": 0.1,
+                "mae": 0.1,
+                "n_rows": 8,
+                "n_features": 2,
+                "conformal": {"method": "split_abs_residual", "alpha": 0.05, "q_hat": 0.1, "calibration_size": 2},
+            },
+        )
+
+    def test_models_train_without_temporal_spec_is_not_defensible(self):
+        with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
+            response = self.client.post(
+                "/api/v1/models/train/",
+                self._external_training_payload(temporal_spec=False),
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertEqual(body["evidence_status"], "evidence_incomplete")
+        self.assertEqual(body["temporal_guardrail_status"], "insufficient_temporal_spec")
+        self.assertIn("temporal_spec_required", body["missing_evidence"])
+        self.assertIn("model_not_defensible", summarize_model_evidence(ModelArtifact.objects.get(id=body["id"])).statuses)
+
+    def test_models_train_with_invalid_temporal_spec_is_not_defensible_not_500(self):
+        with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
+            response = self.client.post(
+                "/api/v1/models/train/",
+                self._external_training_payload(invalid_temporal_spec=True),
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertEqual(body["temporal_guardrail_status"], "temporal_leakage_blocked")
+        self.assertIn("temporal_guardrail_not_passed:temporal_leakage_blocked", body["missing_evidence"])
+
+    def test_models_train_with_valid_temporal_spec_can_be_defensible_shadow_research(self):
+        with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
+            response = self.client.post(
+                "/api/v1/models/train/",
+                self._external_training_payload(),
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertTrue(body["defensible"])
+        self.assertEqual(body["evidence_status"], "evidence_complete")
+        self.assertEqual(body["temporal_guardrail_status"], "temporal_guardrails_passed")
+        self.assertEqual(body["limitations_status"], "limitations_complete")
+        self.assertEqual(body["intended_use"], INTENDED_USE_SHADOW_AGGREGATE)
+
+    def test_score_blocks_model_with_temporal_guardrails_not_evaluated(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(temporal_guardrail_status="not_evaluated_external_payload")
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": str(artifact.id), "grain": "episode", "from_db": True},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "model_not_defensible")
+        self.assertFalse(body["defensible"])
+        self.assertNotIn("results", body)
 
     def test_training_saves_evidence_metadata_or_unavailable_reasons(self):
         with mock.patch("icea_pipeline.views.train_xgb_regressor") as train_mock:

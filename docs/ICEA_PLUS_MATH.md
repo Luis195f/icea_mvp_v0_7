@@ -97,6 +97,15 @@ positive evidence. A model with `calibration_unavailable`,
 This prevents a score or model card from quietly converting missing evidence
 into a validity claim.
 
+Temporal model evidence is similarly fail-closed. A non-empty status is not
+enough: only a known passing temporal guardrail status can support
+defensibility. External payloads that were not evaluated, lack temporal specs,
+or fail leakage checks remain `model_not_defensible`.
+
+Model limitations are a required governance control, not free-form decoration.
+Every defendible artifact must state that it is shadow aggregate research only,
+not for individual decisioning, and not MDR production-ready.
+
 For aggregate shadow reports, ICEA+ may use internal row-level numeric values
 only as an intermediate input to suppressed, k-anonymous aggregate cells. Public
 row responses remain `shadow_only` with `score=null` and `raw_score=null`; the

@@ -12,7 +12,9 @@ class ModelArtifactSerializer(serializers.ModelSerializer):
     missing_evidence = serializers.SerializerMethodField()
     intended_use = serializers.SerializerMethodField()
     limitations = serializers.SerializerMethodField()
+    limitations_status = serializers.SerializerMethodField()
     temporal_spec_version = serializers.SerializerMethodField()
+    temporal_guardrail_status = serializers.SerializerMethodField()
     case_mix_status = serializers.SerializerMethodField()
     calibration_status = serializers.SerializerMethodField()
     validation_status = serializers.SerializerMethodField()
@@ -34,7 +36,9 @@ class ModelArtifactSerializer(serializers.ModelSerializer):
             "missing_evidence",
             "intended_use",
             "limitations",
+            "limitations_status",
             "temporal_spec_version",
+            "temporal_guardrail_status",
             "case_mix_status",
             "calibration_status",
             "validation_status",
@@ -59,8 +63,14 @@ class ModelArtifactSerializer(serializers.ModelSerializer):
     def get_limitations(self, obj):
         return self._evidence(obj).limitations
 
+    def get_limitations_status(self, obj):
+        return self._evidence(obj).limitations_status
+
     def get_temporal_spec_version(self, obj):
         return self._evidence(obj).temporal_spec_version
+
+    def get_temporal_guardrail_status(self, obj):
+        return self._evidence(obj).temporal_guardrail_status
 
     def get_case_mix_status(self, obj):
         return self._evidence(obj).case_mix_status

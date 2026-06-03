@@ -114,6 +114,12 @@ may derive `case_mix_spec` only from real columns covering age, severity,
 comorbidity, fragility/dependency, baseline risk, and baseline load; otherwise
 the artifact remains non-defensible instead of inventing case-mix support.
 
+External `/api/v1/models/train/` payloads must also pass temporal frame
+validation. `not_evaluated_external_payload` is never a defendible status.
+Defendible artifacts must explicitly retain the canonical limitations
+`shadow_aggregate_research_only`, `not_for_individual_decisioning`, and
+`not_mdr_production_ready`.
+
 ### 4.1) ICEA+ v1 score, explain, aggregate
 
 - `POST /api/v1/icea-plus/score/`

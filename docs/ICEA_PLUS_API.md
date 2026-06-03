@@ -127,6 +127,23 @@ marked `source=derived_from_training_data`. If the domains cannot be derived,
 the model is still registered for auditability but remains
 `model_not_defensible` / `case_mix_insufficient`.
 
+`/api/v1/models/train/` validates external dataset rows with the same temporal
+frame guardrails used by governed scoring and DB training. Only explicit passing
+statuses such as `temporal_guardrails_passed`, `temporal_spec_valid`, or
+`passed` can support a defendible model. `not_evaluated_external_payload`,
+`insufficient_temporal_spec`, `temporal_leakage_blocked`,
+`legacy_outcome_not_defensible`, and unknown states are blocking.
+
+Defendible model evidence must also include the canonical minimum limitations:
+
+- `shadow_aggregate_research_only`
+- `not_for_individual_decisioning`
+- `not_mdr_production_ready`
+
+An arbitrary non-empty limitations note is insufficient. `/api/v1/models/`
+exposes `limitations_status` and `temporal_guardrail_status` alongside
+`missing_evidence`.
+
 #### Response sketch
 
 ```json

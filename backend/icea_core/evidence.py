@@ -12,12 +12,45 @@ from icea_pipeline.temporal import CASE_MIX_REQUIRED_DOMAINS, validate_case_mix_
 
 
 INTENDED_USE_SHADOW_AGGREGATE = "shadow_aggregate_research"
+REQUIRED_MODEL_LIMITATIONS = frozenset(
+    {
+        "shadow_aggregate_research_only",
+        "not_for_individual_decisioning",
+        "not_mdr_production_ready",
+    }
+)
 MINIMUM_LIMITATIONS = [
     "shadow_aggregate_research_only",
     "not_for_individual_decisioning",
     "not_clinically_validated",
     "not_mdr_production_ready",
 ]
+DEFENSIBLE_TEMPORAL_GUARDRAIL_STATUSES = frozenset(
+    {
+        "passed",
+        "temporal_spec_valid",
+        "temporal_guardrails_passed",
+    }
+)
+NOT_EVALUATED_TEMPORAL_GUARDRAIL_STATUSES = frozenset(
+    {
+        "",
+        "unknown",
+        "not_evaluated",
+        "not_evaluated_external_payload",
+        "external_payload_temporal_not_defensible",
+    }
+)
+TEMPORAL_SPEC_REQUIRED_STATUSES = frozenset(
+    {
+        "",
+        "unknown",
+        "not_evaluated",
+        "not_evaluated_external_payload",
+        "external_payload_temporal_not_defensible",
+        "insufficient_temporal_spec",
+    }
+)
 CASE_MIX_DERIVATION_CANDIDATES = {
     "age": ["age", "patient_age", "age_years"],
     "severity": ["ri_initial", "baseline_severity", "severity", "rothman_index_initial"],
@@ -36,7 +69,9 @@ class ModelEvidenceSummary:
     statuses: list[str]
     intended_use: str | None
     limitations: list[str]
+    limitations_status: str
     temporal_spec_version: str | None
+    temporal_guardrail_status: str | None
     case_mix_status: str
     calibration_status: str
     validation_status: str
@@ -50,7 +85,9 @@ class ModelEvidenceSummary:
             "statuses": self.statuses,
             "intended_use": self.intended_use,
             "limitations": self.limitations,
+            "limitations_status": self.limitations_status,
             "temporal_spec_version": self.temporal_spec_version,
+            "temporal_guardrail_status": self.temporal_guardrail_status,
             "case_mix_status": self.case_mix_status,
             "calibration_status": self.calibration_status,
             "validation_status": self.validation_status,
@@ -173,6 +210,11 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         evidence.get("temporal_spec_version"),
         metrics.get("temporal_spec_version"),
     )
+    temporal_guardrail_status = str(
+        _first_non_empty(evidence.get("temporal_guardrail_status"), metrics.get("temporal_guardrail_status")) or ""
+    ).strip()
+    limitations = [str(value) for value in _as_list(_first_non_empty(evidence.get("limitations"), metrics.get("limitations"))) if str(value)]
+    missing_required_limitations = sorted(REQUIRED_MODEL_LIMITATIONS - set(limitations))
 
     pack = {
         "model_id": str(artifact.id) if artifact.id else None,
@@ -183,7 +225,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "validation_unavailable_reason": validation_unavailable_reason,
         "feature_names": list(artifact.features or []),
         "temporal_spec_version": temporal_spec_version,
-        "temporal_guardrail_status": _first_non_empty(evidence.get("temporal_guardrail_status"), metrics.get("temporal_guardrail_status")),
+        "temporal_guardrail_status": temporal_guardrail_status or None,
         "outcome_definition": _first_non_empty(evidence.get("outcome_definition"), metrics.get("outcome_definition"), artifact.target),
         "outcome_window": _first_non_empty(evidence.get("outcome_window"), metrics.get("outcome_window")),
         "case_mix_spec": case_mix_spec,
@@ -194,7 +236,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "calibration_summary": calibration_summary,
         "calibration_unavailable_reason": calibration_unavailable_reason,
         "validation_metrics": validation_metrics,
-        "limitations": _as_list(_first_non_empty(evidence.get("limitations"), metrics.get("limitations"))),
+        "limitations": limitations,
         "provenance": _first_non_empty(evidence.get("provenance"), metrics.get("provenance")),
         "source_commit": _first_non_empty(evidence.get("source_commit"), metrics.get("source_commit")),
         "source_commit_unavailable_reason": _first_non_empty(
@@ -231,6 +273,20 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         missing.append("case_mix_spec_or_unavailable_reason")
     if case_mix_issue:
         missing.append("case_mix_spec_sufficient")
+    if temporal_guardrail_status not in DEFENSIBLE_TEMPORAL_GUARDRAIL_STATUSES:
+        if temporal_guardrail_status in NOT_EVALUATED_TEMPORAL_GUARDRAIL_STATUSES:
+            missing.append("temporal_guardrail_not_evaluated")
+        else:
+            missing.append(f"temporal_guardrail_not_passed:{temporal_guardrail_status}")
+        if temporal_guardrail_status in TEMPORAL_SPEC_REQUIRED_STATUSES:
+            missing.append("temporal_spec_required")
+    if missing_required_limitations:
+        missing.extend(
+            [
+                "required_limitations",
+                f"missing_required_limitations:{','.join(missing_required_limitations)}",
+            ]
+        )
     if not pack.get("provenance") and not pack.get("source_commit") and not pack.get("source_commit_unavailable_reason"):
         missing.append("provenance_or_source_commit_or_unavailable_reason")
 
@@ -243,6 +299,14 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         statuses.append("shadow_mode_missing")
     if pack.get("intended_use") != INTENDED_USE_SHADOW_AGGREGATE:
         statuses.append("intended_use_not_shadow_aggregate_research")
+    if temporal_guardrail_status not in DEFENSIBLE_TEMPORAL_GUARDRAIL_STATUSES:
+        statuses.append(
+            "temporal_guardrail_not_evaluated"
+            if temporal_guardrail_status in NOT_EVALUATED_TEMPORAL_GUARDRAIL_STATUSES
+            else "temporal_guardrail_not_passed"
+        )
+    if missing_required_limitations:
+        statuses.append("limitations_incomplete")
     if case_mix_issue:
         statuses.append("case_mix_insufficient")
     if not pack.get("calibration_summary"):
@@ -261,6 +325,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     case_mix_status = "case_mix_available" if not case_mix_issue else "case_mix_insufficient"
     calibration_status = "calibration_available" if pack.get("calibration_summary") else "calibration_unavailable"
     validation_status = "validation_available" if pack.get("validation_metrics") else "validation_unavailable"
+    limitations_status = "limitations_complete" if not missing_required_limitations else "limitations_incomplete"
 
     return ModelEvidenceSummary(
         evidence_status=evidence_status,
@@ -269,7 +334,9 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         statuses=sorted(set(statuses)),
         intended_use=pack.get("intended_use"),
         limitations=list(pack.get("limitations") or []),
+        limitations_status=limitations_status,
         temporal_spec_version=temporal_spec_version,
+        temporal_guardrail_status=temporal_guardrail_status or None,
         case_mix_status=case_mix_status,
         calibration_status=calibration_status,
         validation_status=validation_status,
@@ -286,6 +353,7 @@ def build_training_evidence_metadata(
     dataset_grain: str,
     metrics: dict[str, Any],
     temporal_guardrail_status: str,
+    temporal_guardrail_warnings: list[str] | None = None,
     case_mix_spec: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records = raw_df.where(pd.notnull(raw_df), None).to_dict(orient="records")
@@ -325,6 +393,7 @@ def build_training_evidence_metadata(
         "feature_names": list(features),
         "temporal_spec_version": temporal_versions[0] if len(temporal_versions) == 1 else None,
         "temporal_guardrail_status": temporal_guardrail_status,
+        "temporal_guardrail_warnings": sorted(set(temporal_guardrail_warnings or [])),
         "outcome_definition": target,
         "outcome_window": {
             "source": "row_temporal_spec",
