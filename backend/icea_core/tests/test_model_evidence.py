@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from types import SimpleNamespace
 from unittest import mock
 
@@ -225,6 +226,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         body = response.json()
         self.assertEqual(body["detail"], "model_not_defensible")
         self.assertFalse(body["defensible"])
+        self.assertEqual(body["primary_model_evidence_status"], "evidence_incomplete")
         self.assertNotIn("results", body)
         self.assertIn("dataset_fingerprint", body["missing_evidence"])
 
@@ -597,6 +599,132 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         patient_summary = build_patient_summary(record)
         self.assertIsNone(patient_summary["initial_score"]["score"])
         self.assertNotIn(INTERNAL_AGGREGATE_ROW_KEY, patient_summary["initial_score"])
+
+    def test_score_blocks_non_defensible_baseline_model_before_numeric_benefit(self):
+        baseline = create_artifact(
+            evidence_pack=complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(baseline.id),
+                "grain": "episode",
+                "from_db": True,
+                "episode_ids": [int(self.episodes[0].id)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "baseline_model_not_defensible")
+        self.assertEqual(body["primary_model_evidence_status"], "evidence_complete")
+        self.assertEqual(body["baseline_model_evidence_status"], "evidence_incomplete")
+        self.assertTrue(body["baseline_model_not_defensible"])
+        self.assertIn("dataset_fingerprint", body["baseline_model_missing_evidence"])
+        self.assertEqual(body["baseline_model"]["id"], str(baseline.id))
+        self.assertNotIn("results", body)
+
+    def test_score_returns_controlled_error_for_missing_baseline_model(self):
+        missing_baseline_id = uuid.uuid4()
+
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(missing_baseline_id),
+                "grain": "episode",
+                "from_db": True,
+                "episode_ids": [int(self.episodes[0].id)],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "baseline_model_not_found")
+        self.assertEqual(body["primary_model_evidence_status"], "evidence_complete")
+        self.assertEqual(body["baseline_model_evidence_status"], "not_found")
+        self.assertTrue(body["baseline_model_not_defensible"])
+        self.assertEqual(body["baseline_model_missing_evidence"], ["model_artifact_not_found"])
+        self.assertNotIn("results", body)
+
+    def test_score_allows_defensible_baseline_only_as_publicly_redacted_shadow(self):
+        response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(self.window_artifact.id),
+                "grain": "episode",
+                "from_db": True,
+                "episode_ids": [int(self.episodes[0].id)],
+                "causal_spec": {
+                    "treatment": "nurse_hppd",
+                    "outcome": "delta_ri",
+                    "confounders": ["ri_initial", "proc_count"],
+                    "effect_modifiers": ["ri_initial"],
+                    "n_estimators": 20,
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["primary_model_evidence_status"], "evidence_complete")
+        self.assertEqual(body["baseline_model_evidence_status"], "evidence_complete")
+        self.assertFalse(body["baseline_model_not_defensible"])
+        self.assertEqual(body["summary"]["baseline_mode"], "dedicated_baseline_model")
+        self.assertTrue(body["shadow_mode"])
+        self.assertTrue(body["non_individual_use"])
+        self.assertIsNone(body["results"][0]["score"])
+        self.assertEqual(body["results"][0]["status"], "shadow_only")
+
+    def test_aggregate_blocks_non_defensible_baseline_without_agg_score(self):
+        baseline = create_artifact(
+            evidence_pack=complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        )
+
+        response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(baseline.id),
+                "grain": "episode",
+                "group_by": "unit",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "baseline_model_not_defensible")
+        self.assertEqual(body["baseline_model_evidence_status"], "evidence_incomplete")
+        self.assertTrue(body["baseline_model_not_defensible"])
+        self.assertNotIn("results", body)
+
+    def test_followup_rescore_returns_controlled_baseline_evidence_block(self):
+        baseline = create_artifact(
+            evidence_pack=complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        )
+
+        response = self.client.post(
+            "/api/v1/icea-plus/followup/rescore/",
+            {
+                "episode_id": int(self.episodes[0].id),
+                "model_id": str(self.episode_artifact.id),
+                "baseline_model_id": str(baseline.id),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "baseline_model_not_defensible")
+        self.assertEqual(body["primary_model_evidence_status"], "evidence_complete")
+        self.assertEqual(body["baseline_model_evidence_status"], "evidence_incomplete")
+        self.assertNotIn("results", body)
 
     def test_followup_aggregate_uses_internal_rows_with_sufficient_support(self):
         self._create_followup_records(artifact=self.episode_artifact, count=10)

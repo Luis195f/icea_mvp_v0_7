@@ -29,6 +29,12 @@ from icea_pipeline.models import EpisodeWindow, FHIRWritebackRecord, NormalizedO
 INTERNAL_AGGREGATE_ROW_KEY = "_aggregate_row"
 
 
+class ScoringBlockedError(ValueError):
+    def __init__(self, result: dict[str, Any]):
+        self.result = dict(result)
+        super().__init__(str(result.get("detail") or "scoring_blocked"))
+
+
 @dataclass
 class FollowupEvaluation:
     evidence_types: list[str]
@@ -394,7 +400,7 @@ def _score_episode_from_request(
     }
     raw_result = score_icea_plus(**score_kwargs)
     if raw_result.get("detail"):
-        raise ValueError(str(raw_result.get("detail")))
+        raise ScoringBlockedError(raw_result)
     result = redact_shadow_score_response(raw_result)
     row = next((candidate for candidate in (result.get("results") or []) if int(candidate.get("episode_id") or 0) == int(episode.id)), None)
     if row is None:
@@ -652,6 +658,8 @@ def rescore_followup(
         record.warnings = sorted(set(list(record.warnings or []) + [f"rescore_failed:{exc.__class__.__name__}"]))
         record.last_followup_at = evaluation.last_followup_at
         record.save(update_fields=["followup_status", "current_state", "warnings", "last_followup_at", "updated_at"])
+        if isinstance(exc, ScoringBlockedError):
+            raise
         return record
 
     computation = _computation_from_result(

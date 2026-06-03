@@ -93,6 +93,13 @@ and statuses such as `evidence_incomplete`, `calibration_unavailable`,
 `validation_unavailable`, and `case_mix_insufficient`; it does not include row
 results or numeric score claims.
 
+When `baseline_model_id` is supplied, the baseline artifact passes the same
+model-evidence gate before its predictions can contribute to benefit or ICEA+
+scoring. Missing or non-defensible baselines return
+`baseline_model_not_found` or `baseline_model_not_defensible` without row
+results. Responses distinguish `primary_model_evidence_status` from
+`baseline_model_evidence_status`.
+
 The minimum model evidence pack is stored in `ModelArtifact.metrics.evidence_pack`
 when available and must trace:
 
@@ -243,6 +250,7 @@ Aggregates ICEA+ scores over DB-backed cohorts.
 - `date_to=<iso-datetime>` optional
 - `formula_version=<version>` optional
 - `causal_run_id=<uuid>` optional
+- `baseline_model_id=<uuid>` optional; must reference a defensible model artifact
 - `outcome_goal=higher_is_better|lower_is_better|adverse_event` optional
 
 Individualizable groupings (`patient`, `episode`, `window`, `nurse`) are accepted only for backward-compatible query parsing and fall back to `unit`. `team` also falls back to `unit`. `shift` is deidentified to a unit/date bucket and is suppressed unless support thresholds are met.

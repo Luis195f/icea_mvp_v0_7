@@ -43,6 +43,7 @@ class ICEAPlusAggregateQuerySerializer(serializers.Serializer):
     date_to = serializers.DateTimeField(required=False)
     formula_version = serializers.CharField(required=False, allow_blank=True, default="")
     causal_run_id = serializers.UUIDField(required=False)
+    baseline_model_id = serializers.UUIDField(required=False)
     outcome_goal = serializers.ChoiceField(
         choices=["higher_is_better", "lower_is_better", "adverse_event"],
         required=False,

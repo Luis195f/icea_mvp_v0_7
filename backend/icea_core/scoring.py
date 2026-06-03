@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from django.core.exceptions import ValidationError
 
 from analytics.causal import ICEACausal
 from icea_core.components import (
@@ -27,7 +28,7 @@ from icea_core.components import (
     robust_z,
     utility_transform,
 )
-from icea_core.evidence import summarize_model_evidence
+from icea_core.evidence import ModelEvidenceSummary, summarize_model_evidence
 from icea_core.engine import ICEAEngine
 from icea_core.formula import ICEAPlusComponentValue, ICEAPlusLineage, compute_row_score
 from icea_core.models import ICEAPlusFormulaVersion, ModelArtifact
@@ -38,6 +39,51 @@ from icea_pipeline.temporal import TEMPORAL_STATUSES, validate_causal_temporal_o
 FEATURE_CONTRACT_VERSION = "handover-icea-feature-v1"
 FEATURE_SOURCE_REPO = "Luis195f/HANDOVER"
 DEFAULT_MIN_FEATURE_COVERAGE = 0.95
+
+
+def _model_evidence_descriptor(model_artifact: ModelArtifact, evidence: ModelEvidenceSummary) -> dict[str, Any]:
+    return {
+        "id": str(model_artifact.id),
+        "name": model_artifact.name,
+        "version": model_artifact.version,
+        "target": model_artifact.target,
+        "evidence_status": evidence.evidence_status,
+        "defensible": evidence.defensible,
+        "missing_evidence": list(evidence.missing_evidence),
+        "intended_use": evidence.intended_use,
+    }
+
+
+def _model_evidence_response_metadata(
+    *,
+    primary_evidence: ModelEvidenceSummary,
+    baseline_model: ModelArtifact | None = None,
+    baseline_evidence: ModelEvidenceSummary | None = None,
+    baseline_model_id: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "primary_model_evidence_status": primary_evidence.evidence_status,
+    }
+    if baseline_model_id:
+        metadata["baseline_model_id"] = str(baseline_model_id)
+        if baseline_model is None or baseline_evidence is None:
+            metadata.update(
+                {
+                    "baseline_model_evidence_status": "not_found",
+                    "baseline_model_not_defensible": True,
+                    "baseline_model_missing_evidence": ["model_artifact_not_found"],
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "baseline_model_evidence_status": baseline_evidence.evidence_status,
+                    "baseline_model_not_defensible": not baseline_evidence.defensible,
+                    "baseline_model_missing_evidence": list(baseline_evidence.missing_evidence),
+                    "baseline_model": _model_evidence_descriptor(baseline_model, baseline_evidence),
+                }
+            )
+    return metadata
 
 
 def _apply_shadow_row_governance(row: dict[str, Any], *, suppress_numeric_score: bool) -> dict[str, Any]:
@@ -987,6 +1033,22 @@ def score_icea_plus(
 ) -> dict[str, Any]:
     formula = select_formula(formula_version)
     evidence = summarize_model_evidence(model_artifact)
+    baseline_model = None
+    baseline_evidence = None
+    if baseline_model_id:
+        try:
+            baseline_model = ModelArtifact.objects.filter(id=baseline_model_id).first()
+        except (TypeError, ValueError, ValidationError):
+            baseline_model = None
+        if baseline_model is not None:
+            baseline_evidence = summarize_model_evidence(baseline_model)
+
+    evidence_metadata = _model_evidence_response_metadata(
+        primary_evidence=evidence,
+        baseline_model=baseline_model,
+        baseline_evidence=baseline_evidence,
+        baseline_model_id=baseline_model_id,
+    )
     if not evidence.defensible:
         return {
             "detail": "model_not_defensible",
@@ -996,6 +1058,29 @@ def score_icea_plus(
             "non_individual_use": True,
             "shadow_mode": True,
             **evidence.to_dict(),
+            **evidence_metadata,
+        }
+    if baseline_model_id and baseline_model is None:
+        return {
+            "detail": "baseline_model_not_found",
+            "model_id": str(model_artifact.id),
+            "formula_version": formula.version,
+            "formula_protocol_hash": formula.protocol_hash,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            "intended_use": "shadow_aggregate_research",
+            **evidence_metadata,
+        }
+    if baseline_evidence is not None and not baseline_evidence.defensible:
+        return {
+            "detail": "baseline_model_not_defensible",
+            "model_id": str(model_artifact.id),
+            "formula_version": formula.version,
+            "formula_protocol_hash": formula.protocol_hash,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            "intended_use": "shadow_aggregate_research",
+            **evidence_metadata,
         }
     dataset = load_dataset(
         grain=grain,
@@ -1013,6 +1098,7 @@ def score_icea_plus(
             "detail": "no_rows_available_for_scoring",
             "formula_version": formula.version,
             "formula_protocol_hash": formula.protocol_hash,
+            **evidence_metadata,
         }
 
     features = list(model_artifact.features or [])
@@ -1022,6 +1108,7 @@ def score_icea_plus(
             "model_id": str(model_artifact.id),
             "formula_version": formula.version,
             "formula_protocol_hash": formula.protocol_hash,
+            **evidence_metadata,
         }
 
     if from_db:
@@ -1036,7 +1123,7 @@ def score_icea_plus(
             target=str(model_artifact.target or "delta_ri"),
         )
         if temporal_issues or reference_temporal_issues:
-            return _temporal_guardrail_failure_result(
+            result = _temporal_guardrail_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
@@ -1044,6 +1131,8 @@ def score_icea_plus(
                 issues=temporal_issues,
                 reference_issues=reference_temporal_issues,
             )
+            result.update(evidence_metadata)
+            return result
 
     if not from_db:
         contract_issues = _validate_external_feature_contract(
@@ -1061,12 +1150,11 @@ def score_icea_plus(
                 model_role="reference_primary",
             )
         if baseline_model_id:
-            baseline_model_for_contract = ModelArtifact.objects.filter(id=baseline_model_id).first()
-            if baseline_model_for_contract is not None and baseline_model_for_contract.model_path:
+            if baseline_model is not None and baseline_model.model_path:
                 contract_issues.extend(
                     _validate_external_feature_contract(
                         rows=rows,
-                        model_artifact=baseline_model_for_contract,
+                        model_artifact=baseline_model,
                         grain=grain,
                         model_role="baseline",
                     )
@@ -1075,13 +1163,13 @@ def score_icea_plus(
                     reference_contract_issues.extend(
                         _validate_external_feature_contract(
                             rows=reference_rows,
-                            model_artifact=baseline_model_for_contract,
+                            model_artifact=baseline_model,
                             grain=grain,
                             model_role="reference_baseline",
                         )
                     )
         if contract_issues or reference_contract_issues:
-            return _feature_contract_failure_result(
+            result = _feature_contract_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
@@ -1089,6 +1177,8 @@ def score_icea_plus(
                 issues=contract_issues,
                 reference_issues=reference_contract_issues,
             )
+            result.update(evidence_metadata)
+            return result
         temporal_issues = validate_temporal_frame(
             dataset.selected_df,
             feature_names=features,
@@ -1100,7 +1190,7 @@ def score_icea_plus(
             target=str(model_artifact.target or "delta_ri"),
         )
         if temporal_issues or reference_temporal_issues:
-            return _temporal_guardrail_failure_result(
+            result = _temporal_guardrail_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
@@ -1108,6 +1198,8 @@ def score_icea_plus(
                 issues=temporal_issues,
                 reference_issues=reference_temporal_issues,
             )
+            result.update(evidence_metadata)
+            return result
 
     selected_df = dataset.selected_df.copy()
     reference_df = dataset.reference_df.copy()
@@ -1127,11 +1219,8 @@ def score_icea_plus(
     explained_selected = engine.explain(selected_df, features=features)
     explained_reference = engine.explain(reference_df, features=features)
 
-    baseline_model = None
     baseline_mode = "counterfactual_nursing_reference"
     baseline_replacements: dict[str, float] = {}
-    if baseline_model_id:
-        baseline_model = ModelArtifact.objects.filter(id=baseline_model_id).first()
 
     if baseline_model and baseline_model.model_path:
         baseline_mode = "dedicated_baseline_model"
@@ -1440,6 +1529,7 @@ def score_icea_plus(
         "non_individual_use": True,
         "shadow_mode": True,
         "intended_use": "shadow_aggregate_research",
+        **evidence_metadata,
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,

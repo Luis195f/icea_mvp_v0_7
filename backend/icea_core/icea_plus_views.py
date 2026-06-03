@@ -14,6 +14,7 @@ from icea_core.aggregation import (
     redacted_low_support_summary,
 )
 from icea_core.followup import (
+    ScoringBlockedError,
     build_patient_summary,
     build_summary_writeback,
     ensure_followup_record,
@@ -182,6 +183,7 @@ class ICEAPlusScoreView(APIView):
             event_type="icea_plus_score",
             payload={
                 "model_id": str(artifact.id),
+                "baseline_model_id": str(payload.get("baseline_model_id") or ""),
                 "formula_version": result["formula_version"],
                 "grain": str(payload.get("grain") or "episode"),
                 "rows": int(summary.get("rows_requested") or 0),
@@ -217,6 +219,7 @@ class ICEAPlusAggregateView(APIView):
             nurse_cols=None,
             outcome_goal=params.get("outcome_goal"),
             causal_run_id=str(params.get("causal_run_id")) if params.get("causal_run_id") else None,
+            baseline_model_id=str(params.get("baseline_model_id")) if params.get("baseline_model_id") else None,
             unit_id=params.get("unit_id"),
             date_from=params.get("date_from"),
             date_to=params.get("date_to"),
@@ -282,6 +285,7 @@ class ICEAPlusAggregateView(APIView):
             event_type="icea_plus_aggregate",
             payload={
                 "model_id": str(artifact.id),
+                "baseline_model_id": str(params.get("baseline_model_id") or ""),
                 "requested_group_by": requested_group_by,
                 "effective_group_by": effective_group_by,
                 "grain": str(params.get("grain") or "episode"),
@@ -289,10 +293,23 @@ class ICEAPlusAggregateView(APIView):
             },
             context="icea-plus/aggregate",
         )
+        evidence_metadata = {
+            key: score_result[key]
+            for key in (
+                "primary_model_evidence_status",
+                "baseline_model_id",
+                "baseline_model_evidence_status",
+                "baseline_model_not_defensible",
+                "baseline_model_missing_evidence",
+                "baseline_model",
+            )
+            if key in score_result
+        }
         return Response(
             {
                 "formula_version": score_result["formula_version"],
                 "formula_protocol_hash": score_result["formula_protocol_hash"],
+                **evidence_metadata,
                 "requested_group_by": requested_group_by,
                 "effective_group_by": effective_group_by,
                 "grain": str(params.get("grain") or "episode"),
@@ -358,11 +375,14 @@ class ICEAPlusFollowupIngestView(APIView):
         episode = _get_object_or_typed_error(PatientEpisode, id=int(payload["episode_id"]))
         if isinstance(episode, Response):
             return episode
-        record = ingest_followup(
-            episode=episode,
-            artifact=artifact,
-            request_config={"formula_version": str(payload.get("formula_version") or "")},
-        )
+        try:
+            record = ingest_followup(
+                episode=episode,
+                artifact=artifact,
+                request_config={"formula_version": str(payload.get("formula_version") or "")},
+            )
+        except ScoringBlockedError as exc:
+            return Response(exc.result, status=400)
         return Response(build_patient_summary(record))
 
 
@@ -381,18 +401,21 @@ class ICEAPlusFollowupRescoreView(APIView):
         episode = _get_object_or_typed_error(PatientEpisode, id=int(payload["episode_id"]))
         if isinstance(episode, Response):
             return episode
-        record = rescore_followup(
-            episode=episode,
-            artifact=artifact,
-            request_config={
-                "formula_version": str(payload.get("formula_version") or ""),
-                "outcome_goal": payload.get("outcome_goal"),
-                "causal_run_id": payload.get("causal_run_id"),
-                "causal_spec": payload.get("causal_spec"),
-                "baseline_model_id": payload.get("baseline_model_id"),
-                "nurse_cols": payload.get("nurse_cols"),
-            },
-        )
+        try:
+            record = rescore_followup(
+                episode=episode,
+                artifact=artifact,
+                request_config={
+                    "formula_version": str(payload.get("formula_version") or ""),
+                    "outcome_goal": payload.get("outcome_goal"),
+                    "causal_run_id": payload.get("causal_run_id"),
+                    "causal_spec": payload.get("causal_spec"),
+                    "baseline_model_id": payload.get("baseline_model_id"),
+                    "nurse_cols": payload.get("nurse_cols"),
+                },
+            )
+        except ScoringBlockedError as exc:
+            return Response(exc.result, status=400)
         return Response(build_patient_summary(record))
 
 
