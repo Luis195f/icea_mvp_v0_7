@@ -173,8 +173,8 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.addCleanup(self.dev_env.stop)
         self.client = APIClient()
 
-    def _create_followup_records(self, *, artifact, count, score=70.0):
-        for i, episode in enumerate(self.episodes[:count]):
+    def _create_followup_records(self, *, artifact, count, score=70.0, baseline_model_id=None, start=0):
+        for i, episode in enumerate(self.episodes[start : start + count], start=start):
             aggregate_row = {
                 "row_id": f"episode:{episode.id}",
                 "grain": "episode",
@@ -207,6 +207,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
                 formula_protocol_hash="",
                 initial_state="complete",
                 current_state="complete",
+                initial_request={"baseline_model_id": str(baseline_model_id)} if baseline_model_id else {},
                 initial_result=public_row,
                 non_individual_use=True,
                 shadow_mode=True,
@@ -726,6 +727,70 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["baseline_model_evidence_status"], "evidence_incomplete")
         self.assertNotIn("results", body)
 
+    def test_writeback_patient_returns_controlled_model_evidence_block_without_record(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        )
+
+        response = self.client.get(
+            "/api/v1/icea-plus/writeback/patient/",
+            {
+                "episode_id": int(self.episodes[0].id),
+                "model_id": str(artifact.id),
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "model_not_defensible")
+        self.assertEqual(body["status"], "model_not_defensible")
+        self.assertEqual(body["evidence_status"], "evidence_incomplete")
+        self.assertIn("dataset_fingerprint", body["missing_evidence"])
+        self.assertTrue(body["shadow_mode"])
+        self.assertTrue(body["non_individual_use"])
+        self.assertIsNone(body["score_summary"])
+        self.assertTrue(body["score_summary_redacted"])
+
+    def test_writeback_patient_existing_legacy_record_stays_redacted(self):
+        artifact = create_artifact(metrics={})
+        self._create_followup_records(artifact=artifact, count=1)
+
+        response = self.client.get(
+            "/api/v1/icea-plus/writeback/patient/",
+            {
+                "episode_id": int(self.episodes[0].id),
+                "model_id": str(artifact.id),
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertFalse(body["evidence"]["model"]["defensible"])
+        self.assertEqual(body["evidence"]["model"]["evidence_status"], "evidence_incomplete")
+        self.assertIn("writeback_summary_blocked_by_current_model_evidence", body["warnings"])
+        self.assertIsNone(body["current_score"]["score"])
+        self.assertTrue(body["current_score"]["score_suppressed"])
+        self.assertNotIn(INTERNAL_AGGREGATE_ROW_KEY, body["current_score"])
+
+    def test_writeback_summary_endpoint_returns_controlled_model_evidence_block(self):
+        artifact = create_artifact(metrics={})
+        self._create_followup_records(artifact=artifact, count=10)
+
+        response = self.client.get(
+            "/api/v1/icea-plus/writeback/summary/",
+            {
+                "model_id": str(artifact.id),
+                "group_by": "unit",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "model_not_defensible")
+        self.assertEqual(body["evidence_status"], "evidence_incomplete")
+        self.assertTrue(body["suppressed"])
+        self.assertEqual(body["results"], [])
+
     def test_followup_aggregate_uses_internal_rows_with_sufficient_support(self):
         self._create_followup_records(artifact=self.episode_artifact, count=10)
 
@@ -737,6 +802,90 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertIsNotNone(result["score"])
         self.assertFalse(result["suppressed"])
         self.assertNotIn("rows", result)
+
+    def test_followup_aggregate_blocks_legacy_model_without_evidence_pack(self):
+        artifact = create_artifact(metrics={})
+        self._create_followup_records(artifact=artifact, count=10)
+
+        payload = build_summary_writeback(artifact=artifact, group_by="unit")
+
+        self.assertEqual(payload["detail"], "model_not_defensible")
+        self.assertEqual(payload["evidence_status"], "evidence_incomplete")
+        self.assertTrue(payload["suppressed"])
+        self.assertIsNone(payload["scored_aggregate"])
+        self.assertIsNone(payload["summary"]["scored_aggregate"])
+        self.assertIn("dataset_fingerprint", payload["missing_evidence"])
+        self.assertIn("writeback_summary_blocked_by_current_model_evidence", payload["warnings"])
+        self.assertEqual(payload["results"], [])
+
+    def test_followup_aggregate_blocks_model_whose_evidence_was_invalidated(self):
+        self._create_followup_records(artifact=self.episode_artifact, count=10)
+        invalidated_pack = complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        self.episode_artifact.metrics = {**dict(self.episode_artifact.metrics or {}), "evidence_pack": invalidated_pack}
+        self.episode_artifact.save(update_fields=["metrics"])
+
+        payload = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+
+        self.assertEqual(payload["detail"], "model_not_defensible")
+        self.assertEqual(payload["evidence_status"], "evidence_incomplete")
+        self.assertEqual(payload["summary"]["records"], 10)
+        self.assertEqual(payload["results"], [])
+
+    def test_followup_aggregate_separates_records_for_other_models(self):
+        other_artifact = create_artifact(evidence_pack=complete_evidence_pack())
+        self._create_followup_records(artifact=self.episode_artifact, count=10, score=70.0)
+        self._create_followup_records(artifact=other_artifact, count=10, score=10.0)
+
+        payload = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+
+        self.assertEqual(payload["summary"]["records"], 10)
+        self.assertEqual(len(payload["results"]), 1)
+        self.assertGreater(payload["results"][0]["score"], 60.0)
+
+    def test_followup_aggregate_blocks_non_defensible_stored_baseline(self):
+        baseline = create_artifact(
+            evidence_pack=complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        )
+        self._create_followup_records(
+            artifact=self.episode_artifact,
+            count=10,
+            baseline_model_id=baseline.id,
+        )
+
+        payload = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+
+        self.assertEqual(payload["detail"], "baseline_model_not_defensible")
+        self.assertEqual(payload["baseline_model_evidence_status"], "evidence_incomplete")
+        self.assertTrue(payload["baseline_model_not_defensible"])
+        self.assertEqual(payload["results"], [])
+
+    def test_followup_aggregate_allows_defensible_stored_baseline(self):
+        self._create_followup_records(
+            artifact=self.episode_artifact,
+            count=10,
+            baseline_model_id=self.window_artifact.id,
+        )
+
+        payload = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+
+        self.assertNotIn("detail", payload)
+        self.assertEqual(payload["results"][0]["status"], "scored_aggregate")
+        self.assertIsNotNone(payload["results"][0]["score"])
+
+    def test_followup_aggregate_blocks_mixed_baseline_modes(self):
+        self._create_followup_records(artifact=self.episode_artifact, count=5, start=0)
+        self._create_followup_records(
+            artifact=self.episode_artifact,
+            count=5,
+            start=5,
+            baseline_model_id=self.window_artifact.id,
+        )
+
+        payload = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+
+        self.assertEqual(payload["detail"], "mixed_baseline_models_not_aggregable")
+        self.assertIn("writeback_summary_mixed_baseline_models_not_aggregable", payload["warnings"])
+        self.assertEqual(payload["results"], [])
 
     def test_followup_aggregate_suppresses_internal_rows_with_low_support(self):
         self._create_followup_records(artifact=self.episode_artifact, count=9)
@@ -755,16 +904,21 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
 
         self.assertNotIn("no_comparable_without_case_mix", payload["results"][0]["warnings"])
 
-    def test_followup_aggregate_warns_without_case_mix(self):
+    def test_followup_aggregate_blocks_without_case_mix(self):
         artifact = create_artifact(evidence_pack=complete_evidence_pack(case_mix_spec=None, case_mix_unavailable_reason="missing"))
         self._create_followup_records(artifact=artifact, count=10)
 
         payload = build_summary_writeback(artifact=artifact, group_by="unit")
 
-        self.assertIn("no_comparable_without_case_mix", payload["results"][0]["warnings"])
+        self.assertEqual(payload["detail"], "model_not_defensible")
+        self.assertEqual(payload["evidence_status"], "evidence_incomplete")
+        self.assertEqual(payload["results"], [])
 
     def test_followup_aggregate_keeps_legacy_case_mix_fallback(self):
-        artifact = create_artifact(metrics={"case_mix_spec": complete_evidence_pack()["case_mix_spec"]})
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(case_mix_spec=None, case_mix_unavailable_reason="missing"),
+            metrics={"case_mix_spec": complete_evidence_pack()["case_mix_spec"]},
+        )
         self._create_followup_records(artifact=artifact, count=10)
 
         payload = build_summary_writeback(artifact=artifact, group_by="unit")

@@ -361,6 +361,10 @@ Required query params:
 ### GET `/api/v1/icea-plus/writeback/patient/`
 
 Stable episode JSON summary for service follow-up. It is shadow-only: `initial_score`, `enriched_score`, and `current_score` retain lineage and state but suppress `score` and `raw_score`.
+If no follow-up record exists and current model evidence blocks bootstrap scoring,
+the endpoint returns a controlled `model_not_defensible` response instead of a
+server error. Existing legacy records remain score-redacted and expose current
+model evidence status.
 
 Required query params:
 
@@ -370,6 +374,13 @@ Required query params:
 ### GET `/api/v1/icea-plus/writeback/summary/`
 
 Stable aggregate JSON summary. Results include support counts, suppression flags, and governance metadata and are the only exportable ICEA+ writeback surface.
+
+Stored follow-up results do not replace the current model evidence pack. Before
+reading internal aggregate rows, the endpoint revalidates the selected artifact
+and any stored dedicated baseline model. A missing, invalidated, or
+non-defensible model returns a controlled `model_not_defensible` or
+`baseline_model_not_defensible` response with no numeric aggregate. Records from
+different models or baseline modes are not silently mixed.
 
 Required query params:
 

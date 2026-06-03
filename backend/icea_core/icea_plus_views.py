@@ -65,6 +65,17 @@ def _validate_serializer(ser, *, request_type: str):
     )
 
 
+def _scoring_blocked_response(exc: ScoringBlockedError) -> Response:
+    payload = dict(exc.result)
+    payload.setdefault("status", str(payload.get("detail") or "scoring_blocked"))
+    payload.setdefault("non_individual_use", True)
+    payload.setdefault("shadow_mode", True)
+    payload.setdefault("intended_use", "shadow_aggregate_research")
+    payload.setdefault("score_summary", None)
+    payload.setdefault("score_summary_redacted", True)
+    return Response(payload, status=400)
+
+
 def _safe_aggregate_grouping(requested_group_by: str, *, grain: str) -> tuple[str, list[str], bool]:
     requested = str(requested_group_by or "unit")
     warnings: list[str] = []
@@ -382,7 +393,7 @@ class ICEAPlusFollowupIngestView(APIView):
                 request_config={"formula_version": str(payload.get("formula_version") or "")},
             )
         except ScoringBlockedError as exc:
-            return Response(exc.result, status=400)
+            return _scoring_blocked_response(exc)
         return Response(build_patient_summary(record))
 
 
@@ -415,7 +426,7 @@ class ICEAPlusFollowupRescoreView(APIView):
                 },
             )
         except ScoringBlockedError as exc:
-            return Response(exc.result, status=400)
+            return _scoring_blocked_response(exc)
         return Response(build_patient_summary(record))
 
 
@@ -471,7 +482,7 @@ class ICEAPlusWritebackSummaryView(APIView):
             date_from=params.get("date_from"),
             date_to=params.get("date_to"),
         )
-        return Response(payload)
+        return Response(payload, status=400 if payload.get("detail") else 200)
 
 
 class ICEAPlusWritebackPatientView(APIView):
@@ -495,9 +506,12 @@ class ICEAPlusWritebackPatientView(APIView):
             formula_version=(str(params.get("formula_version") or "").strip() or None),
         )
         if record is None:
-            record = ensure_followup_record(
-                episode=episode,
-                artifact=artifact,
-                request_config={"formula_version": str(params.get("formula_version") or "")},
-            )
+            try:
+                record = ensure_followup_record(
+                    episode=episode,
+                    artifact=artifact,
+                    request_config={"formula_version": str(params.get("formula_version") or "")},
+                )
+            except ScoringBlockedError as exc:
+                return _scoring_blocked_response(exc)
         return Response(build_patient_summary(record))
