@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any
 
 import pandas as pd
@@ -124,6 +125,13 @@ def _first_non_empty(*values: Any) -> Any:
         if value not in (None, "", [], {}):
             return value
     return None
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        return None
+    normalized = int(value)
+    return normalized if normalized > 0 else None
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -341,11 +349,17 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         metrics.get("dataset_fingerprint"),
         metrics.get("dataset_hash"),
     )
+    training_row_count = _first_non_empty(
+        evidence.get("training_row_count"),
+        metrics.get("training_row_count"),
+    )
     validation_row_count = _first_non_empty(
         evidence.get("validation_row_count"),
         metrics.get("validation_row_count"),
         (metrics.get("conformal") or {}).get("calibration_size") if isinstance(metrics.get("conformal"), dict) else None,
     )
+    valid_training_row_count = _positive_int(training_row_count)
+    valid_validation_row_count = _positive_int(validation_row_count)
     validation_unavailable_reason = _first_non_empty(
         evidence.get("validation_unavailable_reason"),
         metrics.get("validation_unavailable_reason"),
@@ -399,7 +413,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "model_id": str(artifact.id) if artifact.id else None,
         "artifact_created_at": artifact.created_at.isoformat() if artifact.created_at else None,
         "dataset_fingerprint": dataset_fingerprint,
-        "training_row_count": _first_non_empty(evidence.get("training_row_count"), metrics.get("training_row_count")),
+        "training_row_count": training_row_count,
         "validation_row_count": validation_row_count,
         "validation_unavailable_reason": validation_unavailable_reason,
         "feature_names": evidence_feature_names,
@@ -436,7 +450,6 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "model_id",
         "artifact_created_at",
         "dataset_fingerprint",
-        "training_row_count",
         "feature_names",
         "temporal_spec_version",
         "temporal_guardrail_status",
@@ -449,8 +462,10 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     ):
         if pack.get(field) in (None, "", [], {}):
             missing.append(field)
-    if pack.get("validation_row_count") in (None, "") and not pack.get("validation_unavailable_reason"):
-        missing.append("validation_row_count_or_unavailable_reason")
+    if valid_training_row_count is None:
+        missing.append("invalid_training_row_count")
+    if valid_validation_row_count is None:
+        missing.append("invalid_validation_row_count")
     if not pack.get("validation_metrics") and not pack.get("validation_unavailable_reason"):
         missing.append("validation_metrics_or_unavailable_reason")
     if not pack.get("calibration_summary") and not pack.get("calibration_unavailable_reason"):
@@ -505,7 +520,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         statuses.extend(["feature_names_mismatch", *feature_names_warnings])
     if not pack.get("calibration_summary"):
         statuses.append("calibration_unavailable")
-    if not pack.get("validation_metrics"):
+    validation_available = bool(pack.get("validation_metrics")) and valid_validation_row_count is not None
+    if not validation_available:
         statuses.append("validation_unavailable")
 
     evidence_status = "evidence_complete" if not missing else "evidence_incomplete"
@@ -518,7 +534,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
 
     case_mix_status = "case_mix_available" if not case_mix_issue else "case_mix_insufficient"
     calibration_status = "calibration_available" if pack.get("calibration_summary") else "calibration_unavailable"
-    validation_status = "validation_available" if pack.get("validation_metrics") else "validation_unavailable"
+    validation_status = "validation_available" if validation_available else "validation_unavailable"
     limitations_status = "limitations_complete" if not missing_required_limitations else "limitations_incomplete"
 
     return ModelEvidenceSummary(
@@ -571,7 +587,26 @@ def build_training_evidence_metadata(
 
     validation_metrics = {key: metrics.get(key) for key in ("rmse", "mae", "r2", "auc") if metrics.get(key) is not None}
     conformal = metrics.get("conformal") if isinstance(metrics.get("conformal"), dict) else None
-    validation_row_count = conformal.get("calibration_size") if conformal else None
+    raw_validation_row_count = conformal.get("calibration_size") if conformal else None
+    validation_row_count = _positive_int(raw_validation_row_count)
+    total_row_count = int(len(model_df))
+    if validation_row_count is None:
+        training_row_count = total_row_count
+    else:
+        candidate_training_row_count = total_row_count - validation_row_count
+        training_row_count = candidate_training_row_count if candidate_training_row_count >= 0 else None
+    if raw_validation_row_count is None:
+        validation_count_unavailable_reason = "validation_row_count_not_computed"
+    elif validation_row_count is None:
+        validation_count_unavailable_reason = "validation_row_count_invalid"
+    else:
+        validation_count_unavailable_reason = None
+    if validation_count_unavailable_reason:
+        validation_unavailable_reason = validation_count_unavailable_reason
+    elif not validation_metrics:
+        validation_unavailable_reason = "validation_metrics_not_computed"
+    else:
+        validation_unavailable_reason = None
     feature_names = {str(feature) for feature in features}
     observed_columns = [column for column in _observed_training_columns(raw_df, model_df) if column in feature_names]
     declared_feature_missing = sorted(set(str(feature) for feature in features) - set(str(column) for column in raw_df.columns))
@@ -590,7 +625,7 @@ def build_training_evidence_metadata(
     evidence = {
         "dataset_fingerprint": dataset_fingerprint,
         "dataset_hash": dataset_fingerprint,
-        "training_row_count": int(len(model_df) - int(validation_row_count or 0)) if validation_row_count is not None else int(len(model_df)),
+        "training_row_count": training_row_count,
         "validation_row_count": validation_row_count,
         "feature_names": list(features),
         "observed_feature_columns": observed_columns,
@@ -624,7 +659,7 @@ def build_training_evidence_metadata(
         "calibration_summary": {"method": "conformal_residual_quantile", "conformal": conformal} if conformal else None,
         "calibration_unavailable_reason": None if conformal else "insufficient_calibration_sample_or_not_computed",
         "validation_metrics": validation_metrics or None,
-        "validation_unavailable_reason": None if validation_metrics else "validation_metrics_not_computed",
+        "validation_unavailable_reason": validation_unavailable_reason,
         "limitations": MINIMUM_LIMITATIONS
         + ([] if not case_mix_issue and not case_mix_support_warnings else ["case_mix_insufficient"])
         + ([] if conformal else ["calibration_unavailable"]),

@@ -5,10 +5,11 @@ import uuid
 from types import SimpleNamespace
 from unittest import mock
 
+import pandas as pd
 from django.test import TestCase
 from rest_framework.test import APIClient
 
-from icea_core.evidence import INTENDED_USE_SHADOW_AGGREGATE, summarize_model_evidence
+from icea_core.evidence import INTENDED_USE_SHADOW_AGGREGATE, build_training_evidence_metadata, summarize_model_evidence
 from icea_core.followup import (
     INTERNAL_AGGREGATE_ROW_KEY,
     FollowupEvaluation,
@@ -184,6 +185,103 @@ class ModelEvidenceUnitTests(TestCase):
         self.assertEqual(evidence.evidence_pack["feature_names"], ["ri_initial", "nurse_hppd"])
         self.assertTrue(evidence.evidence_pack["feature_names_match"])
         self.assertEqual(evidence.evidence_pack["feature_names_warnings"], [])
+
+    def test_invalid_training_row_counts_are_not_defensible(self):
+        for invalid_count in (0, -1, "0", "-1", "abc", None):
+            with self.subTest(invalid_count=invalid_count):
+                artifact = create_artifact(
+                    evidence_pack=complete_evidence_pack(training_row_count=invalid_count)
+                )
+
+                evidence = summarize_model_evidence(artifact)
+
+                self.assertFalse(evidence.defensible)
+                self.assertEqual(evidence.evidence_status, "evidence_incomplete")
+                self.assertIn("invalid_training_row_count", evidence.missing_evidence)
+                self.assertIn("model_not_defensible", evidence.statuses)
+
+    def test_invalid_validation_row_counts_are_unavailable_and_not_defensible(self):
+        for invalid_count in (0, -1, "0", "-1", "abc", None):
+            with self.subTest(invalid_count=invalid_count):
+                artifact = create_artifact(
+                    evidence_pack=complete_evidence_pack(
+                        validation_row_count=invalid_count,
+                        validation_unavailable_reason="validation_count_not_available",
+                    )
+                )
+
+                evidence = summarize_model_evidence(artifact)
+
+                self.assertFalse(evidence.defensible)
+                self.assertEqual(evidence.validation_status, "validation_unavailable")
+                self.assertIn("invalid_validation_row_count", evidence.missing_evidence)
+                self.assertIn("validation_unavailable", evidence.statuses)
+
+    def test_positive_training_and_validation_row_counts_can_be_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(training_row_count=1, validation_row_count=1)
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertTrue(evidence.defensible)
+        self.assertEqual(evidence.validation_status, "validation_available")
+
+    def test_training_evidence_metadata_never_emits_negative_training_count(self):
+        frame = pd.DataFrame({"ri_initial": [1.0, 2.0], "nurse_hppd": [3.0, 4.0], "delta_ri": [0.1, 0.2]})
+
+        evidence = build_training_evidence_metadata(
+            raw_df=frame,
+            model_df=frame,
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            dataset_grain="test",
+            metrics={
+                "rmse": 0.1,
+                "conformal": {"calibration_size": 3},
+            },
+            temporal_guardrail_status="passed",
+        )
+
+        self.assertIsNone(evidence["training_row_count"])
+        self.assertEqual(evidence["validation_row_count"], 3)
+
+    def test_training_evidence_metadata_marks_invalid_validation_count_unavailable(self):
+        frame = pd.DataFrame({"ri_initial": [1.0, 2.0], "nurse_hppd": [3.0, 4.0], "delta_ri": [0.1, 0.2]})
+
+        evidence = build_training_evidence_metadata(
+            raw_df=frame,
+            model_df=frame,
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            dataset_grain="test",
+            metrics={
+                "rmse": 0.1,
+                "conformal": {"calibration_size": "abc"},
+            },
+            temporal_guardrail_status="passed",
+        )
+
+        self.assertEqual(evidence["training_row_count"], 2)
+        self.assertIsNone(evidence["validation_row_count"])
+        self.assertEqual(evidence["validation_unavailable_reason"], "validation_row_count_invalid")
+
+    def test_training_evidence_metadata_marks_missing_validation_count_unavailable(self):
+        frame = pd.DataFrame({"ri_initial": [1.0, 2.0], "nurse_hppd": [3.0, 4.0], "delta_ri": [0.1, 0.2]})
+
+        evidence = build_training_evidence_metadata(
+            raw_df=frame,
+            model_df=frame,
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            dataset_grain="test",
+            metrics={"rmse": 0.1},
+            temporal_guardrail_status="passed",
+        )
+
+        self.assertEqual(evidence["training_row_count"], 2)
+        self.assertIsNone(evidence["validation_row_count"])
+        self.assertEqual(evidence["validation_unavailable_reason"], "validation_row_count_not_computed")
 
     def test_reordered_evidence_features_are_not_defensible(self):
         artifact = create_artifact(
@@ -458,6 +556,44 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["primary_model_evidence_status"], "evidence_incomplete")
         self.assertNotIn("results", body)
         self.assertIn("dataset_fingerprint", body["missing_evidence"])
+
+    def test_invalid_training_row_count_is_exposed_by_models_and_blocks_score(self):
+        artifact = create_artifact(evidence_pack=complete_evidence_pack(training_row_count=0))
+
+        models_response = self.client.get("/api/v1/models/")
+
+        self.assertEqual(models_response.status_code, 200)
+        model = next(item for item in models_response.json() if item["id"] == str(artifact.id))
+        self.assertFalse(model["defensible"])
+        self.assertEqual(model["evidence_status"], "evidence_incomplete")
+        self.assertIn("invalid_training_row_count", model["missing_evidence"])
+
+        score_response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": str(artifact.id), "grain": "episode", "from_db": True},
+            format="json",
+        )
+
+        self.assertEqual(score_response.status_code, 400)
+        self.assertEqual(score_response.json()["detail"], "model_not_defensible")
+        self.assertIn("invalid_training_row_count", score_response.json()["missing_evidence"])
+        self.assertNotIn("results", score_response.json())
+
+    def test_invalid_validation_row_count_is_exposed_as_unavailable_by_models(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(
+                validation_row_count="abc",
+                validation_unavailable_reason="validation_count_not_available",
+            )
+        )
+
+        response = self.client.get("/api/v1/models/")
+
+        self.assertEqual(response.status_code, 200)
+        model = next(item for item in response.json() if item["id"] == str(artifact.id))
+        self.assertFalse(model["defensible"])
+        self.assertEqual(model["validation_status"], "validation_unavailable")
+        self.assertIn("invalid_validation_row_count", model["missing_evidence"])
 
     def test_feature_names_mismatch_is_exposed_and_blocks_score(self):
         artifact = create_artifact(

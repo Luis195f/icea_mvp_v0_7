@@ -105,8 +105,8 @@ when available and must trace:
 
 - `model_id` and `artifact_created_at`
 - `dataset_fingerprint` or `dataset_hash`
-- `training_row_count`
-- `validation_row_count` or `validation_unavailable_reason`
+- positive integer `training_row_count`
+- positive integer `validation_row_count`
 - `feature_names`
 - `temporal_spec_version` and `temporal_guardrail_status`
 - `outcome_definition` and `outcome_window`
@@ -117,6 +117,11 @@ when available and must trace:
 - `validation_metrics` or `validation_unavailable_reason`
 - `limitations`
 - provenance/source commit or an explicit unavailable reason
+
+`validation_unavailable_reason` records why validation evidence is absent, but
+does not replace a positive `validation_row_count` or make a model defendible.
+Zero, negative, string, missing, or otherwise invalid training/validation row
+counts fail closed as incomplete model evidence.
 
 `calibration_unavailable`, `validation_unavailable`, and
 `case_mix_insufficient` are not validation claims. They are audit statuses that
