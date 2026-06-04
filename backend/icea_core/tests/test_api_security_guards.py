@@ -10,8 +10,10 @@ from django.contrib.auth.models import Group
 from django.core.cache import cache
 from django.test import TestCase
 from rest_framework.test import APIClient
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from icea_core.api_security import append_icea_api_audit
+from icea_core.audit_identity import safe_caller_audit_dedupe_identity
 from icea_core.icea_plus_views import (
     ICEAPlusAggregateView,
     ICEAPlusScoreView,
@@ -21,6 +23,7 @@ from icea_core.icea_plus_views import (
 from icea_core.models import ICEAComputation, ModelArtifact
 from icea_core.permissions import _audit_permission_denial, _safe_caller_audit_identity
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
+from icea_core.throttling import IceaAnonRateThrottle, IceaScopedRateThrottle, IceaUserRateThrottle
 from icea_core.views import ICEAComputeView, ModelTrainView
 from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import AuditEvent, FHIRWritebackRecord
@@ -83,6 +86,31 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         rates = settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]
         for scope in {"icea_read", "icea_compute", "icea_train", "icea_export", "icea_writeback"}:
             self.assertIn(scope, rates)
+
+    def test_global_throttles_cover_unscoped_jwt_auth_and_scoped_views(self):
+        configured = settings.REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"]
+        self.assertEqual(
+            configured,
+            [
+                "icea_core.throttling.IceaAnonRateThrottle",
+                "icea_core.throttling.IceaUserRateThrottle",
+                "icea_core.throttling.IceaScopedRateThrottle",
+            ],
+        )
+        self.assertFalse(hasattr(settings, "ICEA_ENABLE_GLOBAL_THROTTLING"))
+
+        for view_class in (TokenObtainPairView, TokenRefreshView):
+            with self.subTest(view=view_class.__name__):
+                self.assertFalse(hasattr(view_class, "throttle_scope"))
+                throttles = view_class().get_throttles()
+                self.assertTrue(any(isinstance(throttle, IceaAnonRateThrottle) for throttle in throttles))
+                self.assertTrue(any(isinstance(throttle, IceaUserRateThrottle) for throttle in throttles))
+                self.assertTrue(any(isinstance(throttle, IceaScopedRateThrottle) for throttle in throttles))
+
+        scoped_throttles = ICEAPlusScoreView().get_throttles()
+        self.assertTrue(any(isinstance(throttle, IceaAnonRateThrottle) for throttle in scoped_throttles))
+        self.assertTrue(any(isinstance(throttle, IceaUserRateThrottle) for throttle in scoped_throttles))
+        self.assertTrue(any(isinstance(throttle, IceaScopedRateThrottle) for throttle in scoped_throttles))
 
     def test_training_rejects_service_role(self):
         self.client.force_authenticate(user=self._user_with_role("service"))
@@ -402,6 +430,12 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
             method="POST",
             META={"REMOTE_ADDR": "198.51.100.20", "HTTP_USER_AGENT": "client-a"},
         )
+        request_a_rotated_user_agent = SimpleNamespace(
+            user=anonymous,
+            path="/api/v1/icea-plus/score/",
+            method="POST",
+            META={"REMOTE_ADDR": "198.51.100.20", "HTTP_USER_AGENT": "attacker-rotated-user-agent"},
+        )
         request_b = SimpleNamespace(
             user=anonymous,
             path="/api/v1/icea-plus/score/",
@@ -412,19 +446,35 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
 
         kind_a, hash_a = _safe_caller_audit_identity(request_a)
         kind_b, hash_b = _safe_caller_audit_identity(request_b)
+        dedupe_kind_a, dedupe_hash_a = safe_caller_audit_dedupe_identity(request_a)
+        rotated_kind, rotated_hash = safe_caller_audit_dedupe_identity(request_a_rotated_user_agent)
+        dedupe_kind_b, dedupe_hash_b = safe_caller_audit_dedupe_identity(request_b)
         unknown_kind, unknown_hash = _safe_caller_audit_identity(unknown)
 
         self.assertEqual(kind_a, "anonymous_client")
         self.assertEqual(kind_b, "anonymous_client")
         self.assertNotEqual(hash_a, hash_b)
+        self.assertEqual((dedupe_kind_a, dedupe_hash_a), (rotated_kind, rotated_hash))
+        self.assertEqual(dedupe_kind_b, "anonymous_client")
+        self.assertNotEqual(dedupe_hash_a, dedupe_hash_b)
+        self.assertNotIn("client-a", dedupe_hash_a)
+        self.assertNotIn("attacker-rotated-user-agent", dedupe_hash_a)
         self.assertEqual(unknown_kind, "anonymous_unknown")
         self.assertEqual(len(unknown_hash), 64)
         self.assertNotIn("198.51.100.20", hash_a)
 
-        with mock.patch("icea_core.api_security.append_icea_api_audit") as audit:
+        with (
+            mock.patch("icea_core.permissions.cache.add", wraps=cache.add) as cache_add,
+            mock.patch("icea_core.api_security.append_icea_api_audit") as audit,
+        ):
             _audit_permission_denial(request_a, view, error_code="auth_required")
+            _audit_permission_denial(request_a_rotated_user_agent, view, error_code="auth_required")
             _audit_permission_denial(request_b, view, error_code="auth_required")
         self.assertEqual(audit.call_count, 2)
+        self.assertEqual(cache_add.call_count, 3)
+        self.assertEqual(cache_add.call_args_list[0].args[0], cache_add.call_args_list[1].args[0])
+        self.assertNotEqual(cache_add.call_args_list[0].args[0], cache_add.call_args_list[2].args[0])
+        self.assertNotIn("attacker-rotated-user-agent", str(cache_add.call_args_list))
 
     def test_permission_denial_remains_fail_closed(self):
         self.client.force_authenticate(user=self.regular_user)

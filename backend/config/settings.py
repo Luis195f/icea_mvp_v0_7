@@ -271,12 +271,12 @@ REST_FRAMEWORK = {
 }
 
 # --- DRF throttling (Zero-Trust perimeter)
-# Scoped throttling is on by default. Operators may explicitly disable it only
-# for isolated local development.
+# Global and scoped throttling are enabled together by default. Operators may
+# explicitly disable all DRF throttling only for isolated local development.
 ICEA_ENABLE_THROTTLING = os.environ.get("ICEA_ENABLE_THROTTLING", "true").lower() in {"1", "true", "yes"}
-ICEA_ENABLE_GLOBAL_THROTTLING = os.environ.get("ICEA_ENABLE_GLOBAL_THROTTLING", "false").lower() in {"1", "true", "yes"}
-ICEA_ANON_RATE_LIMIT = os.environ.get("ICEA_ANON_RATE_LIMIT", "100/day")
-ICEA_USER_RATE_LIMIT = os.environ.get("ICEA_USER_RATE_LIMIT", "1000/hour")
+ICEA_RUNNING_TESTS = "test" in sys.argv
+ICEA_ANON_RATE_LIMIT = os.environ.get("ICEA_ANON_RATE_LIMIT") or ("10000/hour" if ICEA_RUNNING_TESTS else "100/day")
+ICEA_USER_RATE_LIMIT = os.environ.get("ICEA_USER_RATE_LIMIT") or ("10000/hour" if ICEA_RUNNING_TESTS else "1000/hour")
 
 # Scoped throttling is safe to enable globally because it only applies to views
 # that define `throttle_scope = "..."`.
@@ -284,7 +284,6 @@ ICEA_USER_RATE_LIMIT = os.environ.get("ICEA_USER_RATE_LIMIT", "1000/hour")
 #   ICEA_THROTTLE_SCOPE_INGEST="5000/hour"
 #   ICEA_THROTTLE_SCOPE_FEDERATED="50/day"
 ICEA_THROTTLE_SCOPE_PREFIX = "ICEA_THROTTLE_SCOPE_"
-ICEA_RUNNING_TESTS = "test" in sys.argv
 
 
 def _icea_scope_rate(scope: str, production_default: str) -> str:
@@ -294,13 +293,11 @@ def _icea_scope_rate(scope: str, production_default: str) -> str:
     return "10000/hour" if ICEA_RUNNING_TESTS else production_default
 
 if ICEA_ENABLE_THROTTLING:
-    REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = ["icea_core.throttling.IceaScopedRateThrottle"]
-    if ICEA_ENABLE_GLOBAL_THROTTLING:
-        REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = [
-            "icea_core.throttling.IceaAnonRateThrottle",
-            "icea_core.throttling.IceaUserRateThrottle",
-            *REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"],
-        ]
+    REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = [
+        "icea_core.throttling.IceaAnonRateThrottle",
+        "icea_core.throttling.IceaUserRateThrottle",
+        "icea_core.throttling.IceaScopedRateThrottle",
+    ]
 
     # Conservative defaults, overridable with ICEA_THROTTLE_SCOPE_<SCOPE>.
     rates = {

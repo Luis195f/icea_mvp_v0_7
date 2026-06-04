@@ -30,7 +30,7 @@ def hash_audit_identity(value: str) -> str:
 
 
 def safe_caller_audit_identity(request) -> tuple[str, str]:
-    """Return a non-reversible caller kind and identity hash."""
+    """Return a non-reversible descriptive caller identity for audit events."""
 
     user = getattr(request, "user", None)
     if user and getattr(user, "is_authenticated", False):
@@ -61,6 +61,34 @@ def safe_caller_audit_identity(request) -> tuple[str, str]:
 
     caller_kind = "service_unknown" if is_service else "anonymous_unknown"
     return caller_kind, hash_audit_identity(caller_kind)
+
+
+def safe_caller_audit_dedupe_identity(request) -> tuple[str, str]:
+    """Return a bounded identity for permission-denial audit deduplication.
+
+    Authenticated callers retain their stable user identity. Anonymous and
+    service callers use only the securely resolved client IP; attacker-
+    controlled User-Agent and other request headers never affect the key.
+    """
+
+    user = getattr(request, "user", None)
+    if user and getattr(user, "is_authenticated", False):
+        return safe_caller_audit_identity(request)
+
+    try:
+        client_ip = str(get_client_ip(request) or "").strip()
+    except Exception:
+        client_ip = ""
+    if client_ip in {"0.0.0.0", "::"}:
+        client_ip = ""
+
+    is_service = bool(getattr(request, "icea_api_key_authenticated", False))
+    caller_kind = "service_client" if is_service else "anonymous_client"
+    if client_ip:
+        return caller_kind, hash_audit_identity(f"ip:{client_ip}")
+
+    caller_kind = "service_unknown" if is_service else "anonymous_unknown"
+    return caller_kind, hash_audit_identity(f"dedupe:{caller_kind}")
 
 
 def safe_audit_actor(request) -> str:

@@ -35,6 +35,7 @@ from rest_framework.permissions import BasePermission
 from icea_core.audit_identity import (
     hash_audit_identity as _audit_identity_hash,
     safe_caller_audit_identity as _safe_caller_audit_identity,
+    safe_caller_audit_dedupe_identity as _safe_caller_audit_dedupe_identity,
 )
 
 
@@ -173,10 +174,11 @@ def _audit_permission_denial(request, view, *, error_code: str) -> None:
         path = _normalized_permission_audit_path(request, view)
         method = str(getattr(request, "method", "") or "UNKNOWN").upper()
         caller_kind, caller_hash = _safe_caller_audit_identity(request)
+        dedupe_caller_kind, dedupe_caller_hash = _safe_caller_audit_dedupe_identity(request)
         dedupe_material = json.dumps(
             {
-                "caller_hash": caller_hash,
-                "caller_kind": caller_kind,
+                "caller_hash": dedupe_caller_hash,
+                "caller_kind": dedupe_caller_kind,
                 "error_code": error_code,
                 "method": method,
                 "path": path,

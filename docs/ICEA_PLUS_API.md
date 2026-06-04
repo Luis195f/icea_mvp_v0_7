@@ -529,10 +529,14 @@ Expected status codes:
 | `/fhir/writeback/riskassessment/` | admin, service | `icea_writeback` | individual numeric writeback blocked |
 | `/governance/*` | admin | `icea_export` or `icea_writeback` | protected audit/governance surface |
 
-Scoped throttling is enabled by default. Operators can override
+Global anonymous/user throttling and scoped throttling are enabled together by
+default. Operators can override
 `ICEA_THROTTLE_SCOPE_ICEA_READ`, `ICEA_THROTTLE_SCOPE_ICEA_COMPUTE`,
 `ICEA_THROTTLE_SCOPE_ICEA_TRAIN`, `ICEA_THROTTLE_SCOPE_ICEA_EXPORT`, and
 `ICEA_THROTTLE_SCOPE_ICEA_WRITEBACK`.
+When `ICEA_ENABLE_THROTTLING=true`, global anonymous/user throttles and scoped
+throttles are enabled together. This keeps unscoped surfaces, including JWT
+token and refresh endpoints, under the configured global rate limits.
 
 ### Logging and lineage
 
@@ -544,7 +548,10 @@ Permission-denial audit spam is deduplicated for 60 seconds per normalized
 resolved route, method, error, and peppered caller hash. If no resolved route
 is available, the view class is used rather than a potentially identifying raw
 path. Authenticated callers use their stable user key; anonymous/service
-callers use a peppered fingerprint of the securely resolved IP and user-agent.
+deduplication uses only a peppered fingerprint of the securely resolved IP, so
+rotating attacker-controlled User-Agent values cannot bypass the TTL. The
+descriptive pseudonymous audit actor may include a hashed User-Agent, but it
+does not participate in permission-denial deduplication.
 Missing metadata falls back explicitly to `anonymous_unknown` or
 `service_unknown`; raw identities, IPs, user-agents, authorization headers,
 cookies, tokens, and path identifiers are not stored.
