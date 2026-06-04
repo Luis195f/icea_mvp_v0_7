@@ -124,6 +124,20 @@ prevent a model from being presented as defendible. `shadow_aggregate_research`
 means aggregate, exploratory monitoring only; it is not clinical validation and
 is not MDR production readiness.
 
+The legacy `POST /icea/compute/` route is retained as a controlled compatibility
+surface, but it does not execute or return individual `predictions`, `icea`,
+`contributions`, scores, or numeric summaries. Successful requests return
+`status=shadow_only`, `score_summary_redacted=true`, `results={}`,
+`shadow_mode=true`, and `non_individual_use=true`. Non-defensible models remain
+blocked before computation.
+
+An evidence pack must declare `feature_names` matching the current
+`ModelArtifact.features` sequence. Order is part of the model contract because
+training and inference construct the model matrix in that order. Adding,
+removing, reordering, or attaching evidence for different features produces
+`feature_names_mismatch` and makes the model non-defensible until it is
+retrained and supplied with matching evidence.
+
 Training endpoints accept an optional `case_mix_spec` object. A sufficient spec
 must declare the required case-mix domains consumed by
 `validate_case_mix_spec`: `age`, `severity`, `comorbidity`,

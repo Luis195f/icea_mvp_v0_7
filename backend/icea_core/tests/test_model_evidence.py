@@ -62,7 +62,7 @@ def complete_evidence_pack(**overrides):
     return pack
 
 
-def create_artifact(*, evidence_pack=None, metrics=None):
+def create_artifact(*, evidence_pack=None, metrics=None, features=None):
     final_metrics = dict(metrics or {})
     if evidence_pack is not None:
         final_metrics["evidence_pack"] = evidence_pack
@@ -70,7 +70,7 @@ def create_artifact(*, evidence_pack=None, metrics=None):
         name="evidence-test",
         version="v-test",
         target="delta_ri",
-        features=["ri_initial", "nurse_hppd"],
+        features=features or ["ri_initial", "nurse_hppd"],
         model_type="xgboost",
         model_path="missing-model.json",
         metrics=final_metrics,
@@ -78,6 +78,67 @@ def create_artifact(*, evidence_pack=None, metrics=None):
 
 
 class ModelEvidenceUnitTests(TestCase):
+    def test_matching_evidence_and_artifact_features_can_be_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(
+                feature_names=[" ri_initial ", None, "", "nurse_hppd"],
+            )
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertTrue(evidence.defensible)
+        self.assertEqual(evidence.evidence_pack["feature_names"], ["ri_initial", "nurse_hppd"])
+        self.assertTrue(evidence.evidence_pack["feature_names_match"])
+        self.assertEqual(evidence.evidence_pack["feature_names_warnings"], [])
+
+    def test_reordered_evidence_features_are_not_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(feature_names=["nurse_hppd", "ri_initial"])
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertIn("feature_names_mismatch", evidence.missing_evidence)
+        self.assertIn("feature_names_order_mismatch", evidence.missing_evidence)
+
+    def test_artifact_feature_not_covered_by_evidence_is_not_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(),
+            features=["ri_initial", "nurse_hppd", "new_feature"],
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertIn("feature_names_mismatch", evidence.missing_evidence)
+        self.assertIn("artifact_features_missing_from_evidence:new_feature", evidence.missing_evidence)
+
+    def test_evidence_feature_not_used_by_artifact_is_not_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(feature_names=["ri_initial", "nurse_hppd", "stale_feature"])
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertEqual(
+            evidence.evidence_pack["feature_names"],
+            ["ri_initial", "nurse_hppd", "stale_feature"],
+        )
+        self.assertIn("feature_names_mismatch", evidence.missing_evidence)
+        self.assertIn("evidence_features_missing_from_artifact:stale_feature", evidence.missing_evidence)
+
+    def test_missing_evidence_feature_names_is_not_replaced_by_artifact_features(self):
+        artifact = create_artifact(evidence_pack=complete_evidence_pack(feature_names=None))
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertEqual(evidence.evidence_pack["feature_names"], [])
+        self.assertIn("feature_names", evidence.missing_evidence)
+
     def test_model_without_dataset_hash_is_not_defensible(self):
         pack = complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
         artifact = create_artifact(evidence_pack=pack)
@@ -304,6 +365,54 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["primary_model_evidence_status"], "evidence_incomplete")
         self.assertNotIn("results", body)
         self.assertIn("dataset_fingerprint", body["missing_evidence"])
+
+    def test_feature_names_mismatch_is_exposed_and_blocks_score(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(),
+            features=["ri_initial", "nurse_hppd", "post_training_feature"],
+        )
+
+        models_response = self.client.get("/api/v1/models/")
+
+        self.assertEqual(models_response.status_code, 200)
+        model = next(item for item in models_response.json() if item["id"] == str(artifact.id))
+        self.assertFalse(model["defensible"])
+        self.assertEqual(model["evidence_status"], "evidence_incomplete")
+        self.assertIn("feature_names_mismatch", model["missing_evidence"])
+        self.assertIn(
+            "artifact_features_missing_from_evidence:post_training_feature",
+            model["missing_evidence"],
+        )
+
+        score_response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": str(artifact.id), "grain": "episode", "from_db": True},
+            format="json",
+        )
+        self.assertEqual(score_response.status_code, 400)
+        self.assertEqual(score_response.json()["detail"], "model_not_defensible")
+        self.assertIn("feature_names_mismatch", score_response.json()["missing_evidence"])
+
+    def test_legacy_compute_with_non_defensible_model_remains_blocked(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(),
+            features=["ri_initial", "nurse_hppd", "post_training_feature"],
+        )
+
+        response = self.client.post(
+            "/api/v1/icea/compute/",
+            {
+                "model_id": str(artifact.id),
+                "data": [{"ri_initial": 50.0, "nurse_hppd": 4.0, "post_training_feature": 1.0}],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        body = response.json()
+        self.assertEqual(body["detail"], "model_not_defensible")
+        self.assertIn("feature_names_mismatch", body["missing_evidence"])
+        self.assertNotIn("results", body)
 
     def test_complete_evidence_model_passes_only_as_shadow_aggregate_research(self):
         response = self.client.get("/api/v1/models/")

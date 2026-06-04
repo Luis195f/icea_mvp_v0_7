@@ -134,6 +134,19 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _normalized_feature_names(value: Any) -> list[str]:
+    normalized = []
+    seen = set()
+    for name in _as_list(value):
+        if name is None:
+            continue
+        text = str(name).strip()
+        if text and text not in seen:
+            normalized.append(text)
+            seen.add(text)
+    return normalized
+
+
 def _metrics_evidence(metrics: dict[str, Any]) -> dict[str, Any]:
     evidence = metrics.get("evidence_pack")
     return dict(evidence) if isinstance(evidence, dict) else {}
@@ -363,6 +376,22 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
             if str(value) in OUTCOME_COMPARABILITY_WARNINGS
         }
     )
+    evidence_feature_names = _normalized_feature_names(evidence.get("feature_names"))
+    artifact_feature_names = _normalized_feature_names(artifact.features)
+    evidence_features_missing_from_artifact = sorted(set(evidence_feature_names) - set(artifact_feature_names))
+    artifact_features_missing_from_evidence = sorted(set(artifact_feature_names) - set(evidence_feature_names))
+    feature_names_warnings = []
+    if evidence_feature_names and evidence_feature_names != artifact_feature_names:
+        if not evidence_features_missing_from_artifact and not artifact_features_missing_from_evidence:
+            feature_names_warnings.append("feature_names_order_mismatch")
+        if evidence_features_missing_from_artifact:
+            feature_names_warnings.append(
+                f"evidence_features_missing_from_artifact:{','.join(evidence_features_missing_from_artifact)}"
+            )
+        if artifact_features_missing_from_evidence:
+            feature_names_warnings.append(
+                f"artifact_features_missing_from_evidence:{','.join(artifact_features_missing_from_evidence)}"
+            )
     limitations = [str(value) for value in _as_list(_first_non_empty(evidence.get("limitations"), metrics.get("limitations"))) if str(value)]
     missing_required_limitations = sorted(REQUIRED_MODEL_LIMITATIONS - set(limitations))
 
@@ -373,7 +402,12 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "training_row_count": _first_non_empty(evidence.get("training_row_count"), metrics.get("training_row_count")),
         "validation_row_count": validation_row_count,
         "validation_unavailable_reason": validation_unavailable_reason,
-        "feature_names": list(artifact.features or []),
+        "feature_names": evidence_feature_names,
+        "artifact_feature_names": artifact_feature_names,
+        "feature_names_match": bool(evidence_feature_names) and evidence_feature_names == artifact_feature_names,
+        "feature_names_warnings": feature_names_warnings,
+        "evidence_features_missing_from_artifact": evidence_features_missing_from_artifact,
+        "artifact_features_missing_from_evidence": artifact_features_missing_from_evidence,
         "temporal_spec_version": temporal_spec_version,
         "temporal_guardrail_status": temporal_guardrail_status or None,
         "outcome_definition": _first_non_empty(evidence.get("outcome_definition"), metrics.get("outcome_definition"), artifact.target),
@@ -425,6 +459,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         missing.append("case_mix_spec_or_unavailable_reason")
     if case_mix_issue:
         missing.append("case_mix_spec_sufficient")
+    if evidence_feature_names and evidence_feature_names != artifact_feature_names:
+        missing.extend(["feature_names_mismatch", *feature_names_warnings])
     if temporal_guardrail_status not in DEFENSIBLE_TEMPORAL_GUARDRAIL_STATUSES:
         if temporal_guardrail_status in NOT_EVALUATED_TEMPORAL_GUARDRAIL_STATUSES:
             missing.append("temporal_guardrail_not_evaluated")
@@ -465,6 +501,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         statuses.append("limitations_incomplete")
     if case_mix_issue:
         statuses.append("case_mix_insufficient")
+    if evidence_feature_names and evidence_feature_names != artifact_feature_names:
+        statuses.extend(["feature_names_mismatch", *feature_names_warnings])
     if not pack.get("calibration_summary"):
         statuses.append("calibration_unavailable")
     if not pack.get("validation_metrics"):

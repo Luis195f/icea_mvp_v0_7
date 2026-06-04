@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 from icea_pipeline.temporal import validate_temporal_frame
 
 from .evidence import build_training_evidence_metadata, summarize_model_evidence
-from .engine import ICEAEngine, compute_basic_summary, stable_json_dumps
+from .engine import stable_json_dumps
 from .ml import train_xgb_regressor
 from .models import ICEAComputation, ModelArtifact
 from .serializers import (
@@ -100,7 +100,7 @@ class ModelTrainView(APIView):
 
 
 class ICEAComputeView(APIView):
-    """Compute ICEA (and optional group contributions) for a batch of rows."""
+    """Retain the legacy compute contract without emitting individual outputs."""
 
     def post(self, request):
         ser = ComputeRequestSerializer(data=request.data)
@@ -138,37 +138,17 @@ class ICEAComputeView(APIView):
                     status=400,
                 )
 
-        group_map = payload.get("group_map")
-
-        # Background for SHAP: sample the batch (cheap and deterministic)
-        background = df.head(min(len(df), 200)).copy()
-
-        shap_mode = request.query_params.get("shap_mode", "interventional")
-        engine = ICEAEngine(
-            artifact.model_path,
-            background=background,
-            shap_mode=shap_mode,
-        )
-
-        result = engine.compute(
-            df,
-            features=features,
-            nurse_cols=nurse_cols,
-            group_map=group_map,
-        )
-
-        # Traceability / audit
+        # Legacy compute is retained only as a governed audit surface. Models
+        # approved for shadow aggregate research cannot emit row-level outputs.
         request_hash = hashlib.sha256(stable_json_dumps(payload).encode("utf-8")).hexdigest()
+        warnings = ["individual_outputs_suppressed", "legacy_compute_redacted"]
         summary = {
-            "icea": compute_basic_summary(result.icea),
-            "predictions": compute_basic_summary(result.predictions),
-            "base_value": float(result.base_value),
+            "status": "shadow_only",
+            "rows_requested": int(len(df)),
+            "score_summary": None,
+            "score_summary_redacted": True,
+            "warnings": warnings,
         }
-        # Add group summaries
-        group_summaries = {}
-        for k, v in result.contributions.items():
-            group_summaries[k] = compute_basic_summary(v)
-        summary["groups"] = group_summaries
 
         ICEAComputation.objects.create(
             model=artifact,
@@ -182,11 +162,16 @@ class ICEAComputeView(APIView):
                 "model": ModelArtifactSerializer(artifact).data,
                 "summary": summary,
                 "rows": len(df),
-                "results": {
-                    "predictions": result.predictions,
-                    "base_value": float(result.base_value),
-                    "icea": result.icea,
-                    "contributions": result.contributions,
-                },
+                "results": {},
+                "status": "shadow_only",
+                "detail": "legacy_compute_redacted",
+                "model_evidence_status": evidence.evidence_status,
+                "defensible": evidence.defensible,
+                "intended_use": evidence.intended_use,
+                "shadow_mode": True,
+                "non_individual_use": True,
+                "score_summary": None,
+                "score_summary_redacted": True,
+                "warnings": warnings,
             }
         )
