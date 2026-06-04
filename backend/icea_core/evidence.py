@@ -68,6 +68,12 @@ OUTCOME_COMPARABILITY_WARNINGS = frozenset(
         "mixed_temporal_spec_versions",
     }
 )
+BLOCKING_FEATURE_SUPPORT_WARNINGS = frozenset(
+    {
+        "declared_feature_missing_from_payload",
+        "declared_feature_without_observed_values",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -392,6 +398,59 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     )
     evidence_feature_names = _normalized_feature_names(evidence.get("feature_names"))
     artifact_feature_names = _normalized_feature_names(artifact.features)
+    observed_feature_columns = _normalized_feature_names(
+        _first_non_empty(evidence.get("observed_feature_columns"), metrics.get("observed_feature_columns"))
+    )
+    declared_features_missing_from_payload = _normalized_feature_names(
+        _first_non_empty(
+            evidence.get("declared_features_missing_from_payload"),
+            metrics.get("declared_features_missing_from_payload"),
+        )
+    )
+    features_without_observed_training_values = _normalized_feature_names(
+        _first_non_empty(
+            evidence.get("features_without_observed_training_values"),
+            metrics.get("features_without_observed_training_values"),
+        )
+    )
+    feature_warnings = sorted(
+        {
+            str(value)
+            for value in _as_list(_first_non_empty(evidence.get("feature_warnings"), metrics.get("feature_warnings")))
+            if str(value)
+        }
+    )
+    feature_support_status = str(
+        _first_non_empty(evidence.get("feature_support_status"), metrics.get("feature_support_status")) or ""
+    ).strip()
+    unsupported_evidence_features = sorted(set(evidence_feature_names) - set(observed_feature_columns))
+    feature_support_issues = []
+    if feature_support_status != "supported":
+        feature_support_issues.append(
+            "feature_support_not_evaluated"
+            if not feature_support_status
+            else f"feature_support_not_supported:{feature_support_status}"
+        )
+    if declared_features_missing_from_payload or "declared_feature_missing_from_payload" in feature_warnings:
+        feature_support_issues.extend(
+            [
+                "declared_features_missing_from_payload",
+                "declared_feature_missing_from_payload",
+            ]
+        )
+    blocking_feature_warnings = sorted(set(feature_warnings) & BLOCKING_FEATURE_SUPPORT_WARNINGS)
+    if blocking_feature_warnings:
+        feature_support_issues.extend(blocking_feature_warnings)
+    unsupported_features = sorted(
+        set(features_without_observed_training_values) | set(unsupported_evidence_features)
+    )
+    if unsupported_features:
+        feature_support_issues.extend(
+            [
+                "features_without_observed_training_values",
+                f"features_without_observed_training_values:{','.join(unsupported_features)}",
+            ]
+        )
     evidence_features_missing_from_artifact = sorted(set(evidence_feature_names) - set(artifact_feature_names))
     artifact_features_missing_from_evidence = sorted(set(artifact_feature_names) - set(evidence_feature_names))
     feature_names_warnings = []
@@ -420,6 +479,11 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "artifact_feature_names": artifact_feature_names,
         "feature_names_match": bool(evidence_feature_names) and evidence_feature_names == artifact_feature_names,
         "feature_names_warnings": feature_names_warnings,
+        "observed_feature_columns": observed_feature_columns,
+        "declared_features_missing_from_payload": declared_features_missing_from_payload,
+        "features_without_observed_training_values": features_without_observed_training_values,
+        "feature_support_status": feature_support_status or None,
+        "feature_warnings": feature_warnings,
         "evidence_features_missing_from_artifact": evidence_features_missing_from_artifact,
         "artifact_features_missing_from_evidence": artifact_features_missing_from_evidence,
         "temporal_spec_version": temporal_spec_version,
@@ -476,6 +540,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         missing.append("case_mix_spec_sufficient")
     if evidence_feature_names and evidence_feature_names != artifact_feature_names:
         missing.extend(["feature_names_mismatch", *feature_names_warnings])
+    missing.extend(feature_support_issues)
     if temporal_guardrail_status not in DEFENSIBLE_TEMPORAL_GUARDRAIL_STATUSES:
         if temporal_guardrail_status in NOT_EVALUATED_TEMPORAL_GUARDRAIL_STATUSES:
             missing.append("temporal_guardrail_not_evaluated")
@@ -518,6 +583,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         statuses.append("case_mix_insufficient")
     if evidence_feature_names and evidence_feature_names != artifact_feature_names:
         statuses.extend(["feature_names_mismatch", *feature_names_warnings])
+    if feature_support_issues:
+        statuses.extend(["feature_support_incomplete", *feature_warnings])
     if not pack.get("calibration_summary"):
         statuses.append("calibration_unavailable")
     validation_available = bool(pack.get("validation_metrics")) and valid_validation_row_count is not None
@@ -607,9 +674,18 @@ def build_training_evidence_metadata(
         validation_unavailable_reason = "validation_metrics_not_computed"
     else:
         validation_unavailable_reason = None
-    feature_names = {str(feature) for feature in features}
-    observed_columns = [column for column in _observed_training_columns(raw_df, model_df) if column in feature_names]
-    declared_feature_missing = sorted(set(str(feature) for feature in features) - set(str(column) for column in raw_df.columns))
+    feature_names = [str(feature) for feature in features]
+    feature_name_set = set(feature_names)
+    observed_columns = [column for column in _observed_training_columns(raw_df, model_df) if column in feature_name_set]
+    declared_feature_missing = sorted(feature_name_set - set(str(column) for column in raw_df.columns))
+    features_without_observed_training_values = sorted(feature_name_set - set(observed_columns))
+    empty_feature_columns = sorted(set(features_without_observed_training_values) - set(declared_feature_missing))
+    feature_warnings = []
+    if declared_feature_missing:
+        feature_warnings.append("declared_feature_missing_from_payload")
+    if empty_feature_columns:
+        feature_warnings.append("declared_feature_without_observed_values")
+    feature_support_status = "supported" if not features_without_observed_training_values else "incomplete"
     effective_case_mix_spec = dict(case_mix_spec) if isinstance(case_mix_spec, dict) else None
     if effective_case_mix_spec is None:
         effective_case_mix_spec = derive_case_mix_spec_from_columns(observed_columns)
@@ -627,10 +703,12 @@ def build_training_evidence_metadata(
         "dataset_hash": dataset_fingerprint,
         "training_row_count": training_row_count,
         "validation_row_count": validation_row_count,
-        "feature_names": list(features),
+        "feature_names": feature_names,
         "observed_feature_columns": observed_columns,
-        "feature_warnings": ["declared_feature_missing_from_payload"] if declared_feature_missing else [],
+        "feature_support_status": feature_support_status,
+        "feature_warnings": feature_warnings,
         "declared_features_missing_from_payload": declared_feature_missing,
+        "features_without_observed_training_values": features_without_observed_training_values,
         "temporal_spec_version": temporal_versions[0] if len(temporal_versions) == 1 else None,
         "temporal_guardrail_status": temporal_guardrail_status,
         "temporal_guardrail_warnings": sorted(

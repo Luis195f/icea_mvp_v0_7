@@ -108,6 +108,8 @@ when available and must trace:
 - positive integer `training_row_count`
 - positive integer `validation_row_count`
 - `feature_names`
+- `observed_feature_columns`
+- `feature_support_status=supported`
 - `temporal_spec_version` and `temporal_guardrail_status`
 - `outcome_definition` and `outcome_window`
 - `case_mix_spec` or `case_mix_unavailable_reason`
@@ -122,6 +124,13 @@ when available and must trace:
 does not replace a positive `validation_row_count` or make a model defendible.
 Zero, negative, string, missing, or otherwise invalid training/validation row
 counts fail closed as incomplete model evidence.
+
+Every declared model feature must be present with at least one real, non-null
+value in the raw training dataset. Declared-but-absent, entirely empty/NaN, or
+zero-filled-only features set `feature_support_status=incomplete` and invalidate
+defensibility. Compatibility zero-fill is not training evidence. Legacy or
+imported evidence packs without positive observed-feature support also fail
+closed until that support can be audited from real training data.
 
 `calibration_unavailable`, `validation_unavailable`, and
 `case_mix_insufficient` are not validation claims. They are audit statuses that

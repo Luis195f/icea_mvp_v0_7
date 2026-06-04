@@ -31,6 +31,11 @@ def complete_evidence_pack(**overrides):
         "training_row_count": 80,
         "validation_row_count": 20,
         "feature_names": ["ri_initial", "nurse_hppd"],
+        "observed_feature_columns": ["ri_initial", "nurse_hppd"],
+        "feature_support_status": "supported",
+        "feature_warnings": [],
+        "declared_features_missing_from_payload": [],
+        "features_without_observed_training_values": [],
         "temporal_spec_version": "icea_temporal_v1",
         "temporal_guardrail_status": "passed",
         "outcome_definition": "delta_ri",
@@ -185,6 +190,82 @@ class ModelEvidenceUnitTests(TestCase):
         self.assertEqual(evidence.evidence_pack["feature_names"], ["ri_initial", "nurse_hppd"])
         self.assertTrue(evidence.evidence_pack["feature_names_match"])
         self.assertEqual(evidence.evidence_pack["feature_names_warnings"], [])
+
+    def test_declared_features_missing_from_payload_are_not_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(
+                observed_feature_columns=["ri_initial"],
+                feature_support_status="incomplete",
+                feature_warnings=["declared_feature_missing_from_payload"],
+                declared_features_missing_from_payload=["nurse_hppd"],
+                features_without_observed_training_values=["nurse_hppd"],
+            )
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertEqual(evidence.evidence_status, "evidence_incomplete")
+        self.assertIn("declared_features_missing_from_payload", evidence.missing_evidence)
+        self.assertIn("declared_feature_missing_from_payload", evidence.missing_evidence)
+        self.assertIn("feature_support_incomplete", evidence.statuses)
+        self.assertIn("declared_feature_missing_from_payload", evidence.statuses)
+
+    def test_blocking_feature_support_warning_alone_blocks_defensibility(self):
+        for warning in ("declared_feature_missing_from_payload", "declared_feature_without_observed_values"):
+            with self.subTest(warning=warning):
+                artifact = create_artifact(
+                    evidence_pack=complete_evidence_pack(
+                        feature_warnings=[warning],
+                    )
+                )
+
+                evidence = summarize_model_evidence(artifact)
+
+                self.assertFalse(evidence.defensible)
+                self.assertIn(warning, evidence.missing_evidence)
+                self.assertIn("feature_support_incomplete", evidence.statuses)
+
+    def test_feature_support_without_positive_observation_proof_is_not_defensible(self):
+        artifact = create_artifact(
+            evidence_pack=complete_evidence_pack(
+                observed_feature_columns=None,
+                feature_support_status=None,
+            )
+        )
+
+        evidence = summarize_model_evidence(artifact)
+
+        self.assertFalse(evidence.defensible)
+        self.assertIn("feature_support_not_evaluated", evidence.missing_evidence)
+        self.assertIn("features_without_observed_training_values", evidence.missing_evidence)
+
+    def test_training_evidence_metadata_requires_real_feature_observations(self):
+        raw_df = pd.DataFrame(
+            {
+                "observed": [1.0, 2.0],
+                "empty": [None, float("nan")],
+                "delta_ri": [0.1, 0.2],
+            }
+        )
+        model_df = raw_df.reindex(columns=["observed", "empty", "absent", "delta_ri"])
+
+        evidence = build_training_evidence_metadata(
+            raw_df=raw_df,
+            model_df=model_df,
+            features=["observed", "empty", "absent"],
+            target="delta_ri",
+            dataset_grain="test",
+            metrics={"rmse": 0.1, "conformal": {"calibration_size": 1}},
+            temporal_guardrail_status="passed",
+        )
+
+        self.assertEqual(evidence["observed_feature_columns"], ["observed"])
+        self.assertEqual(evidence["declared_features_missing_from_payload"], ["absent"])
+        self.assertEqual(evidence["features_without_observed_training_values"], ["absent", "empty"])
+        self.assertEqual(evidence["feature_support_status"], "incomplete")
+        self.assertIn("declared_feature_missing_from_payload", evidence["feature_warnings"])
+        self.assertIn("declared_feature_without_observed_values", evidence["feature_warnings"])
 
     def test_invalid_training_row_counts_are_not_defensible(self):
         for invalid_count in (0, -1, "0", "-1", "abc", None):
@@ -595,6 +676,106 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(model["validation_status"], "validation_unavailable")
         self.assertIn("invalid_validation_row_count", model["missing_evidence"])
 
+    def test_missing_training_feature_blocks_all_governed_model_surfaces(self):
+        payload = self._external_training_payload()
+        payload["features"].append("zero_filled_only_feature")
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            train_response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(train_response.status_code, 201)
+        body = train_response.json()
+        self.assertFalse(body["defensible"])
+        self.assertEqual(body["evidence_status"], "evidence_incomplete")
+        self.assertIn("declared_features_missing_from_payload", body["missing_evidence"])
+        evidence_pack = body["metrics"]["evidence_pack"]
+        self.assertEqual(evidence_pack["feature_support_status"], "incomplete")
+        self.assertEqual(evidence_pack["declared_features_missing_from_payload"], ["zero_filled_only_feature"])
+        self.assertIn("zero_filled_only_feature", evidence_pack["features_without_observed_training_values"])
+        self.assertIn("declared_feature_missing_from_payload", evidence_pack["feature_warnings"])
+
+        artifact = ModelArtifact.objects.get(id=body["id"])
+        models_response = self.client.get("/api/v1/models/")
+        model = next(item for item in models_response.json() if item["id"] == body["id"])
+        self.assertFalse(model["defensible"])
+        self.assertIn("declared_features_missing_from_payload", model["missing_evidence"])
+
+        score_response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": body["id"], "grain": "episode", "from_db": True},
+            format="json",
+        )
+        self.assertEqual(score_response.status_code, 400)
+        self.assertEqual(score_response.json()["detail"], "model_not_defensible")
+        self.assertNotIn("results", score_response.json())
+
+        aggregate_response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {"model_id": body["id"], "grain": "episode", "group_by": "unit"},
+        )
+        self.assertEqual(aggregate_response.status_code, 400)
+        self.assertEqual(aggregate_response.json()["detail"], "model_not_defensible")
+        self.assertNotIn("results", aggregate_response.json())
+
+        compute_response = self.client.post(
+            "/api/v1/icea/compute/",
+            {
+                "model_id": body["id"],
+                "data": [{"ri_initial": 50.0, "nurse_hppd": 4.0, "zero_filled_only_feature": 0.0}],
+            },
+            format="json",
+        )
+        self.assertEqual(compute_response.status_code, 400)
+        self.assertEqual(compute_response.json()["detail"], "model_not_defensible")
+        self.assertNotIn("results", compute_response.json())
+
+        self._create_followup_records(artifact=artifact, count=1)
+        writeback_summary = build_summary_writeback(artifact=artifact, group_by="unit")
+        self.assertEqual(writeback_summary["detail"], "model_not_defensible")
+        self.assertEqual(writeback_summary["results"], [])
+        self.assertIsNone(writeback_summary["scored_aggregate"])
+        self.assertTrue(writeback_summary["suppressed"])
+
+    def test_models_train_with_entirely_empty_feature_is_not_defensible(self):
+        payload = self._external_training_payload()
+        payload["features"].append("empty_feature")
+        for row in payload["dataset"]:
+            row["empty_feature"] = None
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        evidence = body["metrics"]["evidence_pack"]
+        self.assertEqual(evidence["feature_support_status"], "incomplete")
+        self.assertEqual(evidence["declared_features_missing_from_payload"], [])
+        self.assertIn("empty_feature", evidence["features_without_observed_training_values"])
+        self.assertIn("declared_feature_without_observed_values", evidence["feature_warnings"])
+
+    def test_models_train_with_real_values_for_every_feature_can_be_defensible(self):
+        payload = self._external_training_payload()
+        payload["features"].append("observed_extra_feature")
+        for index, row in enumerate(payload["dataset"]):
+            row["observed_extra_feature"] = float(index + 1)
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertTrue(body["defensible"])
+        evidence = body["metrics"]["evidence_pack"]
+        self.assertEqual(evidence["feature_support_status"], "supported")
+        self.assertIn("observed_extra_feature", evidence["observed_feature_columns"])
+
     def test_feature_names_mismatch_is_exposed_and_blocks_score(self):
         artifact = create_artifact(
             evidence_pack=complete_evidence_pack(),
@@ -873,6 +1054,8 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
             evidence["declared_features_missing_from_payload"],
             ["age_years", "charlson_index", "frailty_score"],
         )
+        self.assertEqual(evidence["feature_support_status"], "incomplete")
+        self.assertIn("declared_features_missing_from_payload", body["missing_evidence"])
         self.assertIsNone(evidence["case_mix_spec"])
         self.assertEqual(body["case_mix_status"], "case_mix_insufficient")
         score_response = self.client.post(
@@ -907,6 +1090,8 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(response.status_code, 201)
         body = response.json()
         self.assertFalse(body["defensible"])
+        self.assertEqual(body["metrics"]["evidence_pack"]["feature_support_status"], "incomplete")
+        self.assertIn("features_without_observed_training_values", body["missing_evidence"])
         self.assertEqual(body["case_mix_status"], "case_mix_insufficient")
         self.assertIn("case_mix_columns_missing_or_empty", body["metrics"]["evidence_pack"]["case_mix_unavailable_reason"])
 
