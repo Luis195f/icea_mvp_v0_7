@@ -134,6 +134,12 @@ marked `source=derived_from_training_data`. If the domains cannot be derived,
 the model is still registered for auditability but remains
 `model_not_defensible` / `case_mix_insufficient`.
 
+When `variables` is a list, each value declares both the required domain and the
+training column with the same name. Dictionary-form `domains` or `variables`
+may map a domain to one or more observed training columns. Contradictory
+declarations, missing columns, and columns containing only null values do not
+satisfy case-mix support.
+
 Case-mix derivation and validation use only columns that are actually present in
 the training payload/model frame and contain at least one observed value.
 Declared features that are absent from every row, entirely empty, or introduced
@@ -434,6 +440,11 @@ Optional query params:
 - `stale`: new follow-up evidence exists and the record should be rescored
 - `failed`: an enriched rescore attempt failed, while the initial score remains available
 - `pending_followup`: no usable new follow-up evidence has been observed
+
+Initial follow-up state is derived from the internal aggregate-only scoring row
+when available. The public patient/episode row remains `shadow_only` and
+score-redacted, and is never used to infer whether the internal scoring result
+was `complete`, `provisional`, or `insufficient_evidence`.
 
 ### Typed errors for follow-up and writeback
 

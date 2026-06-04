@@ -14,10 +14,12 @@ from icea_core.followup import (
     FollowupEvaluation,
     build_patient_summary,
     build_summary_writeback,
+    persist_initial_followup_records,
 )
 from icea_core.models import ICEAPlusComputation, ICEAPlusFollowupRecord, ModelArtifact
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_pipeline.models import EpisodeWindowFeatureRow
+from icea_pipeline.temporal import CASE_MIX_REQUIRED_DOMAINS
 
 
 def complete_evidence_pack(**overrides):
@@ -230,6 +232,61 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
             last_followup_at=self.now,
             feature_snapshot_hash="followup-snapshot",
         )
+
+    def _persist_initial_result(self, *, row_status, score):
+        episode = self.episodes[0]
+        aggregate_row = {
+            "row_id": f"episode:{episode.id}",
+            "episode_id": int(episode.id),
+            "unit_id": int(episode.unit_id),
+            "status": row_status,
+            "score": score,
+            "raw_score": 0.1 if score is not None else None,
+            "warnings": [],
+            "aggregation": {"severity_weight": 1.0, "effective_exposure_share": 1.0},
+        }
+        public_row = {
+            **aggregate_row,
+            "status": "shadow_only" if score is not None else row_status,
+            "score": None,
+            "raw_score": None,
+            "shadow_mode": True,
+            "non_individual_use": True,
+        }
+        result = {
+            "formula_version": "icea_plus_v1",
+            "formula_protocol_hash": "",
+            "results": [public_row],
+            "_aggregate_rows": [aggregate_row],
+        }
+        computation = ICEAPlusComputation.objects.create(
+            formula_version="icea_plus_v1",
+            model=self.episode_artifact,
+            grain="episode",
+            rows=1,
+            status="ok",
+            summary={},
+        )
+        record = persist_initial_followup_records(
+            artifact=self.episode_artifact,
+            result=result,
+            computation=computation,
+            request_config={"grain": "episode", "from_db": True},
+        )[0]
+        return record, public_row
+
+    def _case_mix_variables_list_payload(self):
+        payload = self._external_training_payload()
+        variables = sorted(CASE_MIX_REQUIRED_DOMAINS)
+        for index, row in enumerate(payload["dataset"]):
+            for offset, variable in enumerate(variables):
+                row[variable] = float(index + offset + 1)
+        payload["features"] = ["ri_initial", "nurse_hppd", *variables]
+        payload["case_mix_spec"] = {
+            "source": "test_declared_variables_list",
+            "variables": variables,
+        }
+        return payload
 
     def test_score_with_incomplete_evidence_does_not_return_defensible_score(self):
         artifact = create_artifact(evidence_pack=complete_evidence_pack(dataset_hash=None, dataset_fingerprint=None))
@@ -535,6 +592,121 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         body = response.json()
         self.assertTrue(body["defensible"])
         self.assertEqual(body["case_mix_status"], "case_mix_available")
+
+    def test_case_mix_variables_list_with_observed_columns_is_supported(self):
+        payload = self._case_mix_variables_list_payload()
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertTrue(body["defensible"])
+        self.assertEqual(body["case_mix_status"], "case_mix_available")
+        model = next(item for item in self.client.get("/api/v1/models/").json() if item["id"] == body["id"])
+        self.assertEqual(model["case_mix_status"], "case_mix_available")
+
+    def test_case_mix_variables_list_with_missing_column_is_not_supported(self):
+        payload = self._case_mix_variables_list_payload()
+        for row in payload["dataset"]:
+            row.pop("baseline_load")
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertEqual(body["case_mix_status"], "case_mix_insufficient")
+        self.assertIn(
+            "case_mix_columns_missing_or_empty:baseline_load:baseline_load",
+            body["metrics"]["evidence_pack"]["case_mix_unavailable_reason"],
+        )
+        model = next(item for item in self.client.get("/api/v1/models/").json() if item["id"] == body["id"])
+        self.assertEqual(model["case_mix_status"], "case_mix_insufficient")
+        score_response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": body["id"], "grain": "episode", "from_db": True},
+            format="json",
+        )
+        self.assertEqual(score_response.status_code, 400)
+        self.assertEqual(score_response.json()["case_mix_status"], "case_mix_insufficient")
+
+    def test_case_mix_variables_list_with_nan_only_column_is_not_supported(self):
+        payload = self._case_mix_variables_list_payload()
+        for row in payload["dataset"]:
+            row["baseline_load"] = None
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertEqual(body["case_mix_status"], "case_mix_insufficient")
+        self.assertIn(
+            "case_mix_columns_missing_or_empty:baseline_load:baseline_load",
+            body["metrics"]["evidence_pack"]["case_mix_unavailable_reason"],
+        )
+
+    def test_case_mix_domains_and_variables_conflict_is_not_supported(self):
+        payload = self._case_mix_variables_list_payload()
+        payload["case_mix_spec"]["domains"] = {
+            **{domain: [domain] for domain in CASE_MIX_REQUIRED_DOMAINS},
+            "age": ["age_alias"],
+        }
+        for row in payload["dataset"]:
+            row["age_alias"] = row["age"]
+        payload["features"].append("age_alias")
+        with mock.patch(
+            "icea_core.views.train_xgb_regressor",
+            return_value=self._mock_external_train_result(features=payload["features"]),
+        ):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertIn("case_mix_domain_variable_conflict:age", body["metrics"]["evidence_pack"]["case_mix_unavailable_reason"])
+
+    def test_initial_followup_state_uses_internal_complete_status_not_public_shadow_only(self):
+        record, public_row = self._persist_initial_result(row_status="complete", score=72.0)
+
+        self.assertEqual(public_row["status"], "shadow_only")
+        self.assertIsNone(public_row["score"])
+        self.assertEqual(record.initial_state, "complete")
+        self.assertEqual(record.current_state, "complete")
+        self.assertEqual(record.followup_status, "pending_followup")
+        self.assertEqual(record.initial_result[INTERNAL_AGGREGATE_ROW_KEY]["status"], "complete")
+        patient_summary = build_patient_summary(record)
+        self.assertIsNone(patient_summary["initial_score"]["score"])
+        self.assertNotIn(INTERNAL_AGGREGATE_ROW_KEY, patient_summary["initial_score"])
+        summary = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+        self.assertEqual(summary["status_counts"]["complete"], 1)
+
+    def test_initial_followup_state_uses_internal_provisional_status_not_public_shadow_only(self):
+        record, public_row = self._persist_initial_result(row_status="provisional", score=51.0)
+
+        self.assertEqual(public_row["status"], "shadow_only")
+        self.assertIsNone(public_row["score"])
+        self.assertEqual(record.initial_state, "immediate_provisional")
+        self.assertEqual(record.current_state, "immediate_provisional")
+        self.assertEqual(record.followup_status, "pending_followup")
+
+    def test_initial_followup_state_keeps_real_insufficient_evidence(self):
+        record, public_row = self._persist_initial_result(row_status="insufficient_evidence", score=None)
+
+        self.assertEqual(public_row["status"], "insufficient_evidence")
+        self.assertIsNone(public_row["score"])
+        self.assertEqual(record.initial_state, "insufficient_evidence")
+        self.assertEqual(record.current_state, "insufficient_evidence")
+        self.assertEqual(record.followup_status, "insufficient_evidence")
 
     def test_score_blocks_model_with_temporal_guardrails_not_evaluated(self):
         artifact = create_artifact(

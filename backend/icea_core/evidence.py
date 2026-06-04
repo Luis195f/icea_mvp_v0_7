@@ -210,12 +210,15 @@ def _observed_training_columns(raw_df: pd.DataFrame, model_df: pd.DataFrame) -> 
     return sorted(set(observed))
 
 
-def _case_mix_domain_columns(case_mix_spec: dict[str, Any] | None) -> dict[str, list[str]]:
+def _case_mix_domain_columns(case_mix_spec: dict[str, Any] | None) -> tuple[dict[str, list[str]], list[str]]:
     if not isinstance(case_mix_spec, dict):
-        return {}
+        return {}, []
     mappings: dict[str, list[str]] = {}
+    conflicts: list[str] = []
     for container_name in ("domains", "variables"):
         container = case_mix_spec.get(container_name)
+        if container_name == "variables" and isinstance(container, list):
+            container = {str(variable): str(variable) for variable in container if str(variable)}
         if not isinstance(container, dict):
             continue
         for domain, raw_values in container.items():
@@ -226,14 +229,18 @@ def _case_mix_domain_columns(case_mix_spec: dict[str, Any] | None) -> dict[str, 
             else:
                 values = []
             if values:
-                mappings[str(domain)] = sorted(set(values))
-    return mappings
+                domain_name = str(domain)
+                normalized_values = sorted(set(values))
+                if domain_name in mappings and mappings[domain_name] != normalized_values:
+                    conflicts.append(f"case_mix_domain_variable_conflict:{domain_name}")
+                mappings[domain_name] = normalized_values
+    return mappings, sorted(set(conflicts))
 
 
 def _case_mix_support_issue(case_mix_spec: dict[str, Any] | None, observed_columns: list[str]) -> list[str]:
-    domain_columns = _case_mix_domain_columns(case_mix_spec)
+    domain_columns, conflicts = _case_mix_domain_columns(case_mix_spec)
     observed = set(observed_columns)
-    warnings: list[str] = []
+    warnings: list[str] = list(conflicts)
     for domain in sorted(CASE_MIX_REQUIRED_DOMAINS):
         columns = domain_columns.get(domain) or []
         if not columns:

@@ -97,6 +97,13 @@ def _initial_state(row_status: str | None) -> str:
     return "insufficient_evidence"
 
 
+def _initial_followup_status(row_status: str | None) -> str:
+    initial_state = _initial_state(row_status)
+    if initial_state in {"failed", "insufficient_evidence"}:
+        return initial_state
+    return "pending_followup"
+
+
 def _derive_current_state(record: ICEAPlusFollowupRecord) -> str:
     if record.followup_status == "enriched_followup" and record.enriched_result:
         return "enriched_followup"
@@ -216,6 +223,10 @@ def _aggregate_stored_result(result_row: dict[str, Any]) -> dict[str, Any]:
     if isinstance(aggregate_row, dict):
         return dict(aggregate_row)
     return _public_stored_result(result_row)
+
+
+def _initial_status_source(result_row: dict[str, Any]) -> dict[str, Any]:
+    return _aggregate_stored_result(result_row)
 
 
 def _artifact_case_mix_spec(artifact: ModelArtifact) -> dict[str, Any] | None:
@@ -460,6 +471,9 @@ def _upsert_initial_record(
     protocol_hash = str(lineage.get("formula_protocol_hash") or "")
     snapshot_hash, _ = _feature_snapshot(episode)
     shadow_mode, exploratory_only = _formula_flags(formula_version)
+    initial_status = str(_initial_status_source(row).get("status") or "")
+    initial_state = _initial_state(initial_status)
+    initial_followup_status = _initial_followup_status(initial_status)
 
     record, _ = ICEAPlusFollowupRecord.objects.get_or_create(
         episode=episode,
@@ -470,9 +484,9 @@ def _upsert_initial_record(
             "grain": "episode",
             "patient_key": _patient_key(episode, row),
             "initial_computation": computation,
-            "initial_state": _initial_state(str(row.get("status") or "")),
-            "followup_status": "pending_followup",
-            "current_state": _initial_state(str(row.get("status") or "")),
+            "initial_state": initial_state,
+            "followup_status": initial_followup_status,
+            "current_state": initial_state,
             "initial_request": _jsonable_request(request_config),
             "initial_result": row,
             "feature_snapshot_hash": snapshot_hash,
@@ -494,11 +508,19 @@ def _upsert_initial_record(
     if not record.initial_result:
         record.initial_result = row
         record.initial_computation = computation
-        record.initial_state = _initial_state(str(row.get("status") or ""))
+        record.initial_state = initial_state
+        record.followup_status = initial_followup_status
         record.feature_snapshot_hash = snapshot_hash
         record.initial_request = _jsonable_request(request_config)
         updated_fields.extend(
-            ["initial_result", "initial_computation", "initial_state", "feature_snapshot_hash", "initial_request"]
+            [
+                "initial_result",
+                "initial_computation",
+                "initial_state",
+                "followup_status",
+                "feature_snapshot_hash",
+                "initial_request",
+            ]
         )
     if not record.patient_key:
         record.patient_key = _patient_key(episode, row)
