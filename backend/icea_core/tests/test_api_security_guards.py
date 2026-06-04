@@ -62,6 +62,25 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         user.groups.add(group)
         return user
 
+    def _canonical_path(self, path: str) -> str:
+        # Risk regressions must reach permissions/views, not middleware redirects.
+        return path if path.endswith("/") else f"{path}/"
+
+    def _get(self, path: str, payload: dict | None = None, **extra):
+        return self.client.get(self._canonical_path(path), payload or {}, secure=True, **extra)
+
+    def _post(self, path: str, payload: dict, **extra):
+        return self.client.post(self._canonical_path(path), payload, format="json", secure=True, **extra)
+
+    def test_security_request_helpers_use_canonical_https_paths(self):
+        with mock.patch.object(self.client, "get") as get:
+            self._get("/api/v1/health")
+        get.assert_called_once_with("/api/v1/health/", {}, secure=True)
+
+        with mock.patch.object(self.client, "post") as post:
+            self._post("/api/v1/models/train", {})
+        post.assert_called_once_with("/api/v1/models/train/", {}, format="json", secure=True)
+
     def test_critical_views_have_explicit_throttle_scopes(self):
         expected = {
             ModelTrainView: "icea_train",
@@ -115,30 +134,28 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
     def test_training_rejects_service_role(self):
         self.client.force_authenticate(user=self._user_with_role("service"))
 
-        core = self.client.post("/api/v1/models/train/", {}, format="json")
-        pipeline = self.client.post("/api/v1/pipeline/train/", {}, format="json")
+        core = self._post("/api/v1/models/train/", {})
+        pipeline = self._post("/api/v1/pipeline/train/", {})
 
         self.assertEqual(core.status_code, 403)
         self.assertEqual(pipeline.status_code, 403)
 
     def test_legacy_compute_rejects_aggregate_viewer(self):
         self.client.force_authenticate(user=self._user_with_role("viewer_aggregate"))
-        response = self.client.post(
+        response = self._post(
             "/api/v1/icea/compute/",
             {
                 "model_id": str(self.episode_artifact.id),
                 "data": [self.episodes[0].feature_row.features],
             },
-            format="json",
         )
         self.assertEqual(response.status_code, 403)
 
     def test_conformal_response_suppresses_episode_identifier(self):
         self.client.force_authenticate(user=self._user_with_role("researcher"))
-        response = self.client.post(
+        response = self._post(
             "/api/v1/predict/conformal/",
             {"episode_id": int(self.episodes[0].id), "model_id": str(self.episode_artifact.id)},
-            format="json",
         )
 
         self.assertEqual(response.status_code, 200)
@@ -157,19 +174,17 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
             metrics={},
         )
         self.client.force_authenticate(user=self._user_with_role("researcher"))
-        predict = self.client.post(
+        predict = self._post(
             "/api/v1/predict/conformal/",
             {"episode_id": int(self.episodes[0].id), "model_id": str(artifact.id)},
-            format="json",
         )
         self.assertEqual(predict.status_code, 400)
         self.assertEqual(predict.json()["detail"], "model_not_defensible")
 
         self.client.force_authenticate(user=self._user_with_role("admin"))
-        writeback = self.client.post(
+        writeback = self._post(
             "/api/v1/fhir/writeback/riskassessment/",
             {"episode_id": int(self.episodes[0].id), "model_id": str(artifact.id), "writeback": False},
-            format="json",
         )
         self.assertEqual(writeback.status_code, 400)
         self.assertEqual(writeback.json()["detail"], "model_not_defensible")
@@ -182,7 +197,7 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         )
         self.client.force_authenticate(user=self._user_with_role("admin"))
 
-        response = self.client.get("/api/v1/fhir/writeback/list/")
+        response = self._get("/api/v1/fhir/writeback/list/")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -201,7 +216,7 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         )
         self.client.force_authenticate(user=self._user_with_role("viewer_aggregate"))
 
-        response = self.client.get("/api/v1/dashboard/summary/")
+        response = self._get("/api/v1/dashboard/summary/")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -318,7 +333,7 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         )
         AuditEvent.objects.filter(id=historical_raw.id).update(actor=raw_actor)
         self.client.force_authenticate(user=self._user_with_role("admin"))
-        response = self.client.get("/api/v1/governance/audit/events/")
+        response = self._get("/api/v1/governance/audit/events/")
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -330,14 +345,13 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
     def test_legacy_compute_emits_requested_and_redacted_audit_events(self):
         self.client.force_authenticate(user=self._user_with_role("researcher"))
         with mock.patch("icea_core.views.append_icea_api_audit") as audit:
-            response = self.client.post(
+            response = self._post(
                 "/api/v1/icea/compute/",
                 {
                     "model_id": str(self.episode_artifact.id),
                     "data": [self.episodes[0].feature_row.features],
                     "nurse_cols": ["nurse_hppd"],
                 },
-                format="json",
             )
 
         self.assertEqual(response.status_code, 200)
@@ -479,10 +493,9 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
     def test_permission_denial_remains_fail_closed(self):
         self.client.force_authenticate(user=self.regular_user)
 
-        response = self.client.post(
+        response = self._post(
             "/api/v1/icea-plus/calibrate/",
             {"version": "must-remain-blocked", "spec": {"weights": {"benefit": 1.0}}},
-            format="json",
         )
 
         self.assertEqual(response.status_code, 403)
