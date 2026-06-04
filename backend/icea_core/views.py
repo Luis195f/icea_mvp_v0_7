@@ -8,10 +8,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from icea_pipeline.temporal import validate_temporal_frame
 
+from .api_security import append_icea_api_audit
 from .evidence import build_training_evidence_metadata, summarize_model_evidence
 from .engine import stable_json_dumps
 from .ml import train_xgb_regressor
 from .models import ICEAComputation, ModelArtifact
+from .permissions import ICEAResearcherPermission, ICEATrainingPermission
 from .serializers import (
     ComputeRequestSerializer,
     ModelArtifactSerializer,
@@ -31,6 +33,9 @@ class HealthView(APIView):
 
 
 class ModelListView(APIView):
+    permission_classes = [ICEAResearcherPermission]
+    throttle_scope = "icea_read"
+
     def get(self, request):
         qs = ModelArtifact.objects.order_by("-created_at")
         return Response(ModelArtifactSerializer(qs, many=True).data)
@@ -47,12 +52,23 @@ class ModelTrainView(APIView):
       - params (optional): XGBRegressor kwargs
     """
 
+    permission_classes = [ICEATrainingPermission]
+    throttle_scope = "icea_train"
+
     def post(self, request):
         ser = TrainRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         payload = ser.validated_data
 
         df = pd.DataFrame(payload["dataset"])
+        append_icea_api_audit(
+            request=request,
+            event_type="model_train_requested",
+            context="models/train",
+            action="train",
+            row_count=int(len(df)),
+            status="requested",
+        )
         evidence_model_df = df.reindex(columns=list(payload["features"]) + [str(payload["target"])])
         temporal_issues = validate_temporal_frame(
             df,
@@ -96,11 +112,24 @@ class ModelTrainView(APIView):
             model_path=result.model_path,
             metrics=result.metrics,
         )
+        append_icea_api_audit(
+            request=request,
+            event_type="model_train_completed",
+            context="models/train",
+            action="train",
+            model_id=str(artifact.id),
+            row_count=int(len(df)),
+            evidence_status=summarize_model_evidence(artifact).evidence_status,
+            status="completed",
+        )
         return Response(ModelArtifactSerializer(artifact).data, status=201)
 
 
 class ICEAComputeView(APIView):
     """Retain the legacy compute contract without emitting individual outputs."""
+
+    permission_classes = [ICEAResearcherPermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = ComputeRequestSerializer(data=request.data)
@@ -109,7 +138,27 @@ class ICEAComputeView(APIView):
 
         artifact = ModelArtifact.objects.get(id=payload["model_id"])
         evidence = summarize_model_evidence(artifact)
+        append_icea_api_audit(
+            request=request,
+            event_type="legacy_compute_requested",
+            context="icea/compute",
+            action="compute",
+            model_id=str(artifact.id),
+            row_count=int(len(payload["data"])),
+            evidence_status=evidence.evidence_status,
+            status="requested",
+        )
         if not evidence.defensible:
+            append_icea_api_audit(
+                request=request,
+                event_type="legacy_compute_blocked_model_evidence",
+                context="icea/compute",
+                action="compute",
+                model_id=str(artifact.id),
+                evidence_status=evidence.evidence_status,
+                error_code="model_not_defensible",
+                status="blocked",
+            )
             return Response(
                 {
                     "detail": "model_not_defensible",
@@ -155,6 +204,17 @@ class ICEAComputeView(APIView):
             rows=len(df),
             summary=summary,
             request_hash=request_hash,
+        )
+        append_icea_api_audit(
+            request=request,
+            event_type="legacy_compute_redacted",
+            context="icea/compute",
+            action="compute",
+            model_id=str(artifact.id),
+            row_count=int(len(df)),
+            request_hash=request_hash,
+            status="shadow_only",
+            suppressed=True,
         )
 
         return Response(

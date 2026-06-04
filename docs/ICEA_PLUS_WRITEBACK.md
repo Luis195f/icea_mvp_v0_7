@@ -12,6 +12,7 @@ Individual FHIR RiskAssessment writeback is blocked in shadow mode and does not 
 
 - `GET /api/v1/icea-plus/writeback/patient/`
 - `GET /api/v1/icea-plus/writeback/summary/`
+- `GET /api/v1/fhir/writeback/list/` (legacy aggregate-only export)
 
 ## Patient-level payload
 
@@ -66,6 +67,13 @@ Current degradation rules:
 - cells with fewer than 10 episodes are returned as `suppressed_low_support`
 - staff-sensitive cells require at least 5 staff members when that dimension is requested
 - suppression never uses zero-fill
+- legacy `fhir/writeback/list` groups records by defensible model and suppresses
+  cells below 10; it does not return record ids, episode ids, patient ids,
+  exact timestamps, or individual scores
+
+All writeback/export endpoints require `admin` or `service`, are evidence-gated,
+use `icea_writeback` or `icea_export` throttling, and emit audit events without
+clinical payloads or patient/episode identifiers.
 
 ## HANDOVER guidance
 

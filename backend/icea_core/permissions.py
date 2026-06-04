@@ -32,6 +32,12 @@ from django.core.cache import cache
 
 from rest_framework.permissions import BasePermission
 
+from icea_core.audit_identity import (
+    hash_audit_identity as _audit_identity_hash,
+    safe_caller_audit_identity as _safe_caller_audit_identity,
+    safe_caller_audit_dedupe_identity as _safe_caller_audit_dedupe_identity,
+)
+
 
 ICEA_ROLES = {"viewer_aggregate", "researcher", "admin", "service"}
 ROLE_ALIASES = {
@@ -151,6 +157,54 @@ def _dev_insecure_auth_rbac_bypass_allowed() -> bool:
     )
 
 
+def _normalized_permission_audit_path(request, view) -> str:
+    resolver_match = getattr(request, "resolver_match", None)
+    route = str(getattr(resolver_match, "route", "") or "").strip()
+    if route:
+        normalized = "/" + "/".join(part for part in route.split("/") if part)
+        return normalized or "/"
+    # Raw paths can contain clinical identifiers; the view class is the safe fallback.
+    return view.__class__.__name__
+
+
+def _audit_permission_denial(request, view, *, error_code: str) -> None:
+    try:
+        from icea_core.api_security import append_icea_api_audit
+
+        path = _normalized_permission_audit_path(request, view)
+        method = str(getattr(request, "method", "") or "UNKNOWN").upper()
+        caller_kind, caller_hash = _safe_caller_audit_identity(request)
+        dedupe_caller_kind, dedupe_caller_hash = _safe_caller_audit_dedupe_identity(request)
+        dedupe_material = json.dumps(
+            {
+                "caller_hash": dedupe_caller_hash,
+                "caller_kind": dedupe_caller_kind,
+                "error_code": error_code,
+                "method": method,
+                "path": path,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        audit_key = "icea:permission-denial-audit:" + _audit_identity_hash(dedupe_material)
+        if not cache.add(audit_key, "1", timeout=60):
+            return
+        append_icea_api_audit(
+            request=request,
+            event_type="auth_required" if error_code == "auth_required" else "permission_denied",
+            context=path,
+            actor_override=f"{caller_kind}:{caller_hash}",
+            action=view.__class__.__name__,
+            caller_hash=caller_hash,
+            caller_kind=caller_kind,
+            error_code=error_code,
+            method=method,
+            status="blocked",
+        )
+    except Exception:
+        pass
+
+
 def _load_rbac_rules() -> dict[str, list[str]]:
     """Load RBAC rules from env.
 
@@ -204,6 +258,7 @@ class ICEABackwardCompatiblePermission(BasePermission):
             return dev_insecure
 
         if not _request_is_authenticated(request):
+            _audit_permission_denial(request, view, error_code="auth_required")
             return False
 
         if not rbac_enforce:
@@ -241,7 +296,10 @@ class ICEABackwardCompatiblePermission(BasePermission):
             return True
 
         required = {ROLE_ALIASES.get(r.lower(), r.lower()) for r in matched_roles}
-        return bool(roles.intersection(required))
+        allowed = bool(roles.intersection(required))
+        if not allowed:
+            _audit_permission_denial(request, view, error_code="insufficient_role")
+        return allowed
 
 
 class ICEARolePermission(BasePermission):
@@ -261,6 +319,7 @@ class ICEARolePermission(BasePermission):
     def has_permission(self, request, view) -> bool:
         if self.feature_flag and not _env_flag_enabled(self.feature_flag):
             self.message = f"{self.feature_flag} must be explicitly enabled"
+            _audit_permission_denial(request, view, error_code="feature_disabled")
             return False
 
         if _dev_insecure_auth_rbac_bypass_allowed():
@@ -271,11 +330,15 @@ class ICEARolePermission(BasePermission):
             return True
 
         if not _request_is_authenticated(request):
+            _audit_permission_denial(request, view, error_code="auth_required")
             return False
 
         roles = get_request_roles(request)
         required = {ROLE_ALIASES.get(r.lower(), r.lower()) for r in self.required_roles}
-        return bool(roles.intersection(required))
+        allowed = bool(roles.intersection(required))
+        if not allowed:
+            _audit_permission_denial(request, view, error_code="insufficient_role")
+        return allowed
 
 
 class ICEAAggregateViewerPermission(ICEARolePermission):
@@ -286,6 +349,11 @@ class ICEAAggregateViewerPermission(ICEARolePermission):
 class ICEAResearcherPermission(ICEARolePermission):
     required_roles = {"researcher", "admin", "service"}
     message = "researcher, admin or service role required"
+
+
+class ICEATrainingPermission(ICEARolePermission):
+    required_roles = {"researcher", "admin"}
+    message = "researcher or admin role required"
 
 
 class ICEAAdminPermission(ICEARolePermission):

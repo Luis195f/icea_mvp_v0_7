@@ -240,6 +240,23 @@ Set `ICEA_FEDERATED_SECRET` to require signed updates (header: `X-ICEA-FED-SIG`)
 
 `POST /api/v1/predict/conformal/`
 
+This compatibility endpoint is research/shadow-only. It requires an explicit
+ICEA research-capable role, blocks models without defensible evidence, and
+returns neither an episode identifier nor an individual prediction.
+
+### ICEA API security perimeter
+
+ICEA API routes fail closed by default. Training is limited to
+`researcher/admin`; aggregate reads require an aggregate-capable role; pipeline
+mutations, follow-up, and writeback require `admin/service`; governance exports
+are `admin` only. Scoped throttling is enabled by default for read, compute,
+train, export, and writeback operations.
+
+Legacy compute, conformal prediction, RiskAssessment writeback, dashboard
+summary, and writeback listing remain available only as censored,
+evidence-gated compatibility surfaces. They do not expose an individual score,
+nurse ranking, or unsuppressed low-support export.
+
 ```json
 { "episode_id": 1, "model_id": "<uuid>", "alpha": 0.05 }
 ```

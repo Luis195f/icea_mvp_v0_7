@@ -7,6 +7,7 @@ from django.db import transaction
 from django.utils.dateparse import parse_datetime
 
 from icea_core.models import PatientEpisode
+from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import EpisodeFeatureRow, NormalizedObservation, NormalizedProcedure
 from icea_pipeline.temporal import LEGACY_OUTCOME_STATUS, episode_legacy_temporal_spec
 
@@ -101,4 +102,10 @@ class Command(BaseCommand):
                 )
                 built += 1
 
+        append_audit_event(
+            event_type="build_dataset",
+            payload={"action": "build_dataset", "row_count": int(built), "status": "completed"},
+            context="management/build_dataset",
+            actor="management_command",
+        )
         self.stdout.write(self.style.SUCCESS(f"Built dataset rows: {built} (legacy_outcome_not_defensible)"))

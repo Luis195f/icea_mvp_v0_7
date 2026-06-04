@@ -65,12 +65,17 @@ class ICEAFailClosedSecurityTests(ICEAPlusFixtureMixin, TestCase):
     def _request_cases(self):
         episode = self.episodes[0]
         return [
+            ("models_train", "post", "/api/v1/models/train/", {}),
+            ("legacy_compute", "post", "/api/v1/icea/compute/", {"model_id": str(self.episode_artifact.id), "data": [episode.feature_row.features]}),
             ("icea_plus_score", "post", "/api/v1/icea-plus/score/", {"model_id": str(self.episode_artifact.id), "grain": "episode", "from_db": True}),
             ("icea_plus_calibrate", "post", "/api/v1/icea-plus/calibrate/", {"version": "icea_plus_sec", "spec": {"weights": {"benefit": 1.2}}}),
             ("icea_plus_writeback_patient", "get", "/api/v1/icea-plus/writeback/patient/", {"episode_id": int(episode.id), "model_id": str(self.episode_artifact.id)}),
             ("icea_plus_writeback_summary", "get", "/api/v1/icea-plus/writeback/summary/", {"model_id": str(self.episode_artifact.id)}),
             ("fhir_writeback_riskassessment", "post", "/api/v1/fhir/writeback/riskassessment/", {"episode_id": int(episode.id), "model_id": str(self.episode_artifact.id), "writeback": False}),
             ("fhir_writeback_list", "get", "/api/v1/fhir/writeback/list/", {}),
+            ("pipeline_build_dataset", "post", "/api/v1/pipeline/build-dataset/", {}),
+            ("pipeline_build_windows", "post", "/api/v1/pipeline/build-windows/", {}),
+            ("pipeline_train", "post", "/api/v1/pipeline/train/", {}),
             ("causal_run", "post", "/api/v1/causal/run/", {"spec": self._causal_spec()}),
             ("causal_report", "get", "/api/v1/causal/report/", {"run_id": "00000000-0000-0000-0000-000000000000"}),
             ("causal_discover", "post", "/api/v1/causal/discover/", {"variables": ["ri_initial", "nurse_hppd", "delta_ri"]}),

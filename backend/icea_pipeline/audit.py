@@ -10,6 +10,7 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils import timezone
 
+from icea_core.audit_identity import safe_stored_audit_actor
 from icea_pipeline.models import AuditEvent
 
 
@@ -65,6 +66,7 @@ def append_audit_event(*, event_type: str, payload: Any, context: str = "", acto
 
     try:
         now = timezone.now()
+        actor = safe_stored_audit_actor(actor)
         payload_sha = sha256_hex(_stable_dumps(payload))
 
         last = AuditEvent.objects.order_by("-created_at").only("chain_hash").first()

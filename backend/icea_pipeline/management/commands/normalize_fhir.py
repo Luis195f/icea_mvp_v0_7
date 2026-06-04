@@ -4,6 +4,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from icea_core.models import PatientEpisode
+from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import (
     NormalizedCondition,
     NormalizedObservation,
@@ -56,6 +57,16 @@ class Command(BaseCommand):
                     NormalizedProcedure.objects.create(episode=episode, source_resource=raw, **data)
                     n_proc += 1
 
+        append_audit_event(
+            event_type="normalize_fhir",
+            payload={
+                "action": "normalize",
+                "row_count": int(n_obs + n_cond + n_proc),
+                "status": "completed",
+            },
+            context="management/normalize_fhir",
+            actor="management_command",
+        )
         self.stdout.write(
             self.style.SUCCESS(
                 f"Normalized episode={episode_id}: observations={n_obs}, conditions={n_cond}, procedures={n_proc}"
