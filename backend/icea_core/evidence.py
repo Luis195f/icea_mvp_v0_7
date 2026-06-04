@@ -59,6 +59,14 @@ CASE_MIX_DERIVATION_CANDIDATES = {
     "baseline_risk": ["baseline_risk", "predicted_baseline_risk", "ri_initial"],
     "baseline_load": ["baseline_load", "patient_census", "unit_census", "census", "nurse_hppd"],
 }
+OUTCOME_COMPARABILITY_WARNINGS = frozenset(
+    {
+        "mixed_outcome_horizons",
+        "outcome_window_not_unique",
+        "outcome_definition_not_comparable",
+        "mixed_temporal_spec_versions",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -237,6 +245,68 @@ def _case_mix_support_issue(case_mix_spec: dict[str, Any] | None, observed_colum
     return warnings
 
 
+def _parse_temporal_datetime(value: Any) -> pd.Timestamp | None:
+    try:
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(parsed) else parsed
+
+
+def _training_outcome_comparability(records: list[dict[str, Any]], *, target: str) -> dict[str, Any]:
+    temporal_specs = [row.get("temporal_spec") for row in records if isinstance(row.get("temporal_spec"), dict)]
+    temporal_versions = sorted(
+        {str(spec.get("temporal_spec_version")) for spec in temporal_specs if spec.get("temporal_spec_version")}
+    )
+    horizon_seconds: list[float] = []
+    declared_definitions: set[str] = set()
+    invalid_windows = 0
+
+    for row, spec in (
+        (row, row.get("temporal_spec"))
+        for row in records
+        if isinstance(row.get("temporal_spec"), dict)
+    ):
+        outcome_start = _parse_temporal_datetime(spec.get("outcome_window_start"))
+        outcome_end = _parse_temporal_datetime(spec.get("outcome_window_end"))
+        if outcome_start is None or outcome_end is None or outcome_end <= outcome_start:
+            invalid_windows += 1
+        else:
+            horizon_seconds.append(float((outcome_end - outcome_start).total_seconds()))
+
+        declared_definition = (
+            spec.get("outcome_definition")
+            or spec.get("outcome_target")
+            or row.get("outcome_definition")
+            or row.get("outcome_target")
+        )
+        if declared_definition not in (None, ""):
+            declared_definitions.add(str(declared_definition))
+
+    unique_horizon_seconds = sorted(set(horizon_seconds))
+    warnings: list[str] = []
+    if len(temporal_specs) != len(records) or invalid_windows:
+        warnings.append("outcome_window_not_unique")
+    if len(unique_horizon_seconds) > 1:
+        warnings.extend(["mixed_outcome_horizons", "outcome_window_not_unique"])
+    if len(temporal_versions) > 1:
+        warnings.extend(["mixed_temporal_spec_versions", "outcome_definition_not_comparable"])
+    if declared_definitions and (len(declared_definitions) > 1 or declared_definitions != {str(target)}):
+        warnings.append("outcome_definition_not_comparable")
+
+    unique_horizon_hours = [float(seconds / 3600.0) for seconds in unique_horizon_seconds]
+    return {
+        "status": "comparable" if not warnings else "not_comparable",
+        "warnings": sorted(set(warnings)),
+        "unique_horizon_hours": unique_horizon_hours,
+        "outcome_horizon_hours": unique_horizon_hours[0] if len(unique_horizon_hours) == 1 else None,
+        "declared_outcome_definitions": sorted(declared_definitions),
+        "unique_temporal_spec_versions": temporal_versions,
+        "temporal_spec_row_count": int(len(temporal_specs)),
+        "invalid_outcome_window_count": int(invalid_windows),
+    }
+
+
 def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     metrics = dict(artifact.metrics or {})
     evidence = _metrics_evidence(metrics)
@@ -271,6 +341,21 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     temporal_guardrail_status = str(
         _first_non_empty(evidence.get("temporal_guardrail_status"), metrics.get("temporal_guardrail_status")) or ""
     ).strip()
+    outcome_comparability_status = str(
+        _first_non_empty(evidence.get("outcome_comparability_status"), metrics.get("outcome_comparability_status")) or ""
+    ).strip()
+    outcome_comparability_warnings = sorted(
+        {
+            str(value)
+            for value in _as_list(
+                _first_non_empty(
+                    evidence.get("outcome_comparability_warnings"),
+                    metrics.get("outcome_comparability_warnings"),
+                )
+            )
+            if str(value) in OUTCOME_COMPARABILITY_WARNINGS
+        }
+    )
     limitations = [str(value) for value in _as_list(_first_non_empty(evidence.get("limitations"), metrics.get("limitations"))) if str(value)]
     missing_required_limitations = sorted(REQUIRED_MODEL_LIMITATIONS - set(limitations))
 
@@ -286,6 +371,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         "temporal_guardrail_status": temporal_guardrail_status or None,
         "outcome_definition": _first_non_empty(evidence.get("outcome_definition"), metrics.get("outcome_definition"), artifact.target),
         "outcome_window": _first_non_empty(evidence.get("outcome_window"), metrics.get("outcome_window")),
+        "outcome_comparability_status": outcome_comparability_status or None,
+        "outcome_comparability_warnings": outcome_comparability_warnings,
         "case_mix_spec": case_mix_spec,
         "case_mix_unavailable_reason": _first_non_empty(evidence.get("case_mix_unavailable_reason"), metrics.get("case_mix_unavailable_reason")),
         "intended_use": _first_non_empty(evidence.get("intended_use"), metrics.get("intended_use")),
@@ -338,6 +425,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
             missing.append(f"temporal_guardrail_not_passed:{temporal_guardrail_status}")
         if temporal_guardrail_status in TEMPORAL_SPEC_REQUIRED_STATUSES:
             missing.append("temporal_spec_required")
+    if outcome_comparability_status == "not_comparable" or outcome_comparability_warnings:
+        missing.extend(outcome_comparability_warnings or ["outcome_definition_not_comparable"])
     if missing_required_limitations:
         missing.extend(
             [
@@ -363,6 +452,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
             if temporal_guardrail_status in NOT_EVALUATED_TEMPORAL_GUARDRAIL_STATUSES
             else "temporal_guardrail_not_passed"
         )
+    if outcome_comparability_status == "not_comparable" or outcome_comparability_warnings:
+        statuses.extend(["outcome_definition_not_comparable", *outcome_comparability_warnings])
     if missing_required_limitations:
         statuses.append("limitations_incomplete")
     if case_mix_issue:
@@ -423,6 +514,7 @@ def build_training_evidence_metadata(
     )
     temporal_specs = [row.get("temporal_spec") for row in records if isinstance(row.get("temporal_spec"), dict)]
     temporal_versions = sorted({str(spec.get("temporal_spec_version")) for spec in temporal_specs if spec.get("temporal_spec_version")})
+    outcome_comparability = _training_outcome_comparability(records, target=target)
     outcome_examples = [
         {
             "outcome_window_start": spec.get("outcome_window_start"),
@@ -461,12 +553,20 @@ def build_training_evidence_metadata(
         "declared_features_missing_from_payload": declared_feature_missing,
         "temporal_spec_version": temporal_versions[0] if len(temporal_versions) == 1 else None,
         "temporal_guardrail_status": temporal_guardrail_status,
-        "temporal_guardrail_warnings": sorted(set(temporal_guardrail_warnings or [])),
+        "temporal_guardrail_warnings": sorted(
+            set(list(temporal_guardrail_warnings or []) + list(outcome_comparability["warnings"]))
+        ),
         "outcome_definition": target,
+        "outcome_comparability_status": outcome_comparability["status"],
+        "outcome_comparability_warnings": outcome_comparability["warnings"],
         "outcome_window": {
             "source": "row_temporal_spec",
             "row_count": int(len(temporal_specs)),
             "unique_temporal_spec_versions": temporal_versions,
+            "unique_horizon_hours": outcome_comparability["unique_horizon_hours"],
+            "horizon_hours": outcome_comparability["outcome_horizon_hours"],
+            "invalid_outcome_window_count": outcome_comparability["invalid_outcome_window_count"],
+            "declared_outcome_definitions": outcome_comparability["declared_outcome_definitions"],
             "examples": outcome_examples,
         }
         if temporal_specs

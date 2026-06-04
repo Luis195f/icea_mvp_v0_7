@@ -141,6 +141,13 @@ only by model zero-fill do not count as case-mix evidence. Such declarations are
 recorded with `declared_feature_missing_from_payload` and leave the artifact
 non-defensible when required domains lack real support.
 
+Training evidence also requires one comparable outcome definition across rows.
+Individually valid temporal specs do not make a mixed target defensible:
+different outcome horizons, incompatible temporal-spec versions, or conflicting
+declared outcome definitions produce `mixed_outcome_horizons`,
+`outcome_window_not_unique`, or `outcome_definition_not_comparable` and block
+scoring as `model_not_defensible`.
+
 `/api/v1/models/train/` validates external dataset rows with the same temporal
 frame guardrails used by governed scoring and DB training. Only explicit passing
 statuses such as `temporal_guardrails_passed`, `temporal_spec_valid`, or
@@ -349,6 +356,11 @@ Triggers enriched rescoring only when the repo has sufficient new follow-up supp
 If support is missing, the endpoint returns an explicit non-enriched state instead of
 fabricating a later score.
 
+Evidence-policy blocks are recorded as `governance_blocked`, not `failed`, and
+preserve any prior enriched result for redacted longitudinal display. Technical
+execution errors remain `failed`. Current model evidence still governs whether a
+stored result may contribute to an aggregate writeback.
+
 ### GET `/api/v1/icea-plus/followup/status/`
 
 Returns the longitudinal state for one episode/model pair.
@@ -418,6 +430,7 @@ Optional query params:
 - `complete`: initial score is retained with required components available
 - `enriched_followup`: a later rescore exists and is linked to the initial score
 - `insufficient_evidence`: follow-up did not justify an enriched rescore
+- `governance_blocked`: current model or baseline evidence blocks a new rescore without classifying the record as a technical failure
 - `stale`: new follow-up evidence exists and the record should be rescored
 - `failed`: an enriched rescore attempt failed, while the initial score remains available
 - `pending_followup`: no usable new follow-up evidence has been observed

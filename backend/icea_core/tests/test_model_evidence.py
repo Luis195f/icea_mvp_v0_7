@@ -9,7 +9,12 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from icea_core.evidence import INTENDED_USE_SHADOW_AGGREGATE, summarize_model_evidence
-from icea_core.followup import INTERNAL_AGGREGATE_ROW_KEY, build_patient_summary, build_summary_writeback
+from icea_core.followup import (
+    INTERNAL_AGGREGATE_ROW_KEY,
+    FollowupEvaluation,
+    build_patient_summary,
+    build_summary_writeback,
+)
 from icea_core.models import ICEAPlusComputation, ICEAPlusFollowupRecord, ModelArtifact
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_pipeline.models import EpisodeWindowFeatureRow
@@ -214,6 +219,18 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
                 exploratory_only=True,
             )
 
+    def _sufficient_followup_evaluation(self):
+        return FollowupEvaluation(
+            evidence_types=["test_followup"],
+            evidence_summary={"test_followup": True},
+            support={"sufficient_for_rescore": True},
+            warnings=[],
+            sufficient_for_rescore=True,
+            followup_status="stale",
+            last_followup_at=self.now,
+            feature_snapshot_hash="followup-snapshot",
+        )
+
     def test_score_with_incomplete_evidence_does_not_return_defensible_score(self):
         artifact = create_artifact(evidence_pack=complete_evidence_pack(dataset_hash=None, dataset_fingerprint=None))
 
@@ -270,6 +287,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         *,
         temporal_spec=True,
         invalid_temporal_spec=False,
+        mixed_outcome_horizons=False,
         include_real_case_mix=True,
         provide_case_mix_spec=True,
     ):
@@ -297,7 +315,13 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
                     "feature_window_start": "2026-03-01T08:00:00Z",
                     "feature_window_end": feature_end,
                     "outcome_window_start": outcome_start,
-                    "outcome_window_end": "2026-03-02T08:00:00Z",
+                    "outcome_window_end": (
+                        "2026-03-02T20:00:00Z"
+                        if mixed_outcome_horizons and i % 2 == 0
+                        else "2026-03-02T02:00:00Z"
+                        if mixed_outcome_horizons
+                        else "2026-03-02T08:00:00Z"
+                    ),
                     "censoring_reason": "not_censored",
                 }
             rows.append(row)
@@ -371,6 +395,74 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["temporal_guardrail_status"], "temporal_guardrails_passed")
         self.assertEqual(body["limitations_status"], "limitations_complete")
         self.assertEqual(body["intended_use"], INTENDED_USE_SHADOW_AGGREGATE)
+        evidence = body["metrics"]["evidence_pack"]
+        self.assertEqual(evidence["outcome_comparability_status"], "comparable")
+        self.assertEqual(evidence["outcome_window"]["horizon_hours"], 12.0)
+        self.assertEqual(evidence["outcome_comparability_warnings"], [])
+
+    def test_models_train_with_mixed_outcome_horizons_is_not_defensible(self):
+        with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
+            response = self.client.post(
+                "/api/v1/models/train/",
+                self._external_training_payload(mixed_outcome_horizons=True),
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertEqual(body["evidence_status"], "evidence_incomplete")
+        self.assertIn("mixed_outcome_horizons", body["missing_evidence"])
+        evidence = body["metrics"]["evidence_pack"]
+        self.assertEqual(evidence["outcome_comparability_status"], "not_comparable")
+        self.assertIn("mixed_outcome_horizons", evidence["outcome_comparability_warnings"])
+        self.assertIn("outcome_window_not_unique", evidence["outcome_comparability_warnings"])
+        self.assertEqual(evidence["outcome_window"]["unique_horizon_hours"], [6.0, 24.0])
+        self.assertIsNone(evidence["outcome_window"]["horizon_hours"])
+
+        models_response = self.client.get("/api/v1/models/")
+        model = next(item for item in models_response.json() if item["id"] == body["id"])
+        self.assertIn("mixed_outcome_horizons", model["missing_evidence"])
+
+        score_response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": body["id"], "grain": "episode", "from_db": True},
+            format="json",
+        )
+        self.assertEqual(score_response.status_code, 400)
+        self.assertEqual(score_response.json()["detail"], "model_not_defensible")
+
+        aggregate_response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {"model_id": body["id"], "grain": "episode", "group_by": "unit"},
+        )
+        self.assertEqual(aggregate_response.status_code, 400)
+        self.assertEqual(aggregate_response.json()["detail"], "model_not_defensible")
+        self.assertNotIn("results", aggregate_response.json())
+
+    def test_models_train_with_inconsistent_outcome_definition_is_not_defensible(self):
+        payload = self._external_training_payload()
+        payload["dataset"][0]["temporal_spec"]["outcome_definition"] = "mortality_24h"
+        with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        self.assertIn("outcome_definition_not_comparable", body["missing_evidence"])
+
+    def test_models_train_with_mixed_temporal_versions_is_not_defensible(self):
+        payload = self._external_training_payload()
+        payload["dataset"][0]["temporal_spec"]["temporal_spec_version"] = "icea_temporal_v2"
+        with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
+            response = self.client.post("/api/v1/models/train/", payload, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertFalse(body["defensible"])
+        evidence = body["metrics"]["evidence_pack"]
+        self.assertIn("mixed_temporal_spec_versions", evidence["outcome_comparability_warnings"])
+        self.assertIn("outcome_definition_not_comparable", body["missing_evidence"])
 
     def test_declared_case_mix_features_missing_from_payload_do_not_support_case_mix(self):
         payload = self._external_training_payload(include_real_case_mix=False)
@@ -726,6 +818,79 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(body["primary_model_evidence_status"], "evidence_complete")
         self.assertEqual(body["baseline_model_evidence_status"], "evidence_incomplete")
         self.assertNotIn("results", body)
+
+    def test_followup_governance_block_preserves_prior_enriched_result_without_failed_state(self):
+        self._create_followup_records(artifact=self.episode_artifact, count=1)
+        record = ICEAPlusFollowupRecord.objects.get(episode=self.episodes[0], model=self.episode_artifact)
+        prior_enriched_result = dict(record.initial_result)
+        prior_enriched_result["row_id"] = "prior-enriched"
+        record.enriched_result = prior_enriched_result
+        record.followup_status = "enriched_followup"
+        record.current_state = "enriched_followup"
+        record.save(update_fields=["enriched_result", "followup_status", "current_state"])
+
+        invalidated_pack = complete_evidence_pack(dataset_fingerprint=None, dataset_hash=None)
+        self.episode_artifact.metrics = {
+            **dict(self.episode_artifact.metrics or {}),
+            "evidence_pack": invalidated_pack,
+        }
+        self.episode_artifact.save(update_fields=["metrics"])
+
+        with mock.patch(
+            "icea_core.followup.evaluate_followup",
+            return_value=self._sufficient_followup_evaluation(),
+        ):
+            response = self.client.post(
+                "/api/v1/icea-plus/followup/rescore/",
+                {
+                    "episode_id": int(self.episodes[0].id),
+                    "model_id": str(self.episode_artifact.id),
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "model_not_defensible")
+        record.refresh_from_db()
+        self.assertEqual(record.followup_status, "governance_blocked")
+        self.assertEqual(record.current_state, "governance_blocked")
+        self.assertNotEqual(record.followup_status, "failed")
+        self.assertEqual(record.enriched_result, prior_enriched_result)
+        self.assertEqual(record.provenance["governance_block"]["detail"], "model_not_defensible")
+        self.assertIn("dataset_fingerprint", record.provenance["governance_block"]["missing_evidence"])
+        self.assertIn("model_not_defensible", record.provenance["governance_block"]["warnings"])
+
+        patient_summary = build_patient_summary(record)
+        self.assertEqual(patient_summary["current_score"]["source_status"], prior_enriched_result["status"])
+        self.assertIsNone(patient_summary["current_score"]["score"])
+        aggregate_summary = build_summary_writeback(artifact=self.episode_artifact, group_by="unit")
+        self.assertEqual(aggregate_summary["detail"], "model_not_defensible")
+        self.assertEqual(aggregate_summary["results"], [])
+
+    def test_followup_technical_rescore_error_still_marks_failed(self):
+        self._create_followup_records(artifact=self.episode_artifact, count=1)
+
+        with (
+            mock.patch(
+                "icea_core.followup.evaluate_followup",
+                return_value=self._sufficient_followup_evaluation(),
+            ),
+            mock.patch("icea_core.followup._score_episode_from_request", side_effect=RuntimeError("technical_failure")),
+        ):
+            response = self.client.post(
+                "/api/v1/icea-plus/followup/rescore/",
+                {
+                    "episode_id": int(self.episodes[0].id),
+                    "model_id": str(self.episode_artifact.id),
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        record = ICEAPlusFollowupRecord.objects.get(episode=self.episodes[0], model=self.episode_artifact)
+        self.assertEqual(record.followup_status, "failed")
+        self.assertEqual(record.current_state, "failed")
+        self.assertIn("rescore_failed:RuntimeError", record.warnings)
 
     def test_writeback_patient_returns_controlled_model_evidence_block_without_record(self):
         artifact = create_artifact(

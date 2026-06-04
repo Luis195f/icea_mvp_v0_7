@@ -100,7 +100,7 @@ def _initial_state(row_status: str | None) -> str:
 def _derive_current_state(record: ICEAPlusFollowupRecord) -> str:
     if record.followup_status == "enriched_followup" and record.enriched_result:
         return "enriched_followup"
-    if record.followup_status in {"stale", "failed", "insufficient_evidence"}:
+    if record.followup_status in {"stale", "failed", "insufficient_evidence", "governance_blocked"}:
         return record.followup_status
     if record.initial_state:
         return record.initial_state
@@ -826,14 +826,50 @@ def rescore_followup(
             artifact=artifact,
             request_config=merged_request,
         )
+    except ScoringBlockedError as exc:
+        block = dict(exc.result)
+        block_detail = str(block.get("detail") or "scoring_blocked")
+        record.followup_status = "governance_blocked"
+        record.current_state = "governance_blocked"
+        record.warnings = sorted(
+            set(
+                list(record.warnings or [])
+                + list(block.get("statuses") or [])
+                + [block_detail, "followup_rescore_governance_blocked"]
+            )
+        )
+        record.provenance = {
+            **dict(record.provenance or {}),
+            "governance_block": {
+                "detail": block_detail,
+                "evidence_status": block.get("evidence_status"),
+                "missing_evidence": list(block.get("missing_evidence") or []),
+                "warnings": sorted(
+                    set(list(block.get("warnings") or []) + list(block.get("statuses") or []) + [block_detail])
+                ),
+                "baseline_model_evidence_status": block.get("baseline_model_evidence_status"),
+                "baseline_model_missing_evidence": list(block.get("baseline_model_missing_evidence") or []),
+                "blocked_at": timezone.now().isoformat(),
+            },
+        }
+        record.last_followup_at = evaluation.last_followup_at
+        record.save(
+            update_fields=[
+                "followup_status",
+                "current_state",
+                "warnings",
+                "provenance",
+                "last_followup_at",
+                "updated_at",
+            ]
+        )
+        raise
     except Exception as exc:
         record.followup_status = "failed"
         record.current_state = _derive_current_state(record)
         record.warnings = sorted(set(list(record.warnings or []) + [f"rescore_failed:{exc.__class__.__name__}"]))
         record.last_followup_at = evaluation.last_followup_at
         record.save(update_fields=["followup_status", "current_state", "warnings", "last_followup_at", "updated_at"])
-        if isinstance(exc, ScoringBlockedError):
-            raise
         return record
 
     computation = _computation_from_result(
@@ -890,13 +926,13 @@ def rescore_followup(
 
 
 def _effective_result(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
-    if record.followup_status == "enriched_followup" and record.enriched_result:
+    if record.enriched_result:
         return _public_stored_result(record.enriched_result or {})
     return _public_stored_result(record.initial_result or {})
 
 
 def _effective_aggregate_result(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
-    if record.followup_status == "enriched_followup" and record.enriched_result:
+    if record.enriched_result:
         return _aggregate_stored_result(record.enriched_result or {})
     return _aggregate_stored_result(record.initial_result or {})
 
@@ -909,7 +945,7 @@ def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
 
     initial_score = _compact_score_payload(record.initial_result or {}, scored_at=initial_computed_at)
     enriched_score = _compact_score_payload(record.enriched_result or {}, scored_at=enriched_computed_at) if record.enriched_result else None
-    current_score = enriched_score if record.followup_status == "enriched_followup" and enriched_score else initial_score
+    current_score = enriched_score if enriched_score else initial_score
 
     delta_score = None
 
@@ -1034,6 +1070,7 @@ def build_summary_writeback(
         "complete": int(qs.filter(current_state="complete").count()),
         "enriched_followup": int(qs.filter(current_state="enriched_followup").count()),
         "insufficient_evidence": int(qs.filter(current_state="insufficient_evidence").count()),
+        "governance_blocked": int(qs.filter(current_state="governance_blocked").count()),
         "stale": int(qs.filter(current_state="stale").count()),
         "failed": int(qs.filter(current_state="failed").count()),
     }
