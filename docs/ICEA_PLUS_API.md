@@ -78,6 +78,135 @@ contains statuses such as `insufficient_temporal_spec`, `temporal_leakage_blocke
 - `/causal/run/` and `/causal/simulate/` return `causal_available=false` when treatment, confounders, and outcome ordering cannot be proven.
 - Aggregate endpoints warn `no_comparable_without_case_mix` when unit/date/shift comparisons lack explicit case-mix specification.
 
+### Model Evidence Governance
+
+`/api/v1/models/` enriches each `ModelArtifact` with `evidence_status`,
+`defensible`, `missing_evidence`, `intended_use`, `limitations`,
+`temporal_spec_version`, `case_mix_status`, `calibration_status`, and
+`validation_status`. It does not label incomplete artifacts as `ready`,
+`validated`, or `production`.
+
+`/api/v1/icea-plus/score/` and the legacy `/api/v1/icea/compute/` fail closed
+with `detail=model_not_defensible` before computing scores when the selected
+model lacks the minimum evidence pack. The response includes `missing_evidence`
+and statuses such as `evidence_incomplete`, `calibration_unavailable`,
+`validation_unavailable`, and `case_mix_insufficient`; it does not include row
+results or numeric score claims.
+
+When `baseline_model_id` is supplied, the baseline artifact passes the same
+model-evidence gate before its predictions can contribute to benefit or ICEA+
+scoring. Missing or non-defensible baselines return
+`baseline_model_not_found` or `baseline_model_not_defensible` without row
+results. Responses distinguish `primary_model_evidence_status` from
+`baseline_model_evidence_status`.
+
+The minimum model evidence pack is stored in `ModelArtifact.metrics.evidence_pack`
+when available and must trace:
+
+- `model_id` and `artifact_created_at`
+- `dataset_fingerprint` or `dataset_hash`
+- positive integer `training_row_count`
+- positive integer `validation_row_count`
+- `feature_names`
+- `observed_feature_columns`
+- `feature_support_status=supported`
+- `temporal_spec_version` and `temporal_guardrail_status`
+- `outcome_definition` and `outcome_window`
+- `case_mix_spec` or `case_mix_unavailable_reason`
+- `intended_use=shadow_aggregate_research`
+- `non_individual_use=true` and `shadow_mode=true`
+- `calibration_summary` or `calibration_unavailable_reason`
+- `validation_metrics` or `validation_unavailable_reason`
+- `limitations`
+- provenance/source commit or an explicit unavailable reason
+
+`validation_unavailable_reason` records why validation evidence is absent, but
+does not replace a positive `validation_row_count` or make a model defendible.
+Zero, negative, string, missing, or otherwise invalid training/validation row
+counts fail closed as incomplete model evidence.
+
+Every declared model feature must be present with at least one real, non-null
+value in the raw training dataset. Declared-but-absent, entirely empty/NaN, or
+zero-filled-only features set `feature_support_status=incomplete` and invalidate
+defensibility. Compatibility zero-fill is not training evidence. Legacy or
+imported evidence packs without positive observed-feature support also fail
+closed until that support can be audited from real training data.
+
+`calibration_unavailable`, `validation_unavailable`, and
+`case_mix_insufficient` are not validation claims. They are audit statuses that
+prevent a model from being presented as defendible. `shadow_aggregate_research`
+means aggregate, exploratory monitoring only; it is not clinical validation and
+is not MDR production readiness.
+
+The optional Docker `seed_demo` command uses the same evidence gate as every
+other training route. It generates deterministic synthetic rows with observed
+feature, temporal, outcome, validation, calibration, and case-mix support, then
+registers the artifact only when it is defensible for
+`shadow_aggregate_research`. This demo status is not a clinical validation
+claim, is not MDR production readiness, and never permits individual
+decisioning or individual score exposure.
+
+The legacy `POST /icea/compute/` route is retained as a controlled compatibility
+surface, but it does not execute or return individual `predictions`, `icea`,
+`contributions`, scores, or numeric summaries. Successful requests return
+`status=shadow_only`, `score_summary_redacted=true`, `results={}`,
+`shadow_mode=true`, and `non_individual_use=true`. Non-defensible models remain
+blocked before computation.
+
+An evidence pack must declare `feature_names` matching the current
+`ModelArtifact.features` sequence. Order is part of the model contract because
+training and inference construct the model matrix in that order. Adding,
+removing, reordering, or attaching evidence for different features produces
+`feature_names_mismatch` and makes the model non-defensible until it is
+retrained and supplied with matching evidence.
+
+Training endpoints accept an optional `case_mix_spec` object. A sufficient spec
+must declare the required case-mix domains consumed by
+`validate_case_mix_spec`: `age`, `severity`, `comorbidity`,
+`fragility_or_dependency`, `baseline_risk`, and `baseline_load`, either through
+`domains` or `variables`. If `case_mix_spec` is omitted, training derives one
+only when training columns clearly cover every required domain; derived specs are
+marked `source=derived_from_training_data`. If the domains cannot be derived,
+the model is still registered for auditability but remains
+`model_not_defensible` / `case_mix_insufficient`.
+
+When `variables` is a list, each value declares both the required domain and the
+training column with the same name. Dictionary-form `domains` or `variables`
+may map a domain to one or more observed training columns. Contradictory
+declarations, missing columns, and columns containing only null values do not
+satisfy case-mix support.
+
+Case-mix derivation and validation use only columns that are actually present in
+the training payload/model frame and contain at least one observed value.
+Declared features that are absent from every row, entirely empty, or introduced
+only by model zero-fill do not count as case-mix evidence. Such declarations are
+recorded with `declared_feature_missing_from_payload` and leave the artifact
+non-defensible when required domains lack real support.
+
+Training evidence also requires one comparable outcome definition across rows.
+Individually valid temporal specs do not make a mixed target defensible:
+different outcome horizons, incompatible temporal-spec versions, or conflicting
+declared outcome definitions produce `mixed_outcome_horizons`,
+`outcome_window_not_unique`, or `outcome_definition_not_comparable` and block
+scoring as `model_not_defensible`.
+
+`/api/v1/models/train/` validates external dataset rows with the same temporal
+frame guardrails used by governed scoring and DB training. Only explicit passing
+statuses such as `temporal_guardrails_passed`, `temporal_spec_valid`, or
+`passed` can support a defendible model. `not_evaluated_external_payload`,
+`insufficient_temporal_spec`, `temporal_leakage_blocked`,
+`legacy_outcome_not_defensible`, and unknown states are blocking.
+
+Defendible model evidence must also include the canonical minimum limitations:
+
+- `shadow_aggregate_research_only`
+- `not_for_individual_decisioning`
+- `not_mdr_production_ready`
+
+An arbitrary non-empty limitations note is insufficient. `/api/v1/models/`
+exposes `limitations_status` and `temporal_guardrail_status` alongside
+`missing_evidence`.
+
 #### Response sketch
 
 ```json
@@ -95,58 +224,48 @@ contains statuses such as `insufficient_temporal_spec`, `temporal_leakage_blocke
     "rows_scored": 12,
     "baseline_mode": "counterfactual_nursing_reference",
     "causal_available": true,
-    "default_pilot_weights": {
-      "intercept": 0.0,
-      "benefit": 1.0,
-      "attribution": 1.0,
-      "causal": 1.0,
-      "quality": 1.0,
-      "uncertainty": 1.0
-    },
     "status_counts": {
       "complete": 10,
       "provisional": 2,
       "insufficient_evidence": 0
     },
-    "component_means": {
-      "benefit": 0.31,
-      "attribution": 0.18,
-      "causal": 0.11,
-      "quality": 0.22,
-      "uncertainty": -0.09
-    }
+    "score_summary": null,
+    "score_summary_redacted": true,
+    "summary_redacted": true,
+    "redaction_reason": "non_individual_shadow_mode"
   },
   "results": [
     {
       "row_id": "episode:101",
-      "status": "complete",
+      "status": "shadow_only",
       "provisional": false,
-      "score": 67.4,
-      "raw_score": 0.73,
-      "confidence": {"value": 0.81, "label": "high"},
+      "score": null,
+      "raw_score": null,
+      "score_suppressed": true,
+      "derived_values_redacted": true,
       "flags": {
         "causal_available": true,
         "low_support": false,
         "high_uncertainty": false,
         "missing_key_inputs": false,
-        "insufficient_evidence": false
-      },
-      "components": {
-        "benefit": {"raw": 0.9, "normalized": 0.4, "available": true},
-        "attribution": {"raw": 0.12, "normalized": 0.2, "available": true},
-        "causal": {"raw": 0.3, "normalized": 0.1, "available": true},
-        "quality": {"raw": 0.8, "normalized": 0.3, "available": true},
-        "uncertainty": {"raw": 0.2, "normalized": -0.1, "available": true}
-      },
-      "legacy_icea": {
-        "nursing_shap_sum": 0.41,
-        "prediction": 9.5,
-        "baseline_expected": 8.1
+        "insufficient_evidence": false,
+        "shadow_mode": true,
+        "non_individual_use": true
       }
     }
-  ]
+  ],
+  "score_summary": null,
+  "score_summary_redacted": true,
+  "summary_redacted": true,
+  "redaction_reason": "non_individual_shadow_mode"
 }
 ```
+
+The row-level score response is intentionally allow-listed. It never exports
+individual numeric derivatives such as confidence, predictions, baselines,
+benefit, component breakdowns, SHAP/contributions, uncertainty, legacy ICEA,
+aggregation support, or lineage transformations. Full numeric rows remain
+internal and are only consumed by governed aggregate and follow-up workflows.
 
 ### GET `/api/v1/icea-plus/explain/`
 
@@ -170,6 +289,7 @@ Aggregates ICEA+ scores over DB-backed cohorts.
 - `date_to=<iso-datetime>` optional
 - `formula_version=<version>` optional
 - `causal_run_id=<uuid>` optional
+- `baseline_model_id=<uuid>` optional; must reference a defensible model artifact
 - `outcome_goal=higher_is_better|lower_is_better|adverse_event` optional
 
 Individualizable groupings (`patient`, `episode`, `window`, `nurse`) are accepted only for backward-compatible query parsing and fall back to `unit`. `team` also falls back to `unit`. `shift` is deidentified to a unit/date bucket and is suppressed unless support thresholds are met.
@@ -268,6 +388,11 @@ Triggers enriched rescoring only when the repo has sufficient new follow-up supp
 If support is missing, the endpoint returns an explicit non-enriched state instead of
 fabricating a later score.
 
+Evidence-policy blocks are recorded as `governance_blocked`, not `failed`, and
+preserve any prior enriched result for redacted longitudinal display. Technical
+execution errors remain `failed`. Current model evidence still governs whether a
+stored result may contribute to an aggregate writeback.
+
 ### GET `/api/v1/icea-plus/followup/status/`
 
 Returns the longitudinal state for one episode/model pair.
@@ -280,6 +405,10 @@ Required query params:
 ### GET `/api/v1/icea-plus/writeback/patient/`
 
 Stable episode JSON summary for service follow-up. It is shadow-only: `initial_score`, `enriched_score`, and `current_score` retain lineage and state but suppress `score` and `raw_score`.
+If no follow-up record exists and current model evidence blocks bootstrap scoring,
+the endpoint returns a controlled `model_not_defensible` response instead of a
+server error. Existing legacy records remain score-redacted and expose current
+model evidence status.
 
 Required query params:
 
@@ -289,6 +418,13 @@ Required query params:
 ### GET `/api/v1/icea-plus/writeback/summary/`
 
 Stable aggregate JSON summary. Results include support counts, suppression flags, and governance metadata and are the only exportable ICEA+ writeback surface.
+
+Stored follow-up results do not replace the current model evidence pack. Before
+reading internal aggregate rows, the endpoint revalidates the selected artifact
+and any stored dedicated baseline model. A missing, invalidated, or
+non-defensible model returns a controlled `model_not_defensible` or
+`baseline_model_not_defensible` response with no numeric aggregate. Records from
+different models or baseline modes are not silently mixed.
 
 Required query params:
 
@@ -326,9 +462,15 @@ Optional query params:
 - `complete`: initial score is retained with required components available
 - `enriched_followup`: a later rescore exists and is linked to the initial score
 - `insufficient_evidence`: follow-up did not justify an enriched rescore
+- `governance_blocked`: current model or baseline evidence blocks a new rescore without classifying the record as a technical failure
 - `stale`: new follow-up evidence exists and the record should be rescored
 - `failed`: an enriched rescore attempt failed, while the initial score remains available
 - `pending_followup`: no usable new follow-up evidence has been observed
+
+Initial follow-up state is derived from the internal aggregate-only scoring row
+when available. The public patient/episode row remains `shadow_only` and
+score-redacted, and is never used to infer whether the internal scoring result
+was `complete`, `provisional`, or `insufficient_evidence`.
 
 ### Typed errors for follow-up and writeback
 

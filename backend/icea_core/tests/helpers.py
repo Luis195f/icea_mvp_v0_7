@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
+from icea_core.evidence import INTENDED_USE_SHADOW_AGGREGATE, MINIMUM_LIMITATIONS, dataset_fingerprint_for_records
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import Hospital, ModelArtifact, PatientEpisode, Unit
 from icea_pipeline.models import (
@@ -219,11 +220,55 @@ class ICEAPlusFixtureMixin:
             target="delta_ri",
             model_dir=settings.ICEA_MODEL_DIR,
             params={"n_estimators": 20, "max_depth": 3, "learning_rate": 0.1, "subsample": 1.0, "colsample_bytree": 1.0},
+            test_size=0.3,
         )
         metrics = dict(result.metrics)
         metrics["feature_stats"] = {
             "mean": frame[features].mean(numeric_only=True).to_dict(),
             "std": frame[features].std(numeric_only=True, ddof=0).replace(0, 1.0).to_dict(),
+        }
+        conformal = metrics.get("conformal") if isinstance(metrics.get("conformal"), dict) else None
+        validation_metrics = {key: metrics[key] for key in ("rmse", "mae") if key in metrics}
+        dataset_fingerprint = dataset_fingerprint_for_records(
+            frame.where(pd.notnull(frame), None).to_dict(orient="records"),
+            target="delta_ri",
+            features=features,
+            grain="test_fixture",
+        )
+        metrics["evidence_pack"] = {
+            "dataset_fingerprint": dataset_fingerprint,
+            "dataset_hash": dataset_fingerprint,
+            "training_row_count": int(len(frame) - int((conformal or {}).get("calibration_size") or 0)),
+            "validation_row_count": int((conformal or {}).get("calibration_size") or max(1, len(frame) // 5)),
+            "feature_names": list(features),
+            "observed_feature_columns": list(features),
+            "feature_support_status": "supported",
+            "feature_warnings": [],
+            "declared_features_missing_from_payload": [],
+            "features_without_observed_training_values": [],
+            "temporal_spec_version": "icea_temporal_v1",
+            "temporal_guardrail_status": "passed",
+            "outcome_definition": "delta_ri",
+            "outcome_window": {"horizon": "fixture_fixed_future_horizon", "source": "test_fixture"},
+            "case_mix_spec": {
+                "source": "test_fixture_declared",
+                "domains": {
+                    "age": ["age_years"],
+                    "severity": ["ri_initial"],
+                    "comorbidity": ["charlson_index"],
+                    "fragility_or_dependency": ["frailty_score"],
+                    "baseline_risk": ["ri_initial"],
+                    "baseline_load": ["nurse_hppd"],
+                },
+                "variables": ["age_years", "ri_initial", "charlson_index", "frailty_score", "nurse_hppd"],
+            },
+            "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            "calibration_summary": {"method": "conformal_residual_quantile", "conformal": conformal},
+            "validation_metrics": validation_metrics,
+            "limitations": MINIMUM_LIMITATIONS,
+            "source_commit_unavailable_reason": "test_fixture_no_source_commit",
         }
         return ModelArtifact.objects.create(
             name=name,

@@ -72,11 +72,44 @@ Current explicit states:
 - `legacy_outcome_not_defensible`: the target is based on discharge/final/last-stay information rather than a fixed future horizon.
 - `insufficient_outcome_evidence`: the outcome window is censored or unobserved; no outcome is fabricated.
 - `case_mix_insufficient`: aggregate comparison lacks explicit baseline adjustment domains.
+- `model_not_defensible`: the selected `ModelArtifact` lacks required evidence, governance flags, calibration, validation, or case-mix support.
+- `calibration_unavailable`: calibration was not computed or support was insufficient; no calibration value is fabricated.
+- `validation_unavailable`: validation metrics were not computed or cannot be traced; no validation value is fabricated.
 
 SHAP and feature importance remain predictive explanations only. They are not causal
 attribution for an individual patient, nurse, shift, or unit. Unit comparisons require
 support thresholds plus case-mix warnings unless age, severity, comorbidity,
 fragility/dependence, baseline risk, and baseline load are declared.
+
+## Model Evidence Pack
+
+ICEA+ treats model governance as part of the scoring contract. A model can only
+be considered defendible for the implemented shadow aggregate research surface
+when its artifact traces dataset identity, row counts, feature names, temporal
+specification, temporal guardrail outcome, outcome definition/window, case-mix
+specification, intended use, non-individual/shadow flags, calibration summary,
+validation metrics, limitations, and provenance or an explicit unavailable
+reason.
+
+Unavailable reasons are allowed for audit completeness, but they do not become
+positive evidence. A model with `calibration_unavailable`,
+`validation_unavailable`, or `case_mix_insufficient` remains non-defensible.
+This prevents a score or model card from quietly converting missing evidence
+into a validity claim.
+
+Temporal model evidence is similarly fail-closed. A non-empty status is not
+enough: only a known passing temporal guardrail status can support
+defensibility. External payloads that were not evaluated, lack temporal specs,
+or fail leakage checks remain `model_not_defensible`.
+
+Model limitations are a required governance control, not free-form decoration.
+Every defendible artifact must state that it is shadow aggregate research only,
+not for individual decisioning, and not MDR production-ready.
+
+For aggregate shadow reports, ICEA+ may use internal row-level numeric values
+only as an intermediate input to suppressed, k-anonymous aggregate cells. Public
+row responses remain `shadow_only` with `score=null` and `raw_score=null`; the
+internal values are not a patient, episode, nurse, team, or shift score.
 
 ## Formal definition
 

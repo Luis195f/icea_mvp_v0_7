@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -15,15 +16,28 @@ from icea_core.aggregation import (
     aggregate_scored_rows,
     governance_export_metadata,
 )
+from icea_core.evidence import INTENDED_USE_SHADOW_AGGREGATE, ModelEvidenceSummary, summarize_model_evidence
 from icea_core.models import (
     ICEAPlusComputation,
     ICEAPlusFollowupRecord,
     ModelArtifact,
     PatientEpisode,
 )
-from icea_core.scoring import score_icea_plus, select_formula
+from icea_core.scoring import redact_shadow_score_response, score_icea_plus, select_formula
 from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import EpisodeWindow, FHIRWritebackRecord, NormalizedObservation, NormalizedProcedure
+
+
+INTERNAL_AGGREGATE_ROW_KEY = "_aggregate_row"
+WRITEBACK_MODEL_EVIDENCE_WARNING = "writeback_summary_blocked_by_current_model_evidence"
+WRITEBACK_BASELINE_EVIDENCE_WARNING = "writeback_summary_blocked_by_current_baseline_evidence"
+WRITEBACK_MIXED_BASELINE_WARNING = "writeback_summary_mixed_baseline_models_not_aggregable"
+
+
+class ScoringBlockedError(ValueError):
+    def __init__(self, result: dict[str, Any]):
+        self.result = dict(result)
+        super().__init__(str(result.get("detail") or "scoring_blocked"))
 
 
 @dataclass
@@ -83,10 +97,17 @@ def _initial_state(row_status: str | None) -> str:
     return "insufficient_evidence"
 
 
+def _initial_followup_status(row_status: str | None) -> str:
+    initial_state = _initial_state(row_status)
+    if initial_state in {"failed", "insufficient_evidence"}:
+        return initial_state
+    return "pending_followup"
+
+
 def _derive_current_state(record: ICEAPlusFollowupRecord) -> str:
     if record.followup_status == "enriched_followup" and record.enriched_result:
         return "enriched_followup"
-    if record.followup_status in {"stale", "failed", "insufficient_evidence"}:
+    if record.followup_status in {"stale", "failed", "insufficient_evidence", "governance_blocked"}:
         return record.followup_status
     if record.initial_state:
         return record.initial_state
@@ -134,8 +155,10 @@ def _latest(*values: datetime | None) -> datetime | None:
 
 
 def _nurse_reliability_warning(result_row: dict[str, Any]) -> list[str]:
-    reliability = float(((result_row.get("aggregation") or {}).get("nurse_reliability")) or 0.0)
-    shares = dict((result_row.get("aggregation") or {}).get("nurse_shares") or {})
+    aggregate_row = result_row.get(INTERNAL_AGGREGATE_ROW_KEY)
+    source = aggregate_row if isinstance(aggregate_row, dict) else result_row
+    reliability = float(((source.get("aggregation") or {}).get("nurse_reliability")) or 0.0)
+    shares = dict((source.get("aggregation") or {}).get("nurse_shares") or {})
     if reliability < 0.60 or not shares:
         return ["non_individual_use_team_or_unit_only", "low_support"]
     return ["non_individual_use_team_or_unit_only"]
@@ -144,18 +167,19 @@ def _nurse_reliability_warning(result_row: dict[str, Any]) -> list[str]:
 def _compact_score_payload(result_row: dict[str, Any], *, scored_at: datetime | None) -> dict[str, Any]:
     if not result_row:
         return {}
-    lineage = dict(result_row.get("lineage") or {})
+    public_row = redact_shadow_score_response({"results": [_public_stored_result(result_row)]})["results"][0]
+    lineage = dict(public_row.get("lineage") or {})
     return {
         "status": "shadow_only",
-        "source_status": result_row.get("status"),
+        "source_status": public_row.get("status"),
         "score": None,
         "raw_score": None,
         "score_suppressed": True,
         "suppression_reason": "patient_episode_score_is_not_operational_or_exportable",
-        "confidence": dict(result_row.get("confidence") or {}),
-        "warnings": list(result_row.get("warnings") or []),
+        "derived_values_redacted": True,
+        "warnings": list(public_row.get("warnings") or []),
         "flags": {
-            **dict(result_row.get("flags") or {}),
+            **dict(public_row.get("flags") or {}),
             "non_individual_use": True,
             "shadow_mode": True,
             "operational_score": False,
@@ -172,6 +196,218 @@ def _compact_score_payload(result_row: dict[str, Any], *, scored_at: datetime | 
     }
 
 
+def _row_identity(row: dict[str, Any]) -> str:
+    return str(row.get("row_id") or row.get("episode_id") or "")
+
+
+def _aggregate_rows_by_identity(result: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        _row_identity(row): dict(row)
+        for row in list(result.get("_aggregate_rows") or [])
+        if isinstance(row, dict) and _row_identity(row)
+    }
+
+
+def _with_internal_aggregate_row(public_row: dict[str, Any], aggregate_row: dict[str, Any] | None) -> dict[str, Any]:
+    stored = dict(public_row)
+    if isinstance(aggregate_row, dict):
+        stored[INTERNAL_AGGREGATE_ROW_KEY] = dict(aggregate_row)
+    return stored
+
+
+def _public_stored_result(result_row: dict[str, Any]) -> dict[str, Any]:
+    public = dict(result_row or {})
+    public.pop(INTERNAL_AGGREGATE_ROW_KEY, None)
+    return public
+
+
+def _aggregate_stored_result(result_row: dict[str, Any]) -> dict[str, Any]:
+    aggregate_row = (result_row or {}).get(INTERNAL_AGGREGATE_ROW_KEY)
+    if isinstance(aggregate_row, dict):
+        return dict(aggregate_row)
+    return _public_stored_result(result_row)
+
+
+def _initial_status_source(result_row: dict[str, Any]) -> dict[str, Any]:
+    return _aggregate_stored_result(result_row)
+
+
+def _artifact_case_mix_spec(artifact: ModelArtifact) -> dict[str, Any] | None:
+    metrics = artifact.metrics or {}
+    evidence = metrics.get("evidence_pack") if isinstance(metrics.get("evidence_pack"), dict) else {}
+    value = evidence.get("case_mix_spec") or metrics.get("case_mix_spec")
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _model_evidence_payload(evidence: ModelEvidenceSummary) -> dict[str, Any]:
+    return {
+        "evidence_status": evidence.evidence_status,
+        "defensible": evidence.defensible,
+        "missing_evidence": list(evidence.missing_evidence),
+        "intended_use": evidence.intended_use or INTENDED_USE_SHADOW_AGGREGATE,
+    }
+
+
+def _writeback_summary_block_payload(
+    *,
+    artifact: ModelArtifact,
+    formula_version: str,
+    formula_protocol_hash: str,
+    records: list[ICEAPlusFollowupRecord],
+    detail: str,
+    warnings: list[str],
+    evidence: ModelEvidenceSummary,
+    baseline_model_id: str | None = None,
+    baseline_evidence: ModelEvidenceSummary | None = None,
+    baseline_missing_evidence: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "detail": detail,
+        "status": detail,
+        "model_id": str(artifact.id),
+        "formula_version": formula_version,
+        "formula_protocol_hash": formula_protocol_hash,
+        **_model_evidence_payload(evidence),
+        "primary_model_evidence_status": evidence.evidence_status,
+        "warnings": sorted(set(warnings)),
+        "summary": {
+            "records": int(len(records)),
+            "group_count": 0,
+            "coverage": 0.0,
+            "suppressed_cells": 0,
+            "min_cell_count": MIN_AGGREGATE_EPISODES,
+            "scored_aggregate": None,
+            "no_score_due_to_model_evidence": True,
+        },
+        "scored_aggregate": None,
+        "suppressed": True,
+        "results": [],
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": INTENDED_USE_SHADOW_AGGREGATE,
+    }
+    if baseline_model_id:
+        payload.update(
+            {
+                "baseline_model_id": baseline_model_id,
+                "baseline_model_evidence_status": (
+                    baseline_evidence.evidence_status if baseline_evidence is not None else "not_found"
+                ),
+                "baseline_model_not_defensible": baseline_evidence is None or not baseline_evidence.defensible,
+                "baseline_model_missing_evidence": (
+                    list(baseline_evidence.missing_evidence)
+                    if baseline_evidence is not None
+                    else list(baseline_missing_evidence or ["model_artifact_not_found"])
+                ),
+            }
+        )
+    return payload
+
+
+def _result_baseline_model_id(result_row: dict[str, Any]) -> str | None:
+    public_row = _public_stored_result(result_row or {})
+    aggregate_row = _aggregate_stored_result(result_row or {})
+    for row in (aggregate_row, public_row):
+        value = (row.get("lineage") or {}).get("baseline_model_id")
+        if value:
+            return str(value)
+    return None
+
+
+def _record_baseline_model_id(record: ICEAPlusFollowupRecord) -> str | None:
+    candidates = [
+        (record.initial_request or {}).get("baseline_model_id"),
+        ((record.provenance or {}).get("initial_request") or {}).get("baseline_model_id"),
+        ((record.provenance or {}).get("enriched_request") or {}).get("baseline_model_id"),
+        _result_baseline_model_id(record.initial_result or {}),
+        _result_baseline_model_id(record.enriched_result or {}),
+    ]
+    values = {str(value) for value in candidates if value not in (None, "")}
+    return sorted(values)[0] if len(values) == 1 else ("__mixed__" if values else None)
+
+
+def _validated_uuid(value: str) -> str | None:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def validate_model_evidence_for_writeback_summary(
+    *,
+    artifact: ModelArtifact,
+    formula_version: str,
+    formula_protocol_hash: str,
+    records: list[ICEAPlusFollowupRecord],
+) -> dict[str, Any] | None:
+    evidence = summarize_model_evidence(artifact)
+    record_model_ids = {str(record.model_id) for record in records}
+    if record_model_ids - {str(artifact.id)}:
+        return _writeback_summary_block_payload(
+            artifact=artifact,
+            formula_version=formula_version,
+            formula_protocol_hash=formula_protocol_hash,
+            records=records,
+            detail="mixed_models_not_aggregable",
+            warnings=["writeback_summary_mixed_models_not_aggregable"],
+            evidence=evidence,
+        )
+    if not evidence.defensible:
+        return _writeback_summary_block_payload(
+            artifact=artifact,
+            formula_version=formula_version,
+            formula_protocol_hash=formula_protocol_hash,
+            records=records,
+            detail="model_not_defensible",
+            warnings=[WRITEBACK_MODEL_EVIDENCE_WARNING, *evidence.statuses],
+            evidence=evidence,
+        )
+
+    baseline_modes = {_record_baseline_model_id(record) for record in records}
+    if "__mixed__" in baseline_modes or len(baseline_modes) > 1:
+        return _writeback_summary_block_payload(
+            artifact=artifact,
+            formula_version=formula_version,
+            formula_protocol_hash=formula_protocol_hash,
+            records=records,
+            detail="mixed_baseline_models_not_aggregable",
+            warnings=[WRITEBACK_MIXED_BASELINE_WARNING],
+            evidence=evidence,
+        )
+
+    baseline_model_id = next(iter(baseline_modes), None)
+    if baseline_model_id is None:
+        return None
+    validated_baseline_id = _validated_uuid(baseline_model_id)
+    baseline_model = ModelArtifact.objects.filter(id=validated_baseline_id).first() if validated_baseline_id else None
+    if baseline_model is None:
+        return _writeback_summary_block_payload(
+            artifact=artifact,
+            formula_version=formula_version,
+            formula_protocol_hash=formula_protocol_hash,
+            records=records,
+            detail="baseline_model_not_found",
+            warnings=[WRITEBACK_BASELINE_EVIDENCE_WARNING],
+            evidence=evidence,
+            baseline_model_id=baseline_model_id,
+            baseline_missing_evidence=["model_artifact_not_found"],
+        )
+    baseline_evidence = summarize_model_evidence(baseline_model)
+    if not baseline_evidence.defensible:
+        return _writeback_summary_block_payload(
+            artifact=artifact,
+            formula_version=formula_version,
+            formula_protocol_hash=formula_protocol_hash,
+            records=records,
+            detail="baseline_model_not_defensible",
+            warnings=[WRITEBACK_BASELINE_EVIDENCE_WARNING, *baseline_evidence.statuses],
+            evidence=evidence,
+            baseline_model_id=str(baseline_model.id),
+            baseline_evidence=baseline_evidence,
+        )
+    return None
+
+
 def _computation_from_result(
     *,
     artifact: ModelArtifact,
@@ -181,12 +417,13 @@ def _computation_from_result(
     stage: str,
     linked_initial_computation_id: str | None = None,
 ) -> ICEAPlusComputation:
-    summary = dict(result.get("summary") or {})
+    public_result = redact_shadow_score_response(result)
+    summary = dict(public_result.get("summary") or {})
     summary["longitudinal_stage"] = stage
     if linked_initial_computation_id:
         summary["linked_initial_computation_id"] = linked_initial_computation_id
     request_hash = ""
-    rows = list(result.get("results") or [])
+    rows = list(public_result.get("results") or [])
     if rows:
         request_hash = str((((rows[0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
     return ICEAPlusComputation.objects.create(
@@ -238,6 +475,9 @@ def _upsert_initial_record(
     protocol_hash = str(lineage.get("formula_protocol_hash") or "")
     snapshot_hash, _ = _feature_snapshot(episode)
     shadow_mode, exploratory_only = _formula_flags(formula_version)
+    initial_status = str(_initial_status_source(row).get("status") or "")
+    initial_state = _initial_state(initial_status)
+    initial_followup_status = _initial_followup_status(initial_status)
 
     record, _ = ICEAPlusFollowupRecord.objects.get_or_create(
         episode=episode,
@@ -248,9 +488,9 @@ def _upsert_initial_record(
             "grain": "episode",
             "patient_key": _patient_key(episode, row),
             "initial_computation": computation,
-            "initial_state": _initial_state(str(row.get("status") or "")),
-            "followup_status": "pending_followup",
-            "current_state": _initial_state(str(row.get("status") or "")),
+            "initial_state": initial_state,
+            "followup_status": initial_followup_status,
+            "current_state": initial_state,
             "initial_request": _jsonable_request(request_config),
             "initial_result": row,
             "feature_snapshot_hash": snapshot_hash,
@@ -272,11 +512,19 @@ def _upsert_initial_record(
     if not record.initial_result:
         record.initial_result = row
         record.initial_computation = computation
-        record.initial_state = _initial_state(str(row.get("status") or ""))
+        record.initial_state = initial_state
+        record.followup_status = initial_followup_status
         record.feature_snapshot_hash = snapshot_hash
         record.initial_request = _jsonable_request(request_config)
         updated_fields.extend(
-            ["initial_result", "initial_computation", "initial_state", "feature_snapshot_hash", "initial_request"]
+            [
+                "initial_result",
+                "initial_computation",
+                "initial_state",
+                "followup_status",
+                "feature_snapshot_hash",
+                "initial_request",
+            ]
         )
     if not record.patient_key:
         record.patient_key = _patient_key(episode, row)
@@ -299,7 +547,9 @@ def persist_initial_followup_records(
     computation: ICEAPlusComputation,
     request_config: dict[str, Any],
 ) -> list[ICEAPlusFollowupRecord]:
-    rows = [row for row in (result.get("results") or []) if row.get("episode_id") is not None]
+    public_result = redact_shadow_score_response(result)
+    aggregate_rows = _aggregate_rows_by_identity(result)
+    rows = [row for row in (public_result.get("results") or []) if row.get("episode_id") is not None]
     if not rows:
         return []
     episode_ids = sorted({int(row["episode_id"]) for row in rows})
@@ -312,12 +562,13 @@ def persist_initial_followup_records(
         episode = episodes.get(int(row["episode_id"]))
         if episode is None:
             continue
+        stored_row = _with_internal_aggregate_row(row, aggregate_rows.get(_row_identity(row)))
         records.append(
             _upsert_initial_record(
                 episode=episode,
                 artifact=artifact,
                 computation=computation,
-                row=row,
+                row=stored_row,
                 request_config=request_config,
             )
         )
@@ -347,13 +598,15 @@ def _score_episode_from_request(
         "date_from": None,
         "date_to": None,
     }
-    result = score_icea_plus(**score_kwargs)
-    if result.get("detail"):
-        raise ValueError(str(result.get("detail")))
+    raw_result = score_icea_plus(**score_kwargs)
+    if raw_result.get("detail"):
+        raise ScoringBlockedError(raw_result)
+    result = redact_shadow_score_response(raw_result)
     row = next((candidate for candidate in (result.get("results") or []) if int(candidate.get("episode_id") or 0) == int(episode.id)), None)
     if row is None:
         raise ValueError("episode_not_returned_by_score")
-    return result, row
+    aggregate_row = _aggregate_rows_by_identity(raw_result).get(_row_identity(row))
+    return result, _with_internal_aggregate_row(row, aggregate_row)
 
 
 def ensure_followup_record(
@@ -599,6 +852,44 @@ def rescore_followup(
             artifact=artifact,
             request_config=merged_request,
         )
+    except ScoringBlockedError as exc:
+        block = dict(exc.result)
+        block_detail = str(block.get("detail") or "scoring_blocked")
+        record.followup_status = "governance_blocked"
+        record.current_state = "governance_blocked"
+        record.warnings = sorted(
+            set(
+                list(record.warnings or [])
+                + list(block.get("statuses") or [])
+                + [block_detail, "followup_rescore_governance_blocked"]
+            )
+        )
+        record.provenance = {
+            **dict(record.provenance or {}),
+            "governance_block": {
+                "detail": block_detail,
+                "evidence_status": block.get("evidence_status"),
+                "missing_evidence": list(block.get("missing_evidence") or []),
+                "warnings": sorted(
+                    set(list(block.get("warnings") or []) + list(block.get("statuses") or []) + [block_detail])
+                ),
+                "baseline_model_evidence_status": block.get("baseline_model_evidence_status"),
+                "baseline_model_missing_evidence": list(block.get("baseline_model_missing_evidence") or []),
+                "blocked_at": timezone.now().isoformat(),
+            },
+        }
+        record.last_followup_at = evaluation.last_followup_at
+        record.save(
+            update_fields=[
+                "followup_status",
+                "current_state",
+                "warnings",
+                "provenance",
+                "last_followup_at",
+                "updated_at",
+            ]
+        )
+        raise
     except Exception as exc:
         record.followup_status = "failed"
         record.current_state = _derive_current_state(record)
@@ -661,19 +952,26 @@ def rescore_followup(
 
 
 def _effective_result(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
-    if record.followup_status == "enriched_followup" and record.enriched_result:
-        return dict(record.enriched_result or {})
-    return dict(record.initial_result or {})
+    if record.enriched_result:
+        return _public_stored_result(record.enriched_result or {})
+    return _public_stored_result(record.initial_result or {})
+
+
+def _effective_aggregate_result(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
+    if record.enriched_result:
+        return _aggregate_stored_result(record.enriched_result or {})
+    return _aggregate_stored_result(record.initial_result or {})
 
 
 def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
     effective_result = _effective_result(record)
+    model_evidence = summarize_model_evidence(record.model)
     initial_computed_at = record.initial_computation.created_at if record.initial_computation else record.created_at
     enriched_computed_at = record.enriched_computation.created_at if record.enriched_computation else record.last_rescore_at
 
     initial_score = _compact_score_payload(record.initial_result or {}, scored_at=initial_computed_at)
     enriched_score = _compact_score_payload(record.enriched_result or {}, scored_at=enriched_computed_at) if record.enriched_result else None
-    current_score = enriched_score if record.followup_status == "enriched_followup" and enriched_score else initial_score
+    current_score = enriched_score if enriched_score else initial_score
 
     delta_score = None
 
@@ -697,11 +995,18 @@ def build_patient_summary(record: ICEAPlusFollowupRecord) -> dict[str, Any]:
             "initial_computation_id": str(record.initial_computation_id or ""),
             "enriched_computation_id": str(record.enriched_computation_id or ""),
         },
-        "warnings": sorted(set(list(record.warnings or []) + list(effective_result.get("warnings") or []))),
+        "warnings": sorted(
+            set(
+                list(record.warnings or [])
+                + list(effective_result.get("warnings") or [])
+                + ([] if model_evidence.defensible else [WRITEBACK_MODEL_EVIDENCE_WARNING])
+            )
+        ),
         "support": dict(record.support or {}),
         "evidence": {
             "types": list(record.evidence_types or []),
             "summary": dict(record.evidence_summary or {}),
+            "model": _model_evidence_payload(model_evidence),
         },
         "provenance": {
             "formulaVersion": record.formula_version,
@@ -745,6 +1050,7 @@ def build_summary_writeback(
         qs = qs.filter(episode__admission_date__gte=date_from)
     if date_to is not None:
         qs = qs.filter(episode__admission_date__lte=date_to)
+    records = list(qs)
 
     requested_group_by = str(group_by or "unit")
     effective_group_by = requested_group_by
@@ -757,7 +1063,23 @@ def build_summary_writeback(
         warnings.append("shift_writeback_requires_window_followup_falling_back_to_unit")
     require_staff_count = requested_group_by in {"team", "shift"}
 
-    rows = [_effective_result(record) for record in qs if _effective_result(record)]
+    evidence_block = validate_model_evidence_for_writeback_summary(
+        artifact=artifact,
+        formula_version=formula.version,
+        formula_protocol_hash=formula.protocol_hash,
+        records=records,
+    )
+    if evidence_block is not None:
+        evidence_block["requested_group_by"] = requested_group_by
+        evidence_block["effective_group_by"] = effective_group_by
+        evidence_block["warnings"] = sorted(set(list(evidence_block.get("warnings") or []) + warnings))
+        return evidence_block
+
+    rows = []
+    for record in records:
+        row = _effective_aggregate_result(record)
+        if row:
+            rows.append(row)
     aggregated = aggregate_scored_rows(
         rows=rows,
         group_by=effective_group_by,
@@ -766,7 +1088,7 @@ def build_summary_writeback(
         min_cell_count=MIN_AGGREGATE_EPISODES,
         min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
         require_staff_count=require_staff_count,
-        case_mix_spec=(artifact.metrics or {}).get("case_mix_spec") or (formula.spec or {}).get("case_mix_spec"),
+        case_mix_spec=_artifact_case_mix_spec(artifact) or (formula.spec or {}).get("case_mix_spec"),
     )
     suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
     state_counts = {
@@ -774,6 +1096,7 @@ def build_summary_writeback(
         "complete": int(qs.filter(current_state="complete").count()),
         "enriched_followup": int(qs.filter(current_state="enriched_followup").count()),
         "insufficient_evidence": int(qs.filter(current_state="insufficient_evidence").count()),
+        "governance_blocked": int(qs.filter(current_state="governance_blocked").count()),
         "stale": int(qs.filter(current_state="stale").count()),
         "failed": int(qs.filter(current_state="failed").count()),
     }

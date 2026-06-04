@@ -6,8 +6,10 @@ import pandas as pd
 from django.conf import settings
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from icea_pipeline.temporal import validate_temporal_frame
 
-from .engine import ICEAEngine, compute_basic_summary, stable_json_dumps
+from .evidence import build_training_evidence_metadata, summarize_model_evidence
+from .engine import stable_json_dumps
 from .ml import train_xgb_regressor
 from .models import ICEAComputation, ModelArtifact
 from .serializers import (
@@ -51,6 +53,20 @@ class ModelTrainView(APIView):
         payload = ser.validated_data
 
         df = pd.DataFrame(payload["dataset"])
+        evidence_model_df = df.reindex(columns=list(payload["features"]) + [str(payload["target"])])
+        temporal_issues = validate_temporal_frame(
+            df,
+            feature_names=list(payload["features"]),
+            target=str(payload["target"]),
+        )
+        temporal_guardrail_status = "temporal_guardrails_passed"
+        temporal_guardrail_warnings: list[str] = []
+        if temporal_issues:
+            temporal_guardrail_status = str(temporal_issues[0][1].status or "external_payload_temporal_not_defensible")
+            temporal_guardrail_warnings = sorted(
+                {warning for _, issue in temporal_issues for warning in issue.warnings}
+            )
+
         result = train_xgb_regressor(
             df,
             features=payload["features"],
@@ -58,6 +74,18 @@ class ModelTrainView(APIView):
             model_dir=settings.ICEA_MODEL_DIR,
             params=payload.get("params") or None,
         )
+        evidence_pack = build_training_evidence_metadata(
+            raw_df=df,
+            model_df=evidence_model_df,
+            features=result.features,
+            target=result.target,
+            dataset_grain="external_payload",
+            metrics=result.metrics,
+            temporal_guardrail_status=temporal_guardrail_status,
+            temporal_guardrail_warnings=temporal_guardrail_warnings,
+            case_mix_spec=payload.get("case_mix_spec"),
+        )
+        result.metrics["evidence_pack"] = evidence_pack
 
         artifact = ModelArtifact.objects.create(
             name=payload.get("name", "icea-xgb"),
@@ -72,7 +100,7 @@ class ModelTrainView(APIView):
 
 
 class ICEAComputeView(APIView):
-    """Compute ICEA (and optional group contributions) for a batch of rows."""
+    """Retain the legacy compute contract without emitting individual outputs."""
 
     def post(self, request):
         ser = ComputeRequestSerializer(data=request.data)
@@ -80,6 +108,18 @@ class ICEAComputeView(APIView):
         payload = ser.validated_data
 
         artifact = ModelArtifact.objects.get(id=payload["model_id"])
+        evidence = summarize_model_evidence(artifact)
+        if not evidence.defensible:
+            return Response(
+                {
+                    "detail": "model_not_defensible",
+                    "model_id": str(artifact.id),
+                    "non_individual_use": True,
+                    "shadow_mode": True,
+                    **evidence.to_dict(),
+                },
+                status=400,
+            )
         df = pd.DataFrame(payload["data"])
 
         features = payload.get("features") or artifact.features
@@ -98,37 +138,17 @@ class ICEAComputeView(APIView):
                     status=400,
                 )
 
-        group_map = payload.get("group_map")
-
-        # Background for SHAP: sample the batch (cheap and deterministic)
-        background = df.head(min(len(df), 200)).copy()
-
-        shap_mode = request.query_params.get("shap_mode", "interventional")
-        engine = ICEAEngine(
-            artifact.model_path,
-            background=background,
-            shap_mode=shap_mode,
-        )
-
-        result = engine.compute(
-            df,
-            features=features,
-            nurse_cols=nurse_cols,
-            group_map=group_map,
-        )
-
-        # Traceability / audit
+        # Legacy compute is retained only as a governed audit surface. Models
+        # approved for shadow aggregate research cannot emit row-level outputs.
         request_hash = hashlib.sha256(stable_json_dumps(payload).encode("utf-8")).hexdigest()
+        warnings = ["individual_outputs_suppressed", "legacy_compute_redacted"]
         summary = {
-            "icea": compute_basic_summary(result.icea),
-            "predictions": compute_basic_summary(result.predictions),
-            "base_value": float(result.base_value),
+            "status": "shadow_only",
+            "rows_requested": int(len(df)),
+            "score_summary": None,
+            "score_summary_redacted": True,
+            "warnings": warnings,
         }
-        # Add group summaries
-        group_summaries = {}
-        for k, v in result.contributions.items():
-            group_summaries[k] = compute_basic_summary(v)
-        summary["groups"] = group_summaries
 
         ICEAComputation.objects.create(
             model=artifact,
@@ -142,11 +162,16 @@ class ICEAComputeView(APIView):
                 "model": ModelArtifactSerializer(artifact).data,
                 "summary": summary,
                 "rows": len(df),
-                "results": {
-                    "predictions": result.predictions,
-                    "base_value": float(result.base_value),
-                    "icea": result.icea,
-                    "contributions": result.contributions,
-                },
+                "results": {},
+                "status": "shadow_only",
+                "detail": "legacy_compute_redacted",
+                "model_evidence_status": evidence.evidence_status,
+                "defensible": evidence.defensible,
+                "intended_use": evidence.intended_use,
+                "shadow_mode": True,
+                "non_individual_use": True,
+                "score_summary": None,
+                "score_summary_redacted": True,
+                "warnings": warnings,
             }
         )

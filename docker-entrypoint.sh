@@ -32,7 +32,7 @@ python manage.py migrate --noinput
 
 # Optional: seed demo if requested
 if [ "${ICEA_SEED_DEMO:-false}" = "true" ]; then
-  python manage.py seed_demo --rows "${ICEA_DEMO_ROWS:-800}" --name "${ICEA_DEMO_NAME:-icea-demo}" --version "${ICEA_DEMO_VERSION:-v1}" || true
+  python manage.py seed_demo --rows "${ICEA_DEMO_ROWS:-800}" --name "${ICEA_DEMO_NAME:-icea-demo}" --model-version "${ICEA_DEMO_VERSION:-v1}"
 fi
 
 # Default: WSGI (gunicorn). Enterprise option: ASGI (daphne/uvicorn) for realtime.

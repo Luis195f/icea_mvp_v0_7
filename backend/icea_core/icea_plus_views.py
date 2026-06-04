@@ -14,6 +14,7 @@ from icea_core.aggregation import (
     redacted_low_support_summary,
 )
 from icea_core.followup import (
+    ScoringBlockedError,
     build_patient_summary,
     build_summary_writeback,
     ensure_followup_record,
@@ -40,7 +41,7 @@ from icea_core.permissions import (
     ICEABackwardCompatiblePermission,
     ICEAResearcherPermission,
 )
-from icea_core.scoring import score_icea_plus, select_formula, upsert_formula_version
+from icea_core.scoring import redact_shadow_score_response, score_icea_plus, select_formula, upsert_formula_version
 from icea_pipeline.audit import append_audit_event
 
 
@@ -62,6 +63,17 @@ def _validate_serializer(ser, *, request_type: str):
         errors=ser.errors,
         request_type=request_type,
     )
+
+
+def _scoring_blocked_response(exc: ScoringBlockedError) -> Response:
+    payload = dict(exc.result)
+    payload.setdefault("status", str(payload.get("detail") or "scoring_blocked"))
+    payload.setdefault("non_individual_use", True)
+    payload.setdefault("shadow_mode", True)
+    payload.setdefault("intended_use", "shadow_aggregate_research")
+    payload.setdefault("score_summary", None)
+    payload.setdefault("score_summary_redacted", True)
+    return Response(payload, status=400)
 
 
 def _safe_aggregate_grouping(requested_group_by: str, *, grain: str) -> tuple[str, list[str], bool]:
@@ -165,10 +177,13 @@ class ICEAPlusScoreView(APIView):
         if result.get("detail"):
             return Response(result, status=400)
 
-        summary = dict(result.get("summary") or {})
+        public_result = redact_shadow_score_response(result)
+        summary = dict(public_result.get("summary") or {})
         request_hash = ""
-        if result.get("results"):
-            request_hash = str((((result["results"][0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
+        if public_result.get("results"):
+            request_hash = str(
+                ((((public_result["results"][0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
+            )
         computation = ICEAPlusComputation.objects.create(
             formula_version=result["formula_version"],
             model=artifact,
@@ -182,6 +197,7 @@ class ICEAPlusScoreView(APIView):
             event_type="icea_plus_score",
             payload={
                 "model_id": str(artifact.id),
+                "baseline_model_id": str(payload.get("baseline_model_id") or ""),
                 "formula_version": result["formula_version"],
                 "grain": str(payload.get("grain") or "episode"),
                 "rows": int(summary.get("rows_requested") or 0),
@@ -195,7 +211,7 @@ class ICEAPlusScoreView(APIView):
                 computation=computation,
                 request_config=dict(payload),
             )
-        return Response(result)
+        return Response(public_result)
 
 
 class ICEAPlusAggregateView(APIView):
@@ -217,6 +233,7 @@ class ICEAPlusAggregateView(APIView):
             nurse_cols=None,
             outcome_goal=params.get("outcome_goal"),
             causal_run_id=str(params.get("causal_run_id")) if params.get("causal_run_id") else None,
+            baseline_model_id=str(params.get("baseline_model_id")) if params.get("baseline_model_id") else None,
             unit_id=params.get("unit_id"),
             date_from=params.get("date_from"),
             date_to=params.get("date_to"),
@@ -227,7 +244,7 @@ class ICEAPlusAggregateView(APIView):
         requested_group_by = str(params.get("group_by") or "unit")
         effective_group_by = requested_group_by
         warnings: list[str] = []
-        rows = list(score_result.get("results") or [])
+        rows = list(score_result.get("_aggregate_rows") or score_result.get("results") or [])
 
         formula = select_formula((params.get("formula_version") or "").strip() or None)
         min_rel = float((((formula.spec).get("aggregation") or {}).get("min_nurse_reliability")) or 0.60)
@@ -242,6 +259,8 @@ class ICEAPlusAggregateView(APIView):
         if requested_group_by in {"team", "shift", "nurse"} and min_rel > 0:
             warnings.append("staff_dimension_requires_minimum_support_and_non_punitive_use")
 
+        artifact_metrics = artifact.metrics or {}
+        artifact_evidence = artifact_metrics.get("evidence_pack") if isinstance(artifact_metrics.get("evidence_pack"), dict) else {}
         aggregated = aggregate_scored_rows(
             rows=rows,
             group_by=effective_group_by,
@@ -250,7 +269,9 @@ class ICEAPlusAggregateView(APIView):
             min_cell_count=MIN_AGGREGATE_EPISODES,
             min_staff_count=MIN_STAFF_FOR_STAFF_DIMENSION,
             require_staff_count=require_staff_count,
-            case_mix_spec=(artifact.metrics or {}).get("case_mix_spec") or (formula.spec or {}).get("case_mix_spec"),
+            case_mix_spec=artifact_evidence.get("case_mix_spec")
+            or artifact_metrics.get("case_mix_spec")
+            or (formula.spec or {}).get("case_mix_spec"),
         )
         suppressed_cells = int(sum(1 for row in aggregated if row.get("suppressed")))
         response_summary = score_result.get("summary")
@@ -278,6 +299,7 @@ class ICEAPlusAggregateView(APIView):
             event_type="icea_plus_aggregate",
             payload={
                 "model_id": str(artifact.id),
+                "baseline_model_id": str(params.get("baseline_model_id") or ""),
                 "requested_group_by": requested_group_by,
                 "effective_group_by": effective_group_by,
                 "grain": str(params.get("grain") or "episode"),
@@ -285,10 +307,23 @@ class ICEAPlusAggregateView(APIView):
             },
             context="icea-plus/aggregate",
         )
+        evidence_metadata = {
+            key: score_result[key]
+            for key in (
+                "primary_model_evidence_status",
+                "baseline_model_id",
+                "baseline_model_evidence_status",
+                "baseline_model_not_defensible",
+                "baseline_model_missing_evidence",
+                "baseline_model",
+            )
+            if key in score_result
+        }
         return Response(
             {
                 "formula_version": score_result["formula_version"],
                 "formula_protocol_hash": score_result["formula_protocol_hash"],
+                **evidence_metadata,
                 "requested_group_by": requested_group_by,
                 "effective_group_by": effective_group_by,
                 "grain": str(params.get("grain") or "episode"),
@@ -354,11 +389,14 @@ class ICEAPlusFollowupIngestView(APIView):
         episode = _get_object_or_typed_error(PatientEpisode, id=int(payload["episode_id"]))
         if isinstance(episode, Response):
             return episode
-        record = ingest_followup(
-            episode=episode,
-            artifact=artifact,
-            request_config={"formula_version": str(payload.get("formula_version") or "")},
-        )
+        try:
+            record = ingest_followup(
+                episode=episode,
+                artifact=artifact,
+                request_config={"formula_version": str(payload.get("formula_version") or "")},
+            )
+        except ScoringBlockedError as exc:
+            return _scoring_blocked_response(exc)
         return Response(build_patient_summary(record))
 
 
@@ -377,18 +415,21 @@ class ICEAPlusFollowupRescoreView(APIView):
         episode = _get_object_or_typed_error(PatientEpisode, id=int(payload["episode_id"]))
         if isinstance(episode, Response):
             return episode
-        record = rescore_followup(
-            episode=episode,
-            artifact=artifact,
-            request_config={
-                "formula_version": str(payload.get("formula_version") or ""),
-                "outcome_goal": payload.get("outcome_goal"),
-                "causal_run_id": payload.get("causal_run_id"),
-                "causal_spec": payload.get("causal_spec"),
-                "baseline_model_id": payload.get("baseline_model_id"),
-                "nurse_cols": payload.get("nurse_cols"),
-            },
-        )
+        try:
+            record = rescore_followup(
+                episode=episode,
+                artifact=artifact,
+                request_config={
+                    "formula_version": str(payload.get("formula_version") or ""),
+                    "outcome_goal": payload.get("outcome_goal"),
+                    "causal_run_id": payload.get("causal_run_id"),
+                    "causal_spec": payload.get("causal_spec"),
+                    "baseline_model_id": payload.get("baseline_model_id"),
+                    "nurse_cols": payload.get("nurse_cols"),
+                },
+            )
+        except ScoringBlockedError as exc:
+            return _scoring_blocked_response(exc)
         return Response(build_patient_summary(record))
 
 
@@ -444,7 +485,7 @@ class ICEAPlusWritebackSummaryView(APIView):
             date_from=params.get("date_from"),
             date_to=params.get("date_to"),
         )
-        return Response(payload)
+        return Response(payload, status=400 if payload.get("detail") else 200)
 
 
 class ICEAPlusWritebackPatientView(APIView):
@@ -468,9 +509,12 @@ class ICEAPlusWritebackPatientView(APIView):
             formula_version=(str(params.get("formula_version") or "").strip() or None),
         )
         if record is None:
-            record = ensure_followup_record(
-                episode=episode,
-                artifact=artifact,
-                request_config={"formula_version": str(params.get("formula_version") or "")},
-            )
+            try:
+                record = ensure_followup_record(
+                    episode=episode,
+                    artifact=artifact,
+                    request_config={"formula_version": str(params.get("formula_version") or "")},
+                )
+            except ScoringBlockedError as exc:
+                return _scoring_blocked_response(exc)
         return Response(build_patient_summary(record))

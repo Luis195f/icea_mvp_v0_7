@@ -8,6 +8,11 @@ Core principles:
 - **Traceability first**: raw FHIR JSON is stored for audit/replay.
 - **Semantic interoperability**: resources are normalized into canonical tables for analytics.
 - **Model governance**: models are versioned artifacts (features + target + metrics).
+- **Model evidence gate**: ICEA/ICEA+ scoring fails closed when a `ModelArtifact`
+  lacks dataset fingerprint/hash, temporal spec version, guardrail status,
+  outcome window, case-mix evidence, intended use, validation/calibration
+  evidence or explicit unavailable reasons, limitations, and provenance/source
+  traceability.
 - **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
 - **Shadow aggregate governance**: ICEA/ICEA+ dashboard and export surfaces are aggregate-only, non-punitive, and suppress low-support cells.
 - **Fail-closed high-risk APIs**: scoring, causal, writeback, federated, simulate, policy learning, and fairness require explicit auth/RBAC and feature flags outside dev-only mode.
@@ -39,6 +44,13 @@ Services:
 - Backend API: `http://localhost:8000/api/v1/`
 - Swagger docs: `http://localhost:8000/api/v1/docs/`
 - Dashboard (Streamlit): `http://localhost:8501/`
+
+When `ICEA_SEED_DEMO=true`, the Docker entrypoint creates a governed synthetic
+demo model and enough observed demo rows for aggregate exploration. The model is
+usable only as `shadow_aggregate_research`; it is not clinically validated, MDR
+production-ready, or suitable for individual decisioning. Demo seeding fails
+closed if the generated evidence pack cannot satisfy the normal model-evidence
+gate.
 
 ---
 
@@ -93,6 +105,27 @@ Defensible training/scoring requires fixed-horizon temporal metadata.
 ```json
 { "name": "icea-xgb", "version": "v0.7.4", "target": "delta_ri" }
 ```
+
+Training persists `ModelArtifact.metrics.evidence_pack` when the dataset is
+temporally defensible. The default intended use is
+`shadow_aggregate_research` with `non_individual_use=true` and
+`shadow_mode=true`. Missing calibration, validation, case-mix, or provenance is
+recorded as an explicit unavailable reason rather than fabricated evidence.
+Artifacts with `model_not_defensible`, `calibration_unavailable`,
+`validation_unavailable`, or `case_mix_insufficient` must not be treated as
+clinically validated or MDR production-ready.
+
+Provide `case_mix_spec` on `/api/v1/pipeline/train/` or `/api/v1/models/train/`
+when the dataset cannot prove all required domains from columns alone. Training
+may derive `case_mix_spec` only from real columns covering age, severity,
+comorbidity, fragility/dependency, baseline risk, and baseline load; otherwise
+the artifact remains non-defensible instead of inventing case-mix support.
+
+External `/api/v1/models/train/` payloads must also pass temporal frame
+validation. `not_evaluated_external_payload` is never a defendible status.
+Defendible artifacts must explicitly retain the canonical limitations
+`shadow_aggregate_research_only`, `not_for_individual_decisioning`, and
+`not_mdr_production_ready`.
 
 ### 4.1) ICEA+ v1 score, explain, aggregate
 

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from django.core.exceptions import ValidationError
 
 from analytics.causal import ICEACausal
 from icea_core.components import (
@@ -26,6 +28,7 @@ from icea_core.components import (
     robust_z,
     utility_transform,
 )
+from icea_core.evidence import ModelEvidenceSummary, summarize_model_evidence
 from icea_core.engine import ICEAEngine
 from icea_core.formula import ICEAPlusComponentValue, ICEAPlusLineage, compute_row_score
 from icea_core.models import ICEAPlusFormulaVersion, ModelArtifact
@@ -36,6 +39,206 @@ from icea_pipeline.temporal import TEMPORAL_STATUSES, validate_causal_temporal_o
 FEATURE_CONTRACT_VERSION = "handover-icea-feature-v1"
 FEATURE_SOURCE_REPO = "Luis195f/HANDOVER"
 DEFAULT_MIN_FEATURE_COVERAGE = 0.95
+
+
+def _model_evidence_descriptor(model_artifact: ModelArtifact, evidence: ModelEvidenceSummary) -> dict[str, Any]:
+    return {
+        "id": str(model_artifact.id),
+        "name": model_artifact.name,
+        "version": model_artifact.version,
+        "target": model_artifact.target,
+        "evidence_status": evidence.evidence_status,
+        "defensible": evidence.defensible,
+        "missing_evidence": list(evidence.missing_evidence),
+        "intended_use": evidence.intended_use,
+    }
+
+
+def _model_evidence_response_metadata(
+    *,
+    primary_evidence: ModelEvidenceSummary,
+    baseline_model: ModelArtifact | None = None,
+    baseline_evidence: ModelEvidenceSummary | None = None,
+    baseline_model_id: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "primary_model_evidence_status": primary_evidence.evidence_status,
+    }
+    if baseline_model_id:
+        metadata["baseline_model_id"] = str(baseline_model_id)
+        if baseline_model is None or baseline_evidence is None:
+            metadata.update(
+                {
+                    "baseline_model_evidence_status": "not_found",
+                    "baseline_model_not_defensible": True,
+                    "baseline_model_missing_evidence": ["model_artifact_not_found"],
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "baseline_model_evidence_status": baseline_evidence.evidence_status,
+                    "baseline_model_not_defensible": not baseline_evidence.defensible,
+                    "baseline_model_missing_evidence": list(baseline_evidence.missing_evidence),
+                    "baseline_model": _model_evidence_descriptor(baseline_model, baseline_evidence),
+                }
+            )
+    return metadata
+
+
+def _apply_shadow_row_governance(row: dict[str, Any], *, suppress_numeric_score: bool) -> dict[str, Any]:
+    row["shadow_mode"] = True
+    row["non_individual_use"] = True
+    row["intended_use"] = "shadow_aggregate_research"
+    flags = dict(row.get("flags") or {})
+    flags["shadow_mode"] = True
+    flags["non_individual_use"] = True
+    row["flags"] = flags
+    if suppress_numeric_score:
+        row["score"] = None
+        row["raw_score"] = None
+        row["status"] = "shadow_only"
+    return row
+
+
+def _public_boolean_flags(flags: dict[str, Any] | None) -> dict[str, bool]:
+    return {str(key): value for key, value in dict(flags or {}).items() if isinstance(value, bool)}
+
+
+def _public_feature_contract(feature_contract: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(feature_contract or {})
+    public: dict[str, Any] = {}
+    for key in (
+        "contract_version",
+        "source_repo",
+        "expected_contract_version",
+        "expected_source_repo",
+    ):
+        if isinstance(source.get(key), str):
+            public[key] = source[key]
+    for key in (
+        "expected_contract_versions",
+        "expected_source_repos",
+        "missing_features",
+        "missing_critical_features",
+        "validated_model_roles",
+    ):
+        if isinstance(source.get(key), list):
+            public[key] = [value for value in source[key] if isinstance(value, str)]
+    return public
+
+
+def _public_lineage(lineage: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(lineage or {})
+    public: dict[str, Any] = {}
+    for key in (
+        "formula_version",
+        "formula_protocol_hash",
+        "model_id",
+        "model_version",
+        "baseline_model_id",
+        "causal_spec_hash",
+        "outcome",
+        "outcome_goal",
+        "treatment",
+    ):
+        value = source.get(key)
+        if value is None or isinstance(value, str):
+            public[key] = value
+
+    source_metadata = {}
+    for key in (
+        "grain",
+        "request_hash",
+        "formula_source",
+        "feature_contract_status",
+        "temporal_status",
+    ):
+        value = dict(source.get("source") or {}).get(key)
+        if isinstance(value, (str, bool)):
+            source_metadata[key] = value
+    if source_metadata:
+        public["source"] = source_metadata
+    return public
+
+
+def _redact_shadow_public_row(row: dict[str, Any]) -> dict[str, Any]:
+    source = dict(row or {})
+    had_numeric_score = source.get("score") is not None or source.get("raw_score") is not None
+    public: dict[str, Any] = {}
+    for key in ("row_id", "grain", "episode_id", "window_id", "unit_id", "start_dt", "end_dt"):
+        if key in source:
+            public[key] = source[key]
+
+    public.update(
+        {
+            "status": "shadow_only" if had_numeric_score else str(source.get("status") or "shadow_only"),
+            "provisional": bool(source.get("provisional", False)),
+            "score": None,
+            "raw_score": None,
+            "score_suppressed": True,
+            "derived_values_redacted": True,
+            "suppression_reason": "individual_shadow_score_and_derivatives_are_not_exportable",
+            "warnings": [warning for warning in list(source.get("warnings") or []) if isinstance(warning, str)],
+            "flags": {
+                **_public_boolean_flags(source.get("flags")),
+                "shadow_mode": True,
+                "non_individual_use": True,
+            },
+            "shadow_mode": True,
+            "non_individual_use": True,
+            "intended_use": "shadow_aggregate_research",
+        }
+    )
+    feature_contract = _public_feature_contract(source.get("feature_contract"))
+    if feature_contract:
+        public["feature_contract"] = feature_contract
+    lineage = _public_lineage(source.get("lineage"))
+    if lineage:
+        public["lineage"] = lineage
+    return public
+
+
+def _redact_shadow_public_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(summary or {})
+    public: dict[str, Any] = {}
+    for key in ("rows_requested", "rows_scored"):
+        value = source.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            public[key] = value
+    for key in ("formula_version", "formula_protocol_hash", "baseline_mode"):
+        if isinstance(source.get(key), str):
+            public[key] = source[key]
+    if isinstance(source.get("causal_available"), bool):
+        public["causal_available"] = source["causal_available"]
+    if isinstance(source.get("status_counts"), dict):
+        public["status_counts"] = {
+            str(key): value
+            for key, value in source["status_counts"].items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+    public["warnings"] = [warning for warning in list(source.get("warnings") or []) if isinstance(warning, str)]
+    public.update(
+        {
+            "score_summary": None,
+            "score_summary_redacted": True,
+            "summary_redacted": True,
+            "redaction_reason": "non_individual_shadow_mode",
+        }
+    )
+    return public
+
+
+def redact_shadow_score_response(result: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(result)
+    public.pop("_aggregate_rows", None)
+    public["results"] = [_redact_shadow_public_row(row) for row in list(public.get("results") or [])]
+    public["summary"] = _redact_shadow_public_summary(public.get("summary"))
+    public["score_summary"] = None
+    public["score_summary_redacted"] = True
+    public["summary_redacted"] = True
+    public["redaction_reason"] = "non_individual_shadow_mode"
+    return public
 
 
 @dataclass
@@ -455,24 +658,27 @@ def _feature_contract_failure_result(
 
     for issue in result_issues:
         rows.append(
-            {
-                "row_id": issue.row_id,
-                "grain": grain,
-                "status": issue.status,
-                "score": None,
-                "raw_score": None,
-                "components": {},
-                "flags": issue.flags,
-                "warnings": issue.warnings,
-                "feature_contract": _feature_contract_issue_payload(issue),
-                "lineage": {
-                    "formula_version": formula.version,
-                    "formula_protocol_hash": formula.protocol_hash,
-                    "model_id": str(model_artifact.id),
-                    "model_version": str(model_artifact.version),
-                    "source": {"grain": grain, "feature_contract_status": issue.status},
+            _apply_shadow_row_governance(
+                {
+                    "row_id": issue.row_id,
+                    "grain": grain,
+                    "status": issue.status,
+                    "score": None,
+                    "raw_score": None,
+                    "components": {},
+                    "flags": issue.flags,
+                    "warnings": issue.warnings,
+                    "feature_contract": _feature_contract_issue_payload(issue),
+                    "lineage": {
+                        "formula_version": formula.version,
+                        "formula_protocol_hash": formula.protocol_hash,
+                        "model_id": str(model_artifact.id),
+                        "model_version": str(model_artifact.version),
+                        "source": {"grain": grain, "feature_contract_status": issue.status},
+                    },
                 },
-            }
+                suppress_numeric_score=False,
+            )
         )
 
     status_counts = {
@@ -489,6 +695,9 @@ def _feature_contract_failure_result(
         "formula_version": formula.version,
         "formula_protocol_hash": formula.protocol_hash,
         "formula_source": formula.source,
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": "shadow_aggregate_research",
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,
@@ -534,29 +743,32 @@ def _temporal_guardrail_failure_result(
             flags = {"leakage_blocked": True, "temporal_spec_valid": False}
 
         rows.append(
-            {
-                "row_id": str(meta.get("row_id") or f"row:{pos}"),
-                "grain": grain,
-                "episode_id": meta.get("episode_id"),
-                "window_id": meta.get("window_id"),
-                "patient_key": meta.get("patient_key"),
-                "unit_id": meta.get("unit_id"),
-                "start_dt": meta.get("start_dt"),
-                "end_dt": meta.get("end_dt"),
-                "status": status,
-                "score": None,
-                "raw_score": None,
-                "components": {},
-                "flags": {**flags, "non_individual_use": True, "shadow_mode": True},
-                "warnings": sorted(set(warnings)),
-                "lineage": {
-                    "formula_version": formula.version,
-                    "formula_protocol_hash": formula.protocol_hash,
-                    "model_id": str(model_artifact.id),
-                    "model_version": str(model_artifact.version),
-                    "source": {"grain": grain, "temporal_status": status},
+            _apply_shadow_row_governance(
+                {
+                    "row_id": str(meta.get("row_id") or f"row:{pos}"),
+                    "grain": grain,
+                    "episode_id": meta.get("episode_id"),
+                    "window_id": meta.get("window_id"),
+                    "patient_key": meta.get("patient_key"),
+                    "unit_id": meta.get("unit_id"),
+                    "start_dt": meta.get("start_dt"),
+                    "end_dt": meta.get("end_dt"),
+                    "status": status,
+                    "score": None,
+                    "raw_score": None,
+                    "components": {},
+                    "flags": flags,
+                    "warnings": sorted(set(warnings)),
+                    "lineage": {
+                        "formula_version": formula.version,
+                        "formula_protocol_hash": formula.protocol_hash,
+                        "model_id": str(model_artifact.id),
+                        "model_version": str(model_artifact.version),
+                        "source": {"grain": grain, "temporal_status": status},
+                    },
                 },
-            }
+                suppress_numeric_score=False,
+            )
         )
 
     status_counts = {
@@ -569,6 +781,9 @@ def _temporal_guardrail_failure_result(
         "formula_version": formula.version,
         "formula_protocol_hash": formula.protocol_hash,
         "formula_source": formula.source,
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": "shadow_aggregate_research",
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,
@@ -947,6 +1162,56 @@ def score_icea_plus(
     date_to: datetime | None = None,
 ) -> dict[str, Any]:
     formula = select_formula(formula_version)
+    evidence = summarize_model_evidence(model_artifact)
+    baseline_model = None
+    baseline_evidence = None
+    if baseline_model_id:
+        try:
+            baseline_model = ModelArtifact.objects.filter(id=baseline_model_id).first()
+        except (TypeError, ValueError, ValidationError):
+            baseline_model = None
+        if baseline_model is not None:
+            baseline_evidence = summarize_model_evidence(baseline_model)
+
+    evidence_metadata = _model_evidence_response_metadata(
+        primary_evidence=evidence,
+        baseline_model=baseline_model,
+        baseline_evidence=baseline_evidence,
+        baseline_model_id=baseline_model_id,
+    )
+    if not evidence.defensible:
+        return {
+            "detail": "model_not_defensible",
+            "model_id": str(model_artifact.id),
+            "formula_version": formula.version,
+            "formula_protocol_hash": formula.protocol_hash,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            **evidence.to_dict(),
+            **evidence_metadata,
+        }
+    if baseline_model_id and baseline_model is None:
+        return {
+            "detail": "baseline_model_not_found",
+            "model_id": str(model_artifact.id),
+            "formula_version": formula.version,
+            "formula_protocol_hash": formula.protocol_hash,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            "intended_use": "shadow_aggregate_research",
+            **evidence_metadata,
+        }
+    if baseline_evidence is not None and not baseline_evidence.defensible:
+        return {
+            "detail": "baseline_model_not_defensible",
+            "model_id": str(model_artifact.id),
+            "formula_version": formula.version,
+            "formula_protocol_hash": formula.protocol_hash,
+            "non_individual_use": True,
+            "shadow_mode": True,
+            "intended_use": "shadow_aggregate_research",
+            **evidence_metadata,
+        }
     dataset = load_dataset(
         grain=grain,
         from_db=from_db,
@@ -963,6 +1228,7 @@ def score_icea_plus(
             "detail": "no_rows_available_for_scoring",
             "formula_version": formula.version,
             "formula_protocol_hash": formula.protocol_hash,
+            **evidence_metadata,
         }
 
     features = list(model_artifact.features or [])
@@ -972,6 +1238,7 @@ def score_icea_plus(
             "model_id": str(model_artifact.id),
             "formula_version": formula.version,
             "formula_protocol_hash": formula.protocol_hash,
+            **evidence_metadata,
         }
 
     if from_db:
@@ -986,7 +1253,7 @@ def score_icea_plus(
             target=str(model_artifact.target or "delta_ri"),
         )
         if temporal_issues or reference_temporal_issues:
-            return _temporal_guardrail_failure_result(
+            result = _temporal_guardrail_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
@@ -994,6 +1261,8 @@ def score_icea_plus(
                 issues=temporal_issues,
                 reference_issues=reference_temporal_issues,
             )
+            result.update(evidence_metadata)
+            return result
 
     if not from_db:
         contract_issues = _validate_external_feature_contract(
@@ -1011,12 +1280,11 @@ def score_icea_plus(
                 model_role="reference_primary",
             )
         if baseline_model_id:
-            baseline_model_for_contract = ModelArtifact.objects.filter(id=baseline_model_id).first()
-            if baseline_model_for_contract is not None and baseline_model_for_contract.model_path:
+            if baseline_model is not None and baseline_model.model_path:
                 contract_issues.extend(
                     _validate_external_feature_contract(
                         rows=rows,
-                        model_artifact=baseline_model_for_contract,
+                        model_artifact=baseline_model,
                         grain=grain,
                         model_role="baseline",
                     )
@@ -1025,13 +1293,13 @@ def score_icea_plus(
                     reference_contract_issues.extend(
                         _validate_external_feature_contract(
                             rows=reference_rows,
-                            model_artifact=baseline_model_for_contract,
+                            model_artifact=baseline_model,
                             grain=grain,
                             model_role="reference_baseline",
                         )
                     )
         if contract_issues or reference_contract_issues:
-            return _feature_contract_failure_result(
+            result = _feature_contract_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
@@ -1039,6 +1307,8 @@ def score_icea_plus(
                 issues=contract_issues,
                 reference_issues=reference_contract_issues,
             )
+            result.update(evidence_metadata)
+            return result
         temporal_issues = validate_temporal_frame(
             dataset.selected_df,
             feature_names=features,
@@ -1050,7 +1320,7 @@ def score_icea_plus(
             target=str(model_artifact.target or "delta_ri"),
         )
         if temporal_issues or reference_temporal_issues:
-            return _temporal_guardrail_failure_result(
+            result = _temporal_guardrail_failure_result(
                 formula=formula,
                 model_artifact=model_artifact,
                 grain=grain,
@@ -1058,6 +1328,8 @@ def score_icea_plus(
                 issues=temporal_issues,
                 reference_issues=reference_temporal_issues,
             )
+            result.update(evidence_metadata)
+            return result
 
     selected_df = dataset.selected_df.copy()
     reference_df = dataset.reference_df.copy()
@@ -1077,11 +1349,8 @@ def score_icea_plus(
     explained_selected = engine.explain(selected_df, features=features)
     explained_reference = engine.explain(reference_df, features=features)
 
-    baseline_model = None
     baseline_mode = "counterfactual_nursing_reference"
     baseline_replacements: dict[str, float] = {}
-    if baseline_model_id:
-        baseline_model = ModelArtifact.objects.filter(id=baseline_model_id).first()
 
     if baseline_model and baseline_model.model_path:
         baseline_mode = "dedicated_baseline_model"
@@ -1245,6 +1514,7 @@ def score_icea_plus(
         }
     )
 
+    aggregate_rows = []
     results = []
     for pos, meta in enumerate(dataset.meta_rows):
         idx = selected_df.index[pos]
@@ -1356,9 +1626,10 @@ def score_icea_plus(
         if score_dict["flags"]["ood_detected"] and "ood_detected" not in score_dict["warnings"]:
             score_dict["warnings"].append("ood_detected")
         score_dict["warnings"] = sorted(set(score_dict["warnings"]))
-        results.append(score_dict)
+        aggregate_rows.append(_apply_shadow_row_governance(deepcopy(score_dict), suppress_numeric_score=False))
+        results.append(_redact_shadow_public_row(score_dict))
 
-    scored_rows = [row for row in results if row.get("score") is not None]
+    scored_rows = [row for row in aggregate_rows if row.get("score") is not None]
     component_means = {}
     for name in ("benefit", "attribution", "causal", "quality", "uncertainty"):
         vals = [row["components"][name]["normalized"] for row in scored_rows if row["components"][name]["normalized"] is not None]
@@ -1371,26 +1642,34 @@ def score_icea_plus(
         "formula_protocol_hash": formula.protocol_hash,
         "default_pilot_weights": dict(formula.spec.get("weights") or {}),
         "baseline_mode": baseline_mode,
-        "causal_available": bool(any(row["flags"].get("causal_available") for row in results)),
+        "causal_available": bool(any(row["flags"].get("causal_available") for row in aggregate_rows)),
         "status_counts": {
-            "complete": int(sum(1 for row in results if row.get("status") == "complete")),
-            "provisional": int(sum(1 for row in results if row.get("status") == "provisional")),
-            "insufficient_evidence": int(sum(1 for row in results if row.get("status") == "insufficient_evidence")),
+            "complete": int(sum(1 for row in aggregate_rows if row.get("status") == "complete")),
+            "provisional": int(sum(1 for row in aggregate_rows if row.get("status") == "provisional")),
+            "insufficient_evidence": int(sum(1 for row in aggregate_rows if row.get("status") == "insufficient_evidence")),
         },
         "component_means": component_means,
-        "warnings": sorted({warning for row in results for warning in (row.get("warnings") or [])}),
+        "warnings": sorted({warning for row in aggregate_rows for warning in (row.get("warnings") or [])}),
     }
 
     return {
         "formula_version": formula.version,
         "formula_protocol_hash": formula.protocol_hash,
         "formula_source": formula.source,
+        "non_individual_use": True,
+        "shadow_mode": True,
+        "intended_use": "shadow_aggregate_research",
+        **evidence_metadata,
         "model": {
             "id": str(model_artifact.id),
             "name": model_artifact.name,
             "version": model_artifact.version,
             "target": model_artifact.target,
+            "evidence_status": evidence.evidence_status,
+            "defensible": evidence.defensible,
+            "intended_use": evidence.intended_use,
         },
         "summary": summary,
         "results": results,
+        "_aggregate_rows": aggregate_rows,
     }

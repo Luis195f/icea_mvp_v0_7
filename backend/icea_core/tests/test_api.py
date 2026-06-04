@@ -125,7 +125,7 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
             "non_individual_use": True,
         }
 
-    def test_score_endpoint_returns_breakdown(self):
+    def test_score_endpoint_redacts_individual_breakdown(self):
         response = self.client.post(
             "/api/v1/icea-plus/score/",
             {
@@ -147,7 +147,15 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertIn("summary", body)
         self.assertIn("results", body)
         self.assertTrue(body["results"])
-        self.assertIn("components", body["results"][0])
+        self.assertNotIn("components", body["results"][0])
+        self.assertNotIn("confidence", body["results"][0])
+        self.assertNotIn("legacy_icea", body["results"][0])
+        self.assertNotIn("aggregation", body["results"][0])
+        self.assertNotIn("component_means", body["summary"])
+        self.assertNotIn("default_pilot_weights", body["summary"])
+        self.assertTrue(body["summary"]["summary_redacted"])
+        self.assertTrue(body["score_summary_redacted"])
+        self.assertIsNone(body["score_summary"])
         self.assertIn("formula_version", body)
 
     def test_score_endpoint_invalid_payload(self):
