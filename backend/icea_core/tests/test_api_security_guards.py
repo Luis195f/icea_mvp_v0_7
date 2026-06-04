@@ -22,7 +22,8 @@ from icea_core.models import ICEAComputation, ModelArtifact
 from icea_core.permissions import _audit_permission_denial, _safe_caller_audit_identity
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_core.views import ICEAComputeView, ModelTrainView
-from icea_pipeline.models import FHIRWritebackRecord
+from icea_pipeline.audit import append_audit_event
+from icea_pipeline.models import AuditEvent, FHIRWritebackRecord
 from icea_pipeline.views import (
     CausalRunView,
     ConformalPredictView,
@@ -205,6 +206,98 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         self.assertNotIn("patient_id", audit_payload)
         self.assertNotIn("rows", audit_payload)
         self.assertNotIn("payload", audit_payload)
+        self.assertRegex(append.call_args.kwargs["actor"], r"^anonymous_unknown:[0-9a-f]{64}$")
+
+    def test_authenticated_audit_actor_is_stable_pseudonymous_and_distinct(self):
+        user_a = get_user_model().objects.create_user(
+            username="successful-audit-user-a",
+            email="successful-audit-a@example.test",
+            password="test-pass",
+        )
+        user_b = get_user_model().objects.create_user(
+            username="successful-audit-user-b",
+            email="successful-audit-b@example.test",
+            password="test-pass",
+        )
+        sensitive_token = "Bearer successful-audit-secret-token"
+        sensitive_cookie = "sessionid=successful-audit-secret-cookie"
+
+        def request_for(user):
+            return SimpleNamespace(
+                user=user,
+                icea_api_key_authenticated=False,
+                META={
+                    "REMOTE_ADDR": "198.51.100.30",
+                    "HTTP_USER_AGENT": "successful-audit-client",
+                    "HTTP_AUTHORIZATION": sensitive_token,
+                    "HTTP_COOKIE": sensitive_cookie,
+                },
+                headers={"Authorization": sensitive_token, "Cookie": sensitive_cookie},
+            )
+
+        append_icea_api_audit(request=request_for(user_a), event_type="actor_safety_a", context="security/test")
+        append_icea_api_audit(request=request_for(user_a), event_type="actor_safety_a", context="security/test")
+        append_icea_api_audit(request=request_for(user_b), event_type="actor_safety_b", context="security/test")
+
+        actors_a = list(
+            AuditEvent.objects.filter(event_type="actor_safety_a").order_by("created_at").values_list("actor", flat=True)
+        )
+        actor_b = AuditEvent.objects.get(event_type="actor_safety_b").actor
+
+        self.assertEqual(len(actors_a), 2)
+        self.assertEqual(actors_a[0], actors_a[1])
+        self.assertNotEqual(actors_a[0], actor_b)
+        self.assertRegex(actors_a[0], r"^authenticated_user:[0-9a-f]{64}$")
+        self.assertRegex(actor_b, r"^authenticated_user:[0-9a-f]{64}$")
+        self.assertNotEqual(actors_a[0], str(user_a.pk))
+        serialized = str(list(AuditEvent.objects.filter(event_type__startswith="actor_safety_").values()))
+        for sensitive in (
+            user_a.username,
+            user_a.email,
+            user_b.username,
+            user_b.email,
+            sensitive_token,
+            sensitive_cookie,
+        ):
+            self.assertNotIn(sensitive, serialized)
+
+    def test_audit_persistence_and_list_pseudonymize_raw_legacy_actor(self):
+        raw_actor = "legacy.clinician@example.test"
+        sensitive_token = "Bearer legacy-secret-token"
+        event_id = append_audit_event(
+            event_type="legacy_actor_persistence_guard",
+            payload={"Authorization": sensitive_token, "Cookie": "legacy-secret-cookie"},
+            context="security/test",
+            actor=raw_actor,
+        )
+
+        persisted = AuditEvent.objects.get(id=event_id)
+        self.assertRegex(persisted.actor, r"^legacy_actor:[0-9a-f]{64}$")
+        self.assertNotIn(raw_actor, str(persisted.__dict__))
+        self.assertNotIn(sensitive_token, str(persisted.__dict__))
+
+        direct_orm = AuditEvent.objects.create(
+            event_type="direct_orm_actor_guard",
+            actor=raw_actor,
+            context="security/test",
+        )
+        self.assertRegex(direct_orm.actor, r"^legacy_actor:[0-9a-f]{64}$")
+
+        historical_raw = AuditEvent.objects.create(
+            event_type="historical_raw_actor",
+            actor="system:api",
+            context="security/historical",
+        )
+        AuditEvent.objects.filter(id=historical_raw.id).update(actor=raw_actor)
+        self.client.force_authenticate(user=self._user_with_role("admin"))
+        response = self.client.get("/api/v1/governance/audit/events/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        historical = next(event for event in body["events"] if event["id"] == str(historical_raw.id))
+        self.assertRegex(historical["actor"], r"^legacy_actor:[0-9a-f]{64}$")
+        self.assertNotIn(raw_actor, str(body))
+        self.assertNotIn(sensitive_token, str(body))
 
     def test_legacy_compute_emits_requested_and_redacted_audit_events(self):
         self.client.force_authenticate(user=self._user_with_role("researcher"))
@@ -298,6 +391,7 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(len(audit_call["payload"]["caller_hash"]), 64)
         self.assertEqual(audit_call["payload"]["method"], "POST")
         self.assertEqual(audit_call["context"], "/api/v1/icea-plus/patients/<uuid:patient_id>/score")
+        self.assertRegex(audit_call["actor"], r"^authenticated_user_fallback:[0-9a-f]{64}$")
 
     def test_anonymous_permission_denial_uses_safe_hash_and_unknown_fallback(self):
         anonymous = SimpleNamespace(is_authenticated=False)

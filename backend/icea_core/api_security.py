@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from icea_core.audit_identity import safe_audit_actor, safe_stored_audit_actor
 from icea_pipeline.audit import append_audit_event
 
 
@@ -33,12 +34,9 @@ AUDIT_FIELD_ALLOWLIST = {
 
 
 def request_actor(request) -> str:
-    user = getattr(request, "user", None)
-    if user and getattr(user, "is_authenticated", False):
-        return str(getattr(user, "username", "") or getattr(user, "pk", "") or "authenticated")
-    if getattr(request, "icea_api_key_authenticated", False):
-        return "service"
-    return "anonymous"
+    """Backward-compatible alias for the canonical pseudonymous actor."""
+
+    return safe_audit_actor(request)
 
 
 def append_icea_api_audit(
@@ -57,9 +55,10 @@ def append_icea_api_audit(
         if key in AUDIT_FIELD_ALLOWLIST and value not in (None, "")
     }
     safe_payload.setdefault("endpoint", context)
+    actor = safe_stored_audit_actor(actor_override) if actor_override is not None else safe_audit_actor(request)
     return append_audit_event(
         event_type=event_type,
         payload=safe_payload,
         context=context,
-        actor=actor_override or request_actor(request),
+        actor=actor,
     )

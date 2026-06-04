@@ -18,6 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from icea_core.api_security import append_icea_api_audit
+from icea_core.audit_identity import safe_stored_audit_actor
 from icea_core.aggregation import MIN_AGGREGATE_EPISODES
 from icea_core.permissions import (
     ICEAAdminPermission,
@@ -1175,7 +1176,7 @@ class AuditEventsListView(APIView):
                         "id": str(e.id),
                         "created_at": e.created_at,
                         "event_type": e.event_type,
-                        "actor": e.actor,
+                        "actor": safe_stored_audit_actor(e.actor),
                         "context": e.context,
                         "payload_sha256": e.payload_sha256,
                         "prev_hash": e.prev_hash,

@@ -287,6 +287,13 @@ class AuditEvent(models.Model):
     class Meta:
         indexes = [models.Index(fields=["created_at", "event_type"])]
 
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            from icea_core.audit_identity import safe_stored_audit_actor
+
+            self.actor = safe_stored_audit_actor(self.actor)
+        return super().save(*args, **kwargs)
+
 
 class GovernanceDecision(models.Model):
     """Human-in-the-loop decisions (override/approval/rejection) for high-risk outputs."""

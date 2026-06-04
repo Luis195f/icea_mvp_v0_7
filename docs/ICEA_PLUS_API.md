@@ -548,6 +548,10 @@ callers use a peppered fingerprint of the securely resolved IP and user-agent.
 Missing metadata falls back explicitly to `anonymous_unknown` or
 `service_unknown`; raw identities, IPs, user-agents, authorization headers,
 cookies, tokens, and path identifiers are not stored.
+All request-derived `AuditEvent.actor` values use the stable pseudonymous
+format `<caller_kind>:<peppered-hmac-sha256>`. The low-level audit writer also
+pseudonymizes unexpected raw actors before persistence, and the admin audit
+listing pseudonymizes legacy raw actors before returning them.
 Lineage in the response identifies:
 
 - formula version/hash
