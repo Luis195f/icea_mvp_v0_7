@@ -7,6 +7,7 @@ from unittest import mock
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.core.cache import cache
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -18,6 +19,7 @@ from icea_core.icea_plus_views import (
     ICEAPlusWritebackSummaryView,
 )
 from icea_core.models import ICEAComputation, ModelArtifact
+from icea_core.permissions import _audit_permission_denial, _safe_caller_audit_identity
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_core.views import ICEAComputeView, ModelTrainView
 from icea_pipeline.models import FHIRWritebackRecord
@@ -46,6 +48,8 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         )
         self.env.start()
         self.addCleanup(self.env.stop)
+        cache.clear()
+        self.addCleanup(cache.clear)
         self.client = APIClient()
 
     def _user_with_role(self, role: str):
@@ -219,3 +223,122 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         events = [call.kwargs["event_type"] for call in audit.call_args_list]
         self.assertIn("legacy_compute_requested", events)
         self.assertIn("legacy_compute_redacted", events)
+
+    def test_permission_denial_audits_distinct_authenticated_users_independently(self):
+        user_a = get_user_model().objects.create_user(username="denied-user-a", password="test-pass")
+        user_b = get_user_model().objects.create_user(username="denied-user-b", password="test-pass")
+        view = ICEAPlusScoreView()
+        request_a = SimpleNamespace(user=user_a, path="/api/v1/icea-plus/score/", method="POST", META={})
+        request_b = SimpleNamespace(user=user_b, path="/api/v1/icea-plus/score/", method="POST", META={})
+
+        with mock.patch("icea_core.api_security.append_icea_api_audit") as audit:
+            _audit_permission_denial(request_a, view, error_code="insufficient_role")
+            _audit_permission_denial(request_b, view, error_code="insufficient_role")
+
+        self.assertEqual(audit.call_count, 2)
+        caller_hashes = [call.kwargs["caller_hash"] for call in audit.call_args_list]
+        self.assertEqual(len(set(caller_hashes)), 2)
+
+    def test_permission_denial_deduplicates_repeated_authenticated_user(self):
+        user = get_user_model().objects.create_user(username="denied-repeat-user", password="test-pass")
+        view = ICEAPlusScoreView()
+        request = SimpleNamespace(user=user, path="/api/v1/icea-plus/score/", method="POST", META={})
+
+        with mock.patch("icea_core.api_security.append_icea_api_audit") as audit:
+            _audit_permission_denial(request, view, error_code="insufficient_role")
+            _audit_permission_denial(request, view, error_code="insufficient_role")
+
+        audit.assert_called_once()
+
+    def test_permission_denial_cache_key_and_event_exclude_sensitive_identity_and_headers(self):
+        sensitive_email = "clinical.user@example.test"
+        sensitive_token = "Bearer raw-secret-token"
+        sensitive_cookie = "sessionid=raw-secret-cookie"
+        sensitive_path_identifier = "patient-record-123"
+        fallback_user = SimpleNamespace(
+            is_authenticated=True,
+            pk=None,
+            id=None,
+            username="",
+            email=sensitive_email,
+        )
+        request = SimpleNamespace(
+            user=fallback_user,
+            path=f"/api/v1/icea-plus/patients/{sensitive_path_identifier}/score/?ignored=true",
+            method="post",
+            resolver_match=SimpleNamespace(route="api/v1/icea-plus/patients/<uuid:patient_id>/score/"),
+            META={
+                "REMOTE_ADDR": "198.51.100.10",
+                "HTTP_USER_AGENT": "Sensitive User Agent",
+                "HTTP_AUTHORIZATION": sensitive_token,
+                "HTTP_COOKIE": sensitive_cookie,
+            },
+            headers={"Authorization": sensitive_token, "Cookie": sensitive_cookie},
+        )
+
+        with (
+            mock.patch("icea_core.permissions.cache.add", return_value=True) as cache_add,
+            mock.patch("icea_core.api_security.append_audit_event") as audit,
+        ):
+            _audit_permission_denial(request, ICEAPlusScoreView(), error_code="insufficient_role")
+
+        cache_key = cache_add.call_args.args[0]
+        audit_call = audit.call_args.kwargs
+        serialized = str({"cache_key": cache_key, "audit": audit_call})
+        for sensitive in (
+            sensitive_email,
+            sensitive_token,
+            sensitive_cookie,
+            sensitive_path_identifier,
+            "198.51.100.10",
+            "Sensitive User Agent",
+        ):
+            self.assertNotIn(sensitive, serialized)
+        self.assertEqual(audit_call["payload"]["caller_kind"], "authenticated_user_fallback")
+        self.assertEqual(len(audit_call["payload"]["caller_hash"]), 64)
+        self.assertEqual(audit_call["payload"]["method"], "POST")
+        self.assertEqual(audit_call["context"], "/api/v1/icea-plus/patients/<uuid:patient_id>/score")
+
+    def test_anonymous_permission_denial_uses_safe_hash_and_unknown_fallback(self):
+        anonymous = SimpleNamespace(is_authenticated=False)
+        view = ICEAPlusScoreView()
+        request_a = SimpleNamespace(
+            user=anonymous,
+            path="/api/v1/icea-plus/score/",
+            method="POST",
+            META={"REMOTE_ADDR": "198.51.100.20", "HTTP_USER_AGENT": "client-a"},
+        )
+        request_b = SimpleNamespace(
+            user=anonymous,
+            path="/api/v1/icea-plus/score/",
+            method="POST",
+            META={"REMOTE_ADDR": "198.51.100.21", "HTTP_USER_AGENT": "client-b"},
+        )
+        unknown = SimpleNamespace(user=anonymous, path="/api/v1/icea-plus/score/", method="POST", META={})
+
+        kind_a, hash_a = _safe_caller_audit_identity(request_a)
+        kind_b, hash_b = _safe_caller_audit_identity(request_b)
+        unknown_kind, unknown_hash = _safe_caller_audit_identity(unknown)
+
+        self.assertEqual(kind_a, "anonymous_client")
+        self.assertEqual(kind_b, "anonymous_client")
+        self.assertNotEqual(hash_a, hash_b)
+        self.assertEqual(unknown_kind, "anonymous_unknown")
+        self.assertEqual(len(unknown_hash), 64)
+        self.assertNotIn("198.51.100.20", hash_a)
+
+        with mock.patch("icea_core.api_security.append_icea_api_audit") as audit:
+            _audit_permission_denial(request_a, view, error_code="auth_required")
+            _audit_permission_denial(request_b, view, error_code="auth_required")
+        self.assertEqual(audit.call_count, 2)
+
+    def test_permission_denial_remains_fail_closed(self):
+        self.client.force_authenticate(user=self.regular_user)
+
+        response = self.client.post(
+            "/api/v1/icea-plus/calibrate/",
+            {"version": "must-remain-blocked", "spec": {"weights": {"benefit": 1.0}}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)

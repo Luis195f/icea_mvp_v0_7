@@ -11,6 +11,8 @@ from icea_pipeline.audit import append_audit_event
 AUDIT_FIELD_ALLOWLIST = {
     "action",
     "baseline_model_id",
+    "caller_hash",
+    "caller_kind",
     "effective_group_by",
     "endpoint",
     "error_code",
@@ -18,6 +20,7 @@ AUDIT_FIELD_ALLOWLIST = {
     "formula_version",
     "grain",
     "model_id",
+    "method",
     "requested_group_by",
     "request_hash",
     "role",
@@ -38,7 +41,14 @@ def request_actor(request) -> str:
     return "anonymous"
 
 
-def append_icea_api_audit(*, request, event_type: str, context: str, **fields: Any) -> str | None:
+def append_icea_api_audit(
+    *,
+    request,
+    event_type: str,
+    context: str,
+    actor_override: str | None = None,
+    **fields: Any,
+) -> str | None:
     """Append an audit event while dropping non-allowlisted clinical fields."""
 
     safe_payload = {
@@ -51,5 +61,5 @@ def append_icea_api_audit(*, request, event_type: str, context: str, **fields: A
         event_type=event_type,
         payload=safe_payload,
         context=context,
-        actor=request_actor(request),
+        actor=actor_override or request_actor(request),
     )

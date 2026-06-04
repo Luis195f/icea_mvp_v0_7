@@ -540,6 +540,14 @@ ICEA+ requests, blocks, exports, training, causal runs, suppression, and writeba
 requests are added to the audit chain. The API audit helper uses an explicit
 allowlist and drops clinical rows, FHIR payloads, patient identifiers, and
 episode identifiers before hashing the event.
+Permission-denial audit spam is deduplicated for 60 seconds per normalized
+resolved route, method, error, and peppered caller hash. If no resolved route
+is available, the view class is used rather than a potentially identifying raw
+path. Authenticated callers use their stable user key; anonymous/service
+callers use a peppered fingerprint of the securely resolved IP and user-agent.
+Missing metadata falls back explicitly to `anonymous_unknown` or
+`service_unknown`; raw identities, IPs, user-agents, authorization headers,
+cookies, tokens, and path identifiers are not stored.
 Lineage in the response identifies:
 
 - formula version/hash

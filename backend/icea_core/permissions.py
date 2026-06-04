@@ -28,9 +28,12 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from django.conf import settings
 from django.core.cache import cache
 
 from rest_framework.permissions import BasePermission
+
+from icea_core.net import get_client_ip
 
 
 ICEA_ROLES = {"viewer_aggregate", "researcher", "admin", "service"}
@@ -151,20 +154,91 @@ def _dev_insecure_auth_rbac_bypass_allowed() -> bool:
     )
 
 
+def _audit_identity_hash(value: str) -> str:
+    secret = str(getattr(settings, "AUDIT_LOG_SECRET", "") or settings.SECRET_KEY or "icea-audit-identity")
+    return hmac.new(secret.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _safe_caller_audit_identity(request) -> tuple[str, str]:
+    """Return a non-reversible caller identity for audit deduplication.
+
+    Authenticated users use their stable database key when available. Anonymous
+    and API-key callers use only a peppered hash of securely resolved client IP
+    and user-agent. Authorization, cookies, API keys, and raw identifiers are
+    never included. Missing metadata degrades to an explicit unknown identity.
+    """
+
+    user = getattr(request, "user", None)
+    if user and getattr(user, "is_authenticated", False):
+        user_pk = getattr(user, "pk", None)
+        if user_pk in (None, ""):
+            user_pk = getattr(user, "id", None)
+        if user_pk not in (None, ""):
+            return "authenticated_user", _audit_identity_hash(f"user_pk:{user_pk}")
+
+        fallback = str(getattr(user, "username", "") or getattr(user, "email", "") or "").strip().lower()
+        if fallback:
+            return "authenticated_user_fallback", _audit_identity_hash(f"user_fallback:{fallback}")
+        return "authenticated_unknown", _audit_identity_hash("authenticated_unknown")
+
+    meta = getattr(request, "META", {}) or {}
+    try:
+        client_ip = str(get_client_ip(request) or "").strip()
+    except Exception:
+        client_ip = ""
+    if client_ip in {"0.0.0.0", "::"}:
+        client_ip = ""
+    user_agent = str(meta.get("HTTP_USER_AGENT") or "").strip()
+
+    caller_kind = "service_client" if _api_key_authenticated(request) else "anonymous_client"
+    if client_ip or user_agent:
+        return caller_kind, _audit_identity_hash(f"ip:{client_ip}|ua:{user_agent}")
+
+    caller_kind = "service_unknown" if _api_key_authenticated(request) else "anonymous_unknown"
+    return caller_kind, _audit_identity_hash(caller_kind)
+
+
+def _normalized_permission_audit_path(request, view) -> str:
+    resolver_match = getattr(request, "resolver_match", None)
+    route = str(getattr(resolver_match, "route", "") or "").strip()
+    if route:
+        normalized = "/" + "/".join(part for part in route.split("/") if part)
+        return normalized or "/"
+    # Raw paths can contain clinical identifiers; the view class is the safe fallback.
+    return view.__class__.__name__
+
+
 def _audit_permission_denial(request, view, *, error_code: str) -> None:
     try:
         from icea_core.api_security import append_icea_api_audit
 
-        path = str(getattr(request, "path", "") or view.__class__.__name__)
-        audit_key = "icea:permission-denial-audit:" + hashlib.sha256(f"{path}:{error_code}".encode("utf-8")).hexdigest()
+        path = _normalized_permission_audit_path(request, view)
+        method = str(getattr(request, "method", "") or "UNKNOWN").upper()
+        caller_kind, caller_hash = _safe_caller_audit_identity(request)
+        dedupe_material = json.dumps(
+            {
+                "caller_hash": caller_hash,
+                "caller_kind": caller_kind,
+                "error_code": error_code,
+                "method": method,
+                "path": path,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        audit_key = "icea:permission-denial-audit:" + _audit_identity_hash(dedupe_material)
         if not cache.add(audit_key, "1", timeout=60):
             return
         append_icea_api_audit(
             request=request,
             event_type="auth_required" if error_code == "auth_required" else "permission_denied",
             context=path,
+            actor_override=f"{caller_kind}:{caller_hash}",
             action=view.__class__.__name__,
+            caller_hash=caller_hash,
+            caller_kind=caller_kind,
             error_code=error_code,
+            method=method,
             status="blocked",
         )
     except Exception:
