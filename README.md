@@ -45,6 +45,13 @@ Services:
 - Swagger docs: `http://localhost:8000/api/v1/docs/`
 - Dashboard (Streamlit): `http://localhost:8501/`
 
+When `ICEA_SEED_DEMO=true`, the Docker entrypoint creates a governed synthetic
+demo model and enough observed demo rows for aggregate exploration. The model is
+usable only as `shadow_aggregate_research`; it is not clinically validated, MDR
+production-ready, or suitable for individual decisioning. Demo seeding fails
+closed if the generated evidence pack cannot satisfy the normal model-evidence
+gate.
+
 ---
 
 ## Endpoints (backwards compatible)

@@ -138,6 +138,14 @@ prevent a model from being presented as defendible. `shadow_aggregate_research`
 means aggregate, exploratory monitoring only; it is not clinical validation and
 is not MDR production readiness.
 
+The optional Docker `seed_demo` command uses the same evidence gate as every
+other training route. It generates deterministic synthetic rows with observed
+feature, temporal, outcome, validation, calibration, and case-mix support, then
+registers the artifact only when it is defensible for
+`shadow_aggregate_research`. This demo status is not a clinical validation
+claim, is not MDR production readiness, and never permits individual
+decisioning or individual score exposure.
+
 The legacy `POST /icea/compute/` route is retained as a controlled compatibility
 surface, but it does not execute or return individual `predictions`, `icea`,
 `contributions`, scores, or numeric summaries. Successful requests return
