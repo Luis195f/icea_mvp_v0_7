@@ -101,13 +101,143 @@ def _apply_shadow_row_governance(row: dict[str, Any], *, suppress_numeric_score:
     return row
 
 
+def _public_boolean_flags(flags: dict[str, Any] | None) -> dict[str, bool]:
+    return {str(key): value for key, value in dict(flags or {}).items() if isinstance(value, bool)}
+
+
+def _public_feature_contract(feature_contract: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(feature_contract or {})
+    public: dict[str, Any] = {}
+    for key in (
+        "contract_version",
+        "source_repo",
+        "expected_contract_version",
+        "expected_source_repo",
+    ):
+        if isinstance(source.get(key), str):
+            public[key] = source[key]
+    for key in (
+        "expected_contract_versions",
+        "expected_source_repos",
+        "missing_features",
+        "missing_critical_features",
+        "validated_model_roles",
+    ):
+        if isinstance(source.get(key), list):
+            public[key] = [value for value in source[key] if isinstance(value, str)]
+    return public
+
+
+def _public_lineage(lineage: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(lineage or {})
+    public: dict[str, Any] = {}
+    for key in (
+        "formula_version",
+        "formula_protocol_hash",
+        "model_id",
+        "model_version",
+        "baseline_model_id",
+        "causal_spec_hash",
+        "outcome",
+        "outcome_goal",
+        "treatment",
+    ):
+        value = source.get(key)
+        if value is None or isinstance(value, str):
+            public[key] = value
+
+    source_metadata = {}
+    for key in (
+        "grain",
+        "request_hash",
+        "formula_source",
+        "feature_contract_status",
+        "temporal_status",
+    ):
+        value = dict(source.get("source") or {}).get(key)
+        if isinstance(value, (str, bool)):
+            source_metadata[key] = value
+    if source_metadata:
+        public["source"] = source_metadata
+    return public
+
+
+def _redact_shadow_public_row(row: dict[str, Any]) -> dict[str, Any]:
+    source = dict(row or {})
+    had_numeric_score = source.get("score") is not None or source.get("raw_score") is not None
+    public: dict[str, Any] = {}
+    for key in ("row_id", "grain", "episode_id", "window_id", "unit_id", "start_dt", "end_dt"):
+        if key in source:
+            public[key] = source[key]
+
+    public.update(
+        {
+            "status": "shadow_only" if had_numeric_score else str(source.get("status") or "shadow_only"),
+            "provisional": bool(source.get("provisional", False)),
+            "score": None,
+            "raw_score": None,
+            "score_suppressed": True,
+            "derived_values_redacted": True,
+            "suppression_reason": "individual_shadow_score_and_derivatives_are_not_exportable",
+            "warnings": [warning for warning in list(source.get("warnings") or []) if isinstance(warning, str)],
+            "flags": {
+                **_public_boolean_flags(source.get("flags")),
+                "shadow_mode": True,
+                "non_individual_use": True,
+            },
+            "shadow_mode": True,
+            "non_individual_use": True,
+            "intended_use": "shadow_aggregate_research",
+        }
+    )
+    feature_contract = _public_feature_contract(source.get("feature_contract"))
+    if feature_contract:
+        public["feature_contract"] = feature_contract
+    lineage = _public_lineage(source.get("lineage"))
+    if lineage:
+        public["lineage"] = lineage
+    return public
+
+
+def _redact_shadow_public_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(summary or {})
+    public: dict[str, Any] = {}
+    for key in ("rows_requested", "rows_scored"):
+        value = source.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            public[key] = value
+    for key in ("formula_version", "formula_protocol_hash", "baseline_mode"):
+        if isinstance(source.get(key), str):
+            public[key] = source[key]
+    if isinstance(source.get("causal_available"), bool):
+        public["causal_available"] = source["causal_available"]
+    if isinstance(source.get("status_counts"), dict):
+        public["status_counts"] = {
+            str(key): value
+            for key, value in source["status_counts"].items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+    public["warnings"] = [warning for warning in list(source.get("warnings") or []) if isinstance(warning, str)]
+    public.update(
+        {
+            "score_summary": None,
+            "score_summary_redacted": True,
+            "summary_redacted": True,
+            "redaction_reason": "non_individual_shadow_mode",
+        }
+    )
+    return public
+
+
 def redact_shadow_score_response(result: dict[str, Any]) -> dict[str, Any]:
     public = deepcopy(result)
     public.pop("_aggregate_rows", None)
-    public["results"] = [
-        _apply_shadow_row_governance(dict(row), suppress_numeric_score=bool(row.get("score") is not None))
-        for row in list(public.get("results") or [])
-    ]
+    public["results"] = [_redact_shadow_public_row(row) for row in list(public.get("results") or [])]
+    public["summary"] = _redact_shadow_public_summary(public.get("summary"))
+    public["score_summary"] = None
+    public["score_summary_redacted"] = True
+    public["summary_redacted"] = True
+    public["redaction_reason"] = "non_individual_shadow_mode"
     return public
 
 
@@ -1497,7 +1627,7 @@ def score_icea_plus(
             score_dict["warnings"].append("ood_detected")
         score_dict["warnings"] = sorted(set(score_dict["warnings"]))
         aggregate_rows.append(_apply_shadow_row_governance(deepcopy(score_dict), suppress_numeric_score=False))
-        results.append(_apply_shadow_row_governance(score_dict, suppress_numeric_score=True))
+        results.append(_redact_shadow_public_row(score_dict))
 
     scored_rows = [row for row in aggregate_rows if row.get("score") is not None]
     component_means = {}

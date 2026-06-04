@@ -17,6 +17,7 @@ from icea_core.followup import (
     persist_initial_followup_records,
 )
 from icea_core.models import ICEAPlusComputation, ICEAPlusFollowupRecord, ModelArtifact
+from icea_core.scoring import redact_shadow_score_response
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_pipeline.models import EpisodeWindowFeatureRow
 from icea_pipeline.temporal import CASE_MIX_REQUIRED_DOMAINS
@@ -77,7 +78,99 @@ def create_artifact(*, evidence_pack=None, metrics=None, features=None):
     )
 
 
+def nested_keys(value):
+    keys = set()
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            keys.add(key)
+            keys.update(nested_keys(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            keys.update(nested_keys(nested))
+    return keys
+
+
+PUBLIC_INDIVIDUAL_DERIVED_KEYS = {
+    "aggregation",
+    "attribution",
+    "attributions",
+    "baseline",
+    "baseline_expected",
+    "baseline_prediction",
+    "benefit",
+    "breakdown",
+    "breakdowns",
+    "component_means",
+    "components",
+    "confidence",
+    "contributions",
+    "default_pilot_weights",
+    "explanation",
+    "explanations",
+    "feature_coverage",
+    "legacy_icea",
+    "prediction",
+    "predictions",
+    "shap",
+    "transformations",
+    "uncertainty",
+}
+
+
 class ModelEvidenceUnitTests(TestCase):
+    def test_shadow_response_redaction_removes_individual_numeric_derivatives(self):
+        raw = {
+            "summary": {
+                "rows_requested": 1,
+                "rows_scored": 1,
+                "status_counts": {"complete": 1},
+                "component_means": {"benefit": 0.4},
+                "default_pilot_weights": {"benefit": 1.0},
+            },
+            "results": [
+                {
+                    "row_id": "episode:1",
+                    "status": "complete",
+                    "score": 72.0,
+                    "raw_score": 0.9,
+                    "confidence": {"value": 0.8},
+                    "components": {"benefit": {"raw": 1.0, "normalized": 0.4}},
+                    "prediction": 9.0,
+                    "predictions": [9.0],
+                    "baseline": 7.0,
+                    "baseline_prediction": 7.0,
+                    "benefit": 2.0,
+                    "legacy_icea": {"prediction": 9.0},
+                    "uncertainty": 0.2,
+                    "shap": {"nurse_hppd": 0.2},
+                    "contributions": {"nurse_hppd": 0.2},
+                    "attributions": {"nurse_hppd": 0.2},
+                    "explanation": {"numeric_payload": 0.2},
+                    "breakdown": {"benefit": 0.4},
+                    "aggregation": {"nurse_reliability": 0.9},
+                    "lineage": {
+                        "formula_version": "icea_plus_v1",
+                        "transformations": {"baseline_reference_values": {"nurse_hppd": 2.0}},
+                        "source": {"request_hash": "sha256:test", "reference_rows": 100},
+                    },
+                }
+            ],
+            "_aggregate_rows": [{"score": 72.0, "components": {"benefit": {"normalized": 0.4}}}],
+        }
+
+        public = redact_shadow_score_response(raw)
+
+        self.assertNotIn("_aggregate_rows", public)
+        self.assertTrue(PUBLIC_INDIVIDUAL_DERIVED_KEYS.isdisjoint(nested_keys(public["results"][0])))
+        self.assertTrue(PUBLIC_INDIVIDUAL_DERIVED_KEYS.isdisjoint(nested_keys(public["summary"])))
+        self.assertEqual(public["results"][0]["status"], "shadow_only")
+        self.assertIsNone(public["results"][0]["score"])
+        self.assertIsNone(public["results"][0]["raw_score"])
+        self.assertEqual(public["summary"]["rows_scored"], 1)
+        self.assertEqual(public["summary"]["status_counts"]["complete"], 1)
+        self.assertIsNone(public["score_summary"])
+        self.assertTrue(public["score_summary_redacted"])
+
     def test_matching_evidence_and_artifact_features_can_be_defensible(self):
         artifact = create_artifact(
             evidence_pack=complete_evidence_pack(
@@ -944,6 +1037,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertTrue(body["shadow_mode"])
         self.assertTrue(body["non_individual_use"])
         self.assertEqual(body["intended_use"], INTENDED_USE_SHADOW_AGGREGATE)
+        self.assertNotIn("_aggregate_rows", body)
         row = body["results"][0]
         self.assertTrue(row["shadow_mode"])
         self.assertTrue(row["non_individual_use"])
@@ -953,6 +1047,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(row["status"], "shadow_only")
         self.assertIsNone(row["score"])
         self.assertIsNone(row["raw_score"])
+        self.assertTrue(PUBLIC_INDIVIDUAL_DERIVED_KEYS.isdisjoint(nested_keys(row)))
         summary = body["summary"]
         self.assertGreater(summary["rows_scored"], 0)
         self.assertEqual(
@@ -963,6 +1058,11 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
             summary["status_counts"]["complete"] + summary["status_counts"]["provisional"],
             0,
         )
+        self.assertTrue(PUBLIC_INDIVIDUAL_DERIVED_KEYS.isdisjoint(nested_keys(summary)))
+        self.assertTrue(summary["summary_redacted"])
+        self.assertIsNone(summary["score_summary"])
+        self.assertTrue(body["score_summary_redacted"])
+        self.assertIsNone(body["score_summary"])
         computation = ICEAPlusComputation.objects.filter(model=self.episode_artifact).order_by("-created_at").first()
         self.assertIsNotNone(computation)
         self.assertEqual(computation.summary, summary)
@@ -973,6 +1073,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         patient_summary = build_patient_summary(record)
         self.assertIsNone(patient_summary["initial_score"]["score"])
         self.assertNotIn(INTERNAL_AGGREGATE_ROW_KEY, patient_summary["initial_score"])
+        self.assertTrue(PUBLIC_INDIVIDUAL_DERIVED_KEYS.isdisjoint(nested_keys(patient_summary["initial_score"])))
 
     def test_score_blocks_non_defensible_baseline_model_before_numeric_benefit(self):
         baseline = create_artifact(

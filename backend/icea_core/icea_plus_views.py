@@ -177,10 +177,13 @@ class ICEAPlusScoreView(APIView):
         if result.get("detail"):
             return Response(result, status=400)
 
-        summary = dict(result.get("summary") or {})
+        public_result = redact_shadow_score_response(result)
+        summary = dict(public_result.get("summary") or {})
         request_hash = ""
-        if result.get("results"):
-            request_hash = str((((result["results"][0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
+        if public_result.get("results"):
+            request_hash = str(
+                ((((public_result["results"][0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
+            )
         computation = ICEAPlusComputation.objects.create(
             formula_version=result["formula_version"],
             model=artifact,
@@ -208,7 +211,7 @@ class ICEAPlusScoreView(APIView):
                 computation=computation,
                 request_config=dict(payload),
             )
-        return Response(redact_shadow_score_response(result))
+        return Response(public_result)
 
 
 class ICEAPlusAggregateView(APIView):

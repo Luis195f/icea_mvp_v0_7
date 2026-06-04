@@ -155,8 +155,10 @@ def _latest(*values: datetime | None) -> datetime | None:
 
 
 def _nurse_reliability_warning(result_row: dict[str, Any]) -> list[str]:
-    reliability = float(((result_row.get("aggregation") or {}).get("nurse_reliability")) or 0.0)
-    shares = dict((result_row.get("aggregation") or {}).get("nurse_shares") or {})
+    aggregate_row = result_row.get(INTERNAL_AGGREGATE_ROW_KEY)
+    source = aggregate_row if isinstance(aggregate_row, dict) else result_row
+    reliability = float(((source.get("aggregation") or {}).get("nurse_reliability")) or 0.0)
+    shares = dict((source.get("aggregation") or {}).get("nurse_shares") or {})
     if reliability < 0.60 or not shares:
         return ["non_individual_use_team_or_unit_only", "low_support"]
     return ["non_individual_use_team_or_unit_only"]
@@ -165,18 +167,19 @@ def _nurse_reliability_warning(result_row: dict[str, Any]) -> list[str]:
 def _compact_score_payload(result_row: dict[str, Any], *, scored_at: datetime | None) -> dict[str, Any]:
     if not result_row:
         return {}
-    lineage = dict(result_row.get("lineage") or {})
+    public_row = redact_shadow_score_response({"results": [_public_stored_result(result_row)]})["results"][0]
+    lineage = dict(public_row.get("lineage") or {})
     return {
         "status": "shadow_only",
-        "source_status": result_row.get("status"),
+        "source_status": public_row.get("status"),
         "score": None,
         "raw_score": None,
         "score_suppressed": True,
         "suppression_reason": "patient_episode_score_is_not_operational_or_exportable",
-        "confidence": dict(result_row.get("confidence") or {}),
-        "warnings": list(result_row.get("warnings") or []),
+        "derived_values_redacted": True,
+        "warnings": list(public_row.get("warnings") or []),
         "flags": {
-            **dict(result_row.get("flags") or {}),
+            **dict(public_row.get("flags") or {}),
             "non_individual_use": True,
             "shadow_mode": True,
             "operational_score": False,
@@ -414,12 +417,13 @@ def _computation_from_result(
     stage: str,
     linked_initial_computation_id: str | None = None,
 ) -> ICEAPlusComputation:
-    summary = dict(result.get("summary") or {})
+    public_result = redact_shadow_score_response(result)
+    summary = dict(public_result.get("summary") or {})
     summary["longitudinal_stage"] = stage
     if linked_initial_computation_id:
         summary["linked_initial_computation_id"] = linked_initial_computation_id
     request_hash = ""
-    rows = list(result.get("results") or [])
+    rows = list(public_result.get("results") or [])
     if rows:
         request_hash = str((((rows[0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
     return ICEAPlusComputation.objects.create(

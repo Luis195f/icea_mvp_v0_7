@@ -202,58 +202,48 @@ exposes `limitations_status` and `temporal_guardrail_status` alongside
     "rows_scored": 12,
     "baseline_mode": "counterfactual_nursing_reference",
     "causal_available": true,
-    "default_pilot_weights": {
-      "intercept": 0.0,
-      "benefit": 1.0,
-      "attribution": 1.0,
-      "causal": 1.0,
-      "quality": 1.0,
-      "uncertainty": 1.0
-    },
     "status_counts": {
       "complete": 10,
       "provisional": 2,
       "insufficient_evidence": 0
     },
-    "component_means": {
-      "benefit": 0.31,
-      "attribution": 0.18,
-      "causal": 0.11,
-      "quality": 0.22,
-      "uncertainty": -0.09
-    }
+    "score_summary": null,
+    "score_summary_redacted": true,
+    "summary_redacted": true,
+    "redaction_reason": "non_individual_shadow_mode"
   },
   "results": [
     {
       "row_id": "episode:101",
-      "status": "complete",
+      "status": "shadow_only",
       "provisional": false,
-      "score": 67.4,
-      "raw_score": 0.73,
-      "confidence": {"value": 0.81, "label": "high"},
+      "score": null,
+      "raw_score": null,
+      "score_suppressed": true,
+      "derived_values_redacted": true,
       "flags": {
         "causal_available": true,
         "low_support": false,
         "high_uncertainty": false,
         "missing_key_inputs": false,
-        "insufficient_evidence": false
-      },
-      "components": {
-        "benefit": {"raw": 0.9, "normalized": 0.4, "available": true},
-        "attribution": {"raw": 0.12, "normalized": 0.2, "available": true},
-        "causal": {"raw": 0.3, "normalized": 0.1, "available": true},
-        "quality": {"raw": 0.8, "normalized": 0.3, "available": true},
-        "uncertainty": {"raw": 0.2, "normalized": -0.1, "available": true}
-      },
-      "legacy_icea": {
-        "nursing_shap_sum": 0.41,
-        "prediction": 9.5,
-        "baseline_expected": 8.1
+        "insufficient_evidence": false,
+        "shadow_mode": true,
+        "non_individual_use": true
       }
     }
-  ]
+  ],
+  "score_summary": null,
+  "score_summary_redacted": true,
+  "summary_redacted": true,
+  "redaction_reason": "non_individual_shadow_mode"
 }
 ```
+
+The row-level score response is intentionally allow-listed. It never exports
+individual numeric derivatives such as confidence, predictions, baselines,
+benefit, component breakdowns, SHAP/contributions, uncertainty, legacy ICEA,
+aggregation support, or lineage transformations. Full numeric rows remain
+internal and are only consumed by governed aggregate and follow-up workflows.
 
 ### GET `/api/v1/icea-plus/explain/`
 
