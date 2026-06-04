@@ -11,26 +11,30 @@ import numpy as np
 import pandas as pd
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from icea_core.api_security import append_icea_api_audit
+from icea_core.aggregation import MIN_AGGREGATE_EPISODES
 from icea_core.permissions import (
+    ICEAAdminPermission,
     ICEAAdminOrServicePermission,
-    ICEABackwardCompatiblePermission,
+    ICEAAggregateViewerPermission,
     ICEACausalDiscoverPermission,
     ICEAFederatedPermission,
     ICEAResearcherPermission,
     ICEASimulatePermission,
+    ICEATrainingPermission,
     RequiresAntiReplayHMAC,
 )
 
 from fhir_integration.facade import FHIRFacade
 from fhir_integration.service import FHIRClient
 from icea_core.engine import ICEAEngine
-from icea_core.evidence import build_training_evidence_metadata
+from icea_core.evidence import build_training_evidence_metadata, summarize_model_evidence
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import ICEAComputation, ModelArtifact, PatientEpisode
 
@@ -90,6 +94,13 @@ def _stable_schema_hash(features: dict[str, Any], target: dict[str, Any]) -> str
     return hashlib.sha256(("|".join(sorted(features.keys())) + "#" + "|".join(sorted(target.keys()))).encode("utf-8")).hexdigest()
 
 
+def _support_safe_count(value: int) -> int | None:
+    value = int(value)
+    if 0 < value < MIN_AGGREGATE_EPISODES:
+        return None
+    return value
+
+
 def _to_utc_aware(value: Any):
     if isinstance(value, datetime):
         dt = value
@@ -128,7 +139,7 @@ class PipelineIngestView(APIView):
 
     # Optional HMAC signing (v0.7.2) + optional anti-replay (v0.7.3).
     # Enforced only when ICEA_AUDIT_SIGNING_REQUIRED=true.
-    permission_classes = [ICEABackwardCompatiblePermission, RequiresAntiReplayHMAC]
+    permission_classes = [ICEAAdminOrServicePermission, RequiresAntiReplayHMAC]
 
     # Scoped throttling (v0.7.3): applies only when ICEA_ENABLE_THROTTLING=true
     # and a matching ICEA_THROTTLE_SCOPE_INGEST rate is configured.
@@ -332,6 +343,9 @@ class PipelineNormalizeView(APIView):
     previously ingested in the same episode.
     """
 
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_writeback"
+
     def post(self, request):
         ser = NormalizeFHIRSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -391,6 +405,9 @@ class PipelineBuildDatasetView(APIView):
 
     v0.4 adds roster-derived exposures and data-quality snapshots.
     """
+
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = BuildDatasetSerializer(data=request.data)
@@ -549,6 +566,9 @@ class PipelineBuildWindowsView(APIView):
 
     v0.5: episode-windows support shift-level target-trial emulation (e.g., 12h windows).
     """
+
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = BuildWindowsSerializer(data=request.data)
@@ -843,6 +863,9 @@ class PipelineBuildWindowsView(APIView):
 class PipelineTrainFromDBView(APIView):
     """Train model using DB materialized dataset."""
 
+    permission_classes = [ICEATrainingPermission]
+    throttle_scope = "icea_train"
+
     def post(self, request):
         ser = TrainFromDBSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -868,7 +891,26 @@ class PipelineTrainFromDBView(APIView):
             row.update(r.target)
             dataset.append(row)
 
+        append_icea_api_audit(
+            request=request,
+            event_type="model_train_requested",
+            context="pipeline/train",
+            action="train",
+            row_count=int(len(dataset)),
+            grain=dataset_grain,
+            status="requested",
+        )
         if not dataset:
+            append_icea_api_audit(
+                request=request,
+                event_type="model_train_blocked",
+                context="pipeline/train",
+                action="train",
+                row_count=0,
+                grain=dataset_grain,
+                error_code="dataset_empty",
+                status="blocked",
+            )
             if dataset_grain == "window":
                 return Response({"detail": "No window dataset rows. Run build-windows first.", "dataset_grain": dataset_grain}, status=400)
             return Response({"detail": "No dataset rows. Run build-dataset first.", "dataset_grain": dataset_grain}, status=400)
@@ -876,6 +918,16 @@ class PipelineTrainFromDBView(APIView):
         df = pd.DataFrame(dataset)
         temporal_issues = validate_temporal_frame(df, feature_names=[c for c in df.columns if c != target], target=target)
         if temporal_issues:
+            append_icea_api_audit(
+                request=request,
+                event_type="model_train_blocked",
+                context="pipeline/train",
+                action="train",
+                row_count=int(len(df)),
+                grain=dataset_grain,
+                error_code="dataset_not_temporally_defensible",
+                status="blocked",
+            )
             return Response(
                 {
                     "detail": "dataset_not_temporally_defensible",
@@ -939,6 +991,17 @@ class PipelineTrainFromDBView(APIView):
             },
             context="pipeline/train",
         )
+        append_icea_api_audit(
+            request=request,
+            event_type="model_train_completed",
+            context="pipeline/train",
+            action="train",
+            model_id=str(artifact.id),
+            row_count=int(len(df)),
+            grain=dataset_grain,
+            evidence_status=summarize_model_evidence(artifact).evidence_status,
+            status="completed",
+        )
         return Response(
             {
                 "model_id": str(artifact.id),
@@ -951,6 +1014,9 @@ class PipelineTrainFromDBView(APIView):
 
 
 class DashboardSummaryView(APIView):
+    permission_classes = [ICEAAggregateViewerPermission]
+    throttle_scope = "icea_read"
+
     def get(self, request):
         latest_model = ModelArtifact.objects.order_by("-created_at").first()
         latest_train = TrainingRun.objects.order_by("-created_at").first()
@@ -959,60 +1025,81 @@ class DashboardSummaryView(APIView):
         latest_dq = DataQualitySnapshot.objects.order_by("-created_at").first()
         latest_gov = GovernanceDecision.objects.order_by("-created_at").first()
 
+        append_icea_api_audit(
+            request=request,
+            event_type="dashboard_summary_requested",
+            context="dashboard/summary",
+            action="aggregate",
+            status="requested",
+        )
         return Response(
             {
-                "episodes": PatientEpisode.objects.count(),
-                "raw_fhir": RawFHIRResource.objects.count(),
-                "roster_shifts": RosterShift.objects.count(),
+                "episodes": _support_safe_count(PatientEpisode.objects.count()),
+                "raw_fhir": _support_safe_count(RawFHIRResource.objects.count()),
+                "roster_shifts": _support_safe_count(RosterShift.objects.count()),
                 "normalized": {
-                    "observations": NormalizedObservation.objects.count(),
-                    "conditions": NormalizedCondition.objects.count(),
-                    "procedures": NormalizedProcedure.objects.count(),
+                    "observations": _support_safe_count(NormalizedObservation.objects.count()),
+                    "conditions": _support_safe_count(NormalizedCondition.objects.count()),
+                    "procedures": _support_safe_count(NormalizedProcedure.objects.count()),
                 },
-                "dataset_rows": EpisodeFeatureRow.objects.count(),
-                "windows": EpisodeWindow.objects.count(),
-                "window_rows": EpisodeWindowFeatureRow.objects.count(),
+                "dataset_rows": _support_safe_count(EpisodeFeatureRow.objects.count()),
+                "windows": _support_safe_count(EpisodeWindow.objects.count()),
+                "window_rows": _support_safe_count(EpisodeWindowFeatureRow.objects.count()),
                 "audit_events": AuditEvent.objects.count(),
                 "governance_decisions": GovernanceDecision.objects.count(),
-                "writebacks": {"count": FHIRWritebackRecord.objects.count()},
+                "writebacks": {"count": _support_safe_count(FHIRWritebackRecord.objects.count())},
                 "latest_model": {
                     "id": str(latest_model.id) if latest_model else None,
                     "name": latest_model.name if latest_model else None,
                     "version": latest_model.version if latest_model else None,
                     "created_at": latest_model.created_at if latest_model else None,
+                    "evidence_status": summarize_model_evidence(latest_model).evidence_status if latest_model else None,
                 },
                 "latest_training": {
                     "id": str(latest_train.id) if latest_train else None,
                     "created_at": latest_train.created_at if latest_train else None,
-                    "dataset_rows": latest_train.dataset_rows if latest_train else None,
+                    "dataset_rows": _support_safe_count(latest_train.dataset_rows) if latest_train else None,
                 },
                 "latest_compute": {
                     "id": str(latest_comp.id) if latest_comp else None,
                     "created_at": latest_comp.created_at if latest_comp else None,
-                    "summary": latest_comp.summary if latest_comp else None,
+                    "summary": None,
+                    "summary_redacted": bool(latest_comp),
                 },
                 "latest_causal": {
                     "id": str(latest_causal.id) if latest_causal else None,
                     "created_at": latest_causal.created_at if latest_causal else None,
-                    "summary": latest_causal.summary if latest_causal else None,
+                    "summary": None,
+                    "summary_redacted": bool(latest_causal),
                 },
 
                 "latest_governance": {
                     "id": str(latest_gov.id) if latest_gov else None,
                     "created_at": latest_gov.created_at if latest_gov else None,
                     "decision_type": latest_gov.decision_type if latest_gov else None,
-                    "actor": latest_gov.actor if latest_gov else None,
+                    "actor": None,
+                    "actor_redacted": bool(latest_gov),
                 },
                 "latest_data_quality": {
                     "id": str(latest_dq.id) if latest_dq else None,
                     "created_at": latest_dq.created_at if latest_dq else None,
-                    "report": latest_dq.report if latest_dq else None,
+                    "report": None,
+                    "report_redacted": bool(latest_dq),
                 },
+                "support_policy": {
+                    "min_cell_count": MIN_AGGREGATE_EPISODES,
+                    "counts_below_minimum_are_null": True,
+                },
+                "non_individual_use": True,
+                "shadow_mode": True,
             }
         )
 
 
 class RosterUploadView(APIView):
+    permission_classes = [ICEAAdminPermission]
+    throttle_scope = "icea_writeback"
+
     def post(self, request):
         ser = RosterUploadSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
@@ -1058,6 +1145,9 @@ class RosterUploadView(APIView):
 
 
 class RosterSummaryView(APIView):
+    permission_classes = [ICEAAggregateViewerPermission]
+    throttle_scope = "icea_read"
+
     def get(self, request):
         return Response(
             {
@@ -1069,6 +1159,9 @@ class RosterSummaryView(APIView):
 
 class AuditEventsListView(APIView):
     """List recent audit events (for governance / forensic traceability)."""
+
+    permission_classes = [ICEAAdminPermission]
+    throttle_scope = "icea_export"
 
     def get(self, request):
         limit = int(request.query_params.get("limit", "100"))
@@ -1097,6 +1190,9 @@ class AuditEventsListView(APIView):
 
 class GovernanceDecisionView(APIView):
     """Record a human-in-the-loop decision (override/approval) for outputs."""
+
+    permission_classes = [ICEAAdminPermission]
+    throttle_scope = "icea_writeback"
 
     def post(self, request):
         ser = GovernanceDecisionSerializer(data=request.data)
@@ -1147,11 +1243,20 @@ class CausalRunView(APIView):
     """
 
     permission_classes = [ICEAResearcherPermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = CausalRunSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         spec = ser.validated_data["spec"] or {}
+        append_icea_api_audit(
+            request=request,
+            event_type="causal_run_requested",
+            context="causal/run",
+            action="causal_run",
+            grain=str(spec.get("grain") or spec.get("dataset_grain") or "episode"),
+            status="requested",
+        )
 
         # v0.5.3: Target Trial Template (optional) validated in-memory via Pydantic.
         # This keeps DB schema flexible while preventing malformed protocol injection.
@@ -1907,9 +2012,17 @@ class CausalReportView(APIView):
     """
 
     permission_classes = [ICEAResearcherPermission]
+    throttle_scope = "icea_export"
 
     def get(self, request):
         run_id = (request.query_params.get("run_id") or "").strip()
+        append_icea_api_audit(
+            request=request,
+            event_type="export_requested",
+            context="causal/report",
+            action="export",
+            status="requested",
+        )
         if not run_id:
             return Response({"detail": "run_id query param is required"}, status=400)
 
@@ -1976,7 +2089,7 @@ class RiskAssessmentWritebackView(APIView):
     permission_classes = [ICEAAdminOrServicePermission, RequiresAntiReplayHMAC]
 
     # Scoped throttling (v0.7.3)
-    throttle_scope = "writeback"
+    throttle_scope = "icea_writeback"
 
     def post(self, request):
         ser = RiskAssessmentWritebackSerializer(data=request.data)
@@ -1988,6 +2101,37 @@ class RiskAssessmentWritebackView(APIView):
         writeback = bool(payload.get("writeback"))
 
         artifact = ModelArtifact.objects.get(id=model_id)
+        evidence = summarize_model_evidence(artifact)
+        append_icea_api_audit(
+            request=request,
+            event_type="writeback_patient_requested",
+            context="fhir/writeback/riskassessment",
+            action="writeback",
+            model_id=str(artifact.id),
+            evidence_status=evidence.evidence_status,
+            status="requested",
+        )
+        if not evidence.defensible:
+            append_icea_api_audit(
+                request=request,
+                event_type="writeback_blocked_model_evidence",
+                context="fhir/writeback/riskassessment",
+                action="writeback",
+                model_id=str(artifact.id),
+                evidence_status=evidence.evidence_status,
+                error_code="model_not_defensible",
+                status="blocked",
+            )
+            return Response(
+                {
+                    "detail": "model_not_defensible",
+                    "model_id": str(artifact.id),
+                    "non_individual_use": True,
+                    "shadow_mode": True,
+                    **evidence.to_dict(),
+                },
+                status=400,
+            )
         ep = PatientEpisode.objects.get(id=episode_id)
 
         if not ep.fhir_patient_id or not ep.fhir_encounter_id:
@@ -2038,12 +2182,21 @@ class RiskAssessmentWritebackView(APIView):
             }
             rec.save(update_fields=["writeback_ok", "writeback_response"])
 
-        append_audit_event(event_type="fhir_writeback", payload={"record_id": str(rec.id), "episode_id": int(ep.id), "model_id": str(artifact.id), "attempted": bool(rec.attempted_writeback), "ok": bool(rec.writeback_ok)}, context="fhir/writeback/riskassessment")
+        append_icea_api_audit(
+            request=request,
+            event_type="writeback_patient_completed",
+            context="fhir/writeback/riskassessment",
+            action="writeback",
+            model_id=str(artifact.id),
+            status="shadow_only",
+            suppressed=True,
+        )
 
         return Response(
             {
                 "record_id": str(rec.id),
-                "episode_id": ep.id,
+                "episode_id": None,
+                "identifier_suppressed": True,
                 "writeback_ok": bool(rec.writeback_ok),
                 "status": "shadow_only",
                 "prediction": {
@@ -2071,6 +2224,7 @@ class ConformalPredictView(APIView):
     """
 
     permission_classes = [ICEAResearcherPermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = ConformalPredictSerializer(data=request.data)
@@ -2078,6 +2232,37 @@ class ConformalPredictView(APIView):
         p = ser.validated_data
 
         artifact = ModelArtifact.objects.get(id=p["model_id"])
+        evidence = summarize_model_evidence(artifact)
+        append_icea_api_audit(
+            request=request,
+            event_type="conformal_predict_requested",
+            context="predict/conformal",
+            action="score",
+            model_id=str(artifact.id),
+            evidence_status=evidence.evidence_status,
+            status="requested",
+        )
+        if not evidence.defensible:
+            append_icea_api_audit(
+                request=request,
+                event_type="score_blocked_model_evidence",
+                context="predict/conformal",
+                action="score",
+                model_id=str(artifact.id),
+                evidence_status=evidence.evidence_status,
+                error_code="model_not_defensible",
+                status="blocked",
+            )
+            return Response(
+                {
+                    "detail": "model_not_defensible",
+                    "model_id": str(artifact.id),
+                    "non_individual_use": True,
+                    "shadow_mode": True,
+                    **evidence.to_dict(),
+                },
+                status=400,
+            )
         ep = PatientEpisode.objects.get(id=int(p["episode_id"]))
         fr = getattr(ep, "feature_row", None)
         if not fr:
@@ -2089,15 +2274,20 @@ class ConformalPredictView(APIView):
             "suppression_reason": "individual_prediction_not_operational_or_exportable",
         }
 
-        append_audit_event(
-            event_type="conformal_predict",
-            payload={"episode_id": int(ep.id), "model_id": str(artifact.id), "target": artifact.target},
+        append_icea_api_audit(
+            request=request,
+            event_type="conformal_predict_redacted",
             context="predict/conformal",
+            action="score",
+            model_id=str(artifact.id),
+            status="shadow_only",
+            suppressed=True,
         )
 
         return Response(
             {
-                "episode_id": int(ep.id),
+                "episode_id": None,
+                "identifier_suppressed": True,
                 "model_id": str(artifact.id),
                 "target": artifact.target,
                 "pred": None,
@@ -2114,25 +2304,67 @@ class ConformalPredictView(APIView):
 
 class WritebackListView(APIView):
     permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_export"
 
     def get(self, request):
-        qs = FHIRWritebackRecord.objects.order_by("-created_at")[:50]
-        out = []
-        for r in qs:
-            out.append(
+        grouped = list(FHIRWritebackRecord.objects.values("model_id").annotate(count=Count("id")).order_by("model_id"))
+        results = []
+        blocked_model_records = 0
+        suppressed_cells = 0
+        for group in grouped:
+            model_id = group["model_id"]
+            count = int(group["count"])
+            artifact = ModelArtifact.objects.filter(id=model_id).first()
+            evidence = summarize_model_evidence(artifact) if artifact else None
+            if not evidence or not evidence.defensible:
+                blocked_model_records += count
+                continue
+            if count < MIN_AGGREGATE_EPISODES:
+                suppressed_cells += 1
+                results.append(
+                    {
+                        "model_id": str(model_id),
+                        "count": None,
+                        "suppressed": True,
+                        "status": "suppressed_low_support",
+                    }
+                )
+                continue
+            model_qs = FHIRWritebackRecord.objects.filter(model_id=model_id)
+            attempted_count = int(model_qs.filter(attempted_writeback=True).count())
+            ok_count = int(model_qs.filter(writeback_ok=True).count())
+            results.append(
                 {
-                    "id": str(r.id),
-                    "created_at": r.created_at,
-                    "episode_id": None,
-                    "model_id": str(r.model_id),
-                    "attempted": bool(r.attempted_writeback),
-                    "ok": bool(r.writeback_ok),
-                    "non_individual_use": True,
-                    "shadow_mode": True,
-                    "identifier_suppressed": True,
+                    "model_id": str(model_id),
+                    "count": count,
+                    "attempted": _support_safe_count(attempted_count),
+                    "ok": _support_safe_count(ok_count),
+                    "suppressed": False,
+                    "status": "aggregate_only",
                 }
             )
-        return Response(out)
+
+        append_icea_api_audit(
+            request=request,
+            event_type="export_requested",
+            context="fhir/writeback/list",
+            action="export",
+            row_count=int(sum(int(group["count"]) for group in grouped)),
+            suppressed=bool(suppressed_cells or blocked_model_records),
+            suppressed_cells=suppressed_cells,
+            status="completed",
+        )
+        return Response(
+            {
+                "status": "aggregate_only",
+                "non_individual_use": True,
+                "shadow_mode": True,
+                "min_cell_count": MIN_AGGREGATE_EPISODES,
+                "suppressed_cells": suppressed_cells,
+                "blocked_model_records": _support_safe_count(blocked_model_records),
+                "results": results,
+            }
+        )
 
 
 class FHIROpisodeQualityView(APIView):
@@ -2141,6 +2373,9 @@ class FHIROpisodeQualityView(APIView):
     v0.5.1: exposes validation statistics produced by the FHIR Facade.
     Does not modify any data.
     """
+
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_export"
 
     def get(self, request):
         episode_id = request.query_params.get("episode_id")
@@ -2197,6 +2432,9 @@ class EntityChangeLogListView(APIView):
       - limit (optional, default 100, max 500)
     """
 
+    permission_classes = [ICEAAdminPermission]
+    throttle_scope = "icea_export"
+
     def get(self, request):
         from icea_pipeline.models import EntityChangeLog
 
@@ -2243,6 +2481,7 @@ class CausalDiscoverView(APIView):
     """
 
     permission_classes = [ICEACausalDiscoverPermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         from icea_pipeline.serializers import CausalDiscoverSerializer
@@ -2370,6 +2609,7 @@ class CausalSimulateView(APIView):
     """
 
     permission_classes = [ICEASimulatePermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         from icea_pipeline.serializers import CausalSimulateSerializer

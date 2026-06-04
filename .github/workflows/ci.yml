@@ -161,6 +161,7 @@ jobs:
           AUDIT_LOG_SECRET: ci-risk-audit-secret-not-for-production
         run: |
           python manage.py test -v 2 \
+            icea_core.tests.test_api_security_guards.ICEAApiSecurityGuardTests \
             icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_sensitive_endpoints_reject_unauthenticated_requests \
             icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_sensitive_endpoints_reject_insufficient_role \
             icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_correct_roles_can_access_representative_sensitive_endpoints \

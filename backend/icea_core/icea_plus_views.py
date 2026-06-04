@@ -6,6 +6,7 @@ from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from icea_core.api_security import append_icea_api_audit
 from icea_core.aggregation import (
     MIN_AGGREGATE_EPISODES,
     MIN_STAFF_FOR_STAFF_DIMENSION,
@@ -38,7 +39,6 @@ from icea_core.permissions import (
     ICEAAdminPermission,
     ICEAAdminOrServicePermission,
     ICEAAggregateViewerPermission,
-    ICEABackwardCompatiblePermission,
     ICEAResearcherPermission,
 )
 from icea_core.scoring import redact_shadow_score_response, score_icea_plus, select_formula, upsert_formula_version
@@ -113,6 +113,9 @@ def _get_object_or_typed_error(model_cls: type[Model], **lookup):
 
 
 class ICEAPlusExplainView(APIView):
+    permission_classes = [ICEAAggregateViewerPermission]
+    throttle_scope = "icea_read"
+
     def get(self, request):
         version = (request.query_params.get("formula_version") or "").strip() or None
         formula = select_formula(version)
@@ -149,6 +152,7 @@ class ICEAPlusExplainView(APIView):
 
 class ICEAPlusScoreView(APIView):
     permission_classes = [ICEAResearcherPermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = ICEAPlusScoreRequestSerializer(data=request.data)
@@ -156,6 +160,17 @@ class ICEAPlusScoreView(APIView):
         payload = ser.validated_data
 
         artifact = ModelArtifact.objects.get(id=payload["model_id"])
+        append_icea_api_audit(
+            request=request,
+            event_type="score_requested",
+            context="icea-plus/score",
+            action="score",
+            model_id=str(artifact.id),
+            baseline_model_id=str(payload.get("baseline_model_id") or ""),
+            grain=str(payload.get("grain") or "episode"),
+            row_count=int(len(payload.get("rows") or [])) if not bool(payload.get("from_db", True)) else None,
+            status="requested",
+        )
         result = score_icea_plus(
             model_artifact=artifact,
             grain=payload.get("grain") or "episode",
@@ -175,6 +190,17 @@ class ICEAPlusScoreView(APIView):
         )
 
         if result.get("detail"):
+            append_icea_api_audit(
+                request=request,
+                event_type="score_blocked_model_evidence",
+                context="icea-plus/score",
+                action="score",
+                model_id=str(artifact.id),
+                baseline_model_id=str(payload.get("baseline_model_id") or ""),
+                evidence_status=str(result.get("evidence_status") or result.get("primary_model_evidence_status") or ""),
+                error_code=str(result.get("detail") or "score_blocked"),
+                status="blocked",
+            )
             return Response(result, status=400)
 
         public_result = redact_shadow_score_response(result)
@@ -216,6 +242,7 @@ class ICEAPlusScoreView(APIView):
 
 class ICEAPlusAggregateView(APIView):
     permission_classes = [ICEAAggregateViewerPermission]
+    throttle_scope = "icea_compute"
 
     def get(self, request):
         ser = ICEAPlusAggregateQuerySerializer(data=request.query_params)
@@ -223,6 +250,17 @@ class ICEAPlusAggregateView(APIView):
         params = ser.validated_data
 
         artifact = ModelArtifact.objects.get(id=params["model_id"])
+        append_icea_api_audit(
+            request=request,
+            event_type="aggregate_requested",
+            context="icea-plus/aggregate",
+            action="aggregate",
+            model_id=str(artifact.id),
+            baseline_model_id=str(params.get("baseline_model_id") or ""),
+            requested_group_by=str(params.get("group_by") or "unit"),
+            grain=str(params.get("grain") or "episode"),
+            status="requested",
+        )
         score_result = score_icea_plus(
             model_artifact=artifact,
             grain=params.get("grain") or "episode",
@@ -239,6 +277,17 @@ class ICEAPlusAggregateView(APIView):
             date_to=params.get("date_to"),
         )
         if score_result.get("detail"):
+            append_icea_api_audit(
+                request=request,
+                event_type="aggregate_blocked_model_evidence",
+                context="icea-plus/aggregate",
+                action="aggregate",
+                model_id=str(artifact.id),
+                baseline_model_id=str(params.get("baseline_model_id") or ""),
+                evidence_status=str(score_result.get("evidence_status") or score_result.get("primary_model_evidence_status") or ""),
+                error_code=str(score_result.get("detail") or "aggregate_blocked"),
+                status="blocked",
+            )
             return Response(score_result, status=400)
 
         requested_group_by = str(params.get("group_by") or "unit")
@@ -307,6 +356,18 @@ class ICEAPlusAggregateView(APIView):
             },
             context="icea-plus/aggregate",
         )
+        if suppressed_cells:
+            append_icea_api_audit(
+                request=request,
+                event_type="aggregate_suppressed_low_support",
+                context="icea-plus/aggregate",
+                action="aggregate",
+                model_id=str(artifact.id),
+                effective_group_by=effective_group_by,
+                suppressed=True,
+                suppressed_cells=suppressed_cells,
+                status="suppressed_low_support",
+            )
         evidence_metadata = {
             key: score_result[key]
             for key in (
@@ -341,6 +402,7 @@ class ICEAPlusAggregateView(APIView):
 
 class ICEAPlusCalibrateView(APIView):
     permission_classes = [ICEAAdminPermission]
+    throttle_scope = "icea_train"
 
     def post(self, request):
         ser = ICEAPlusCalibrateSerializer(data=request.data)
@@ -375,7 +437,8 @@ class ICEAPlusCalibrateView(APIView):
 
 
 class ICEAPlusFollowupIngestView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_writeback"
 
     def post(self, request):
         ser = ICEAPlusFollowupIngestSerializer(data=request.data)
@@ -401,7 +464,8 @@ class ICEAPlusFollowupIngestView(APIView):
 
 
 class ICEAPlusFollowupRescoreView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_compute"
 
     def post(self, request):
         ser = ICEAPlusFollowupRescoreSerializer(data=request.data)
@@ -434,7 +498,8 @@ class ICEAPlusFollowupRescoreView(APIView):
 
 
 class ICEAPlusFollowupStatusView(APIView):
-    permission_classes = [ICEABackwardCompatiblePermission]
+    permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_read"
 
     def get(self, request):
         ser = ICEAPlusFollowupStatusQuerySerializer(data=request.query_params)
@@ -467,6 +532,7 @@ class ICEAPlusFollowupStatusView(APIView):
 
 class ICEAPlusWritebackSummaryView(APIView):
     permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_export"
 
     def get(self, request):
         ser = ICEAPlusWritebackSummaryQuerySerializer(data=request.query_params)
@@ -477,6 +543,16 @@ class ICEAPlusWritebackSummaryView(APIView):
         artifact = _get_object_or_typed_error(ModelArtifact, id=params["model_id"])
         if isinstance(artifact, Response):
             return artifact
+        append_icea_api_audit(
+            request=request,
+            event_type="writeback_summary_requested",
+            context="icea-plus/writeback/summary",
+            action="export",
+            model_id=str(artifact.id),
+            requested_group_by=str(params.get("group_by") or "unit"),
+            unit_id=params.get("unit_id"),
+            status="requested",
+        )
         payload = build_summary_writeback(
             artifact=artifact,
             group_by=str(params.get("group_by") or "unit"),
@@ -485,11 +561,23 @@ class ICEAPlusWritebackSummaryView(APIView):
             date_from=params.get("date_from"),
             date_to=params.get("date_to"),
         )
+        append_icea_api_audit(
+            request=request,
+            event_type="writeback_blocked_model_evidence" if payload.get("detail") else "writeback_summary_completed",
+            context="icea-plus/writeback/summary",
+            action="export",
+            model_id=str(artifact.id),
+            evidence_status=str(payload.get("evidence_status") or payload.get("primary_model_evidence_status") or ""),
+            error_code=str(payload.get("detail") or ""),
+            suppressed=bool(payload.get("suppressed") or payload.get("summary", {}).get("suppressed_cells")),
+            status="blocked" if payload.get("detail") else "completed",
+        )
         return Response(payload, status=400 if payload.get("detail") else 200)
 
 
 class ICEAPlusWritebackPatientView(APIView):
     permission_classes = [ICEAAdminOrServicePermission]
+    throttle_scope = "icea_writeback"
 
     def get(self, request):
         ser = ICEAPlusWritebackPatientQuerySerializer(data=request.query_params)
@@ -500,6 +588,14 @@ class ICEAPlusWritebackPatientView(APIView):
         artifact = _get_object_or_typed_error(ModelArtifact, id=params["model_id"])
         if isinstance(artifact, Response):
             return artifact
+        append_icea_api_audit(
+            request=request,
+            event_type="writeback_patient_requested",
+            context="icea-plus/writeback/patient",
+            action="writeback",
+            model_id=str(artifact.id),
+            status="requested",
+        )
         episode = _get_object_or_typed_error(PatientEpisode, id=int(params["episode_id"]))
         if isinstance(episode, Response):
             return episode

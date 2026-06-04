@@ -1021,9 +1021,11 @@ class ICEAPlusAPITests(ICEAPlusFixtureMixin, TestCase):
         response = self.client.get("/api/v1/fhir/writeback/list/")
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertTrue(body)
-        self.assertIsNone(body[0]["episode_id"])
-        self.assertTrue(body[0]["identifier_suppressed"])
+        self.assertEqual(body["status"], "aggregate_only")
+        self.assertTrue(body["results"])
+        self.assertTrue(body["results"][0]["suppressed"])
+        self.assertIsNone(body["results"][0]["count"])
+        self.assertNotIn("episode_id", str(body))
 
     def test_followup_endpoint_requires_auth_when_flag_enabled(self):
         episode = self.episodes[4]

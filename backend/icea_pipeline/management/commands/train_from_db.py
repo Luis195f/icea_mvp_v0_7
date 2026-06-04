@@ -9,6 +9,7 @@ from django.core.management.base import BaseCommand
 from icea_core.evidence import build_training_evidence_metadata
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import ModelArtifact
+from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import EpisodeFeatureRow, TrainingRun
 from icea_pipeline.temporal import validate_temporal_frame
 
@@ -49,13 +50,36 @@ class Command(BaseCommand):
             row.update(r.target)
             dataset.append(row)
 
+        append_audit_event(
+            event_type="model_train_requested",
+            payload={"action": "train", "row_count": int(len(dataset)), "status": "requested"},
+            context="management/train_from_db",
+            actor="management_command",
+        )
         if not dataset:
+            append_audit_event(
+                event_type="model_train_blocked",
+                payload={"action": "train", "row_count": 0, "status": "blocked", "error_code": "dataset_empty"},
+                context="management/train_from_db",
+                actor="management_command",
+            )
             self.stdout.write(self.style.WARNING("No EpisodeFeatureRow data found. Run build_dataset first."))
             return
 
         df = pd.DataFrame(dataset)
         temporal_issues = validate_temporal_frame(df, feature_names=[c for c in df.columns if c != target], target=target)
         if temporal_issues:
+            append_audit_event(
+                event_type="model_train_blocked",
+                payload={
+                    "action": "train",
+                    "row_count": int(len(df)),
+                    "status": "blocked",
+                    "error_code": "dataset_not_temporally_defensible",
+                },
+                context="management/train_from_db",
+                actor="management_command",
+            )
             self.stdout.write(
                 self.style.ERROR(
                     f"Dataset not temporally defensible: {temporal_issues[0][1].status} ({len(temporal_issues)} rows blocked)"
@@ -94,5 +118,16 @@ class Command(BaseCommand):
         )
 
         TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
+        append_audit_event(
+            event_type="model_train_completed",
+            payload={
+                "action": "train",
+                "model_id": str(artifact.id),
+                "row_count": int(len(df)),
+                "status": "completed",
+            },
+            context="management/train_from_db",
+            actor="management_command",
+        )
 
         self.stdout.write(self.style.SUCCESS(f"Trained and registered model: {artifact.id} ({name}:{version})"))

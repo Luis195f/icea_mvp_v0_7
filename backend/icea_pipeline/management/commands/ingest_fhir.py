@@ -8,6 +8,7 @@ from django.db import transaction
 from fhir_integration.service import FHIRClient
 from icea_core.models import PatientEpisode
 
+from icea_pipeline.audit import append_audit_event
 from icea_pipeline.models import RawFHIRResource
 
 
@@ -62,4 +63,10 @@ class Command(BaseCommand):
                     )
                     total += 1
 
+        append_audit_event(
+            event_type="ingest_fhir",
+            payload={"action": "ingest", "row_count": int(total), "status": "completed"},
+            context="management/ingest_fhir",
+            actor="management_command",
+        )
         self.stdout.write(self.style.SUCCESS(f"Ingested/updated {total} resources for episode={episode_id}"))

@@ -503,14 +503,43 @@ Expected status codes:
 - Production/secure defaults are fail-closed. Do not expose sensitive ICEA endpoints without authentication and an explicit ICEA role.
 - `ICEA_DEV_ALLOW_INSECURE=true` is only for local development/demo runs without PHI. Keep it `false` in secure mode.
 - Minimum ICEA roles are `viewer_aggregate` for non-nominal aggregate reads, `researcher` for causal/reporting research, `admin` for calibration/config/writeback/federated administration, and `service` for backend-to-backend HANDOVER integration.
-- `POST /score/`, `POST /predict/conformal/`, and `/causal/*` require `researcher`, `admin`, or `service`.
-- `/writeback/*`, `/fhir/writeback/*`, `/federated/*`, and `/calibrate/` require `admin` or `service`, except `/calibrate/` which is `admin` only.
+- Training endpoints require `researcher` or `admin`; the `service` role cannot create models.
+- `POST /score/`, legacy `POST /icea/compute/`, `POST /predict/conformal/`, and `/causal/*` require `researcher`, `admin`, or `service`.
+- Follow-up, `/writeback/*`, `/fhir/writeback/*`, pipeline mutations, and FHIR quality detail require `admin` or `service`.
+- `/calibrate/`, governance audit/change exports, roster upload, and governance decisions are `admin` only.
 - `policy_learning`, `fairness`, `causal_discover`, `simulate`, and `federated` remain disabled until explicitly enabled with `ICEA_POLICY_LEARNING_ENABLED`, `ICEA_FAIRNESS_ENABLED`, `ICEA_CAUSAL_DISCOVER_ENABLED`, `ICEA_SIMULATE_ENABLED`, and `ICEA_FEDERATED_ENABLED`.
 - In `ICEA_SECURE_MODE=true`, startup fails unless `ICEA_AUTH_REQUIRED=true`, `ICEA_RBAC_ENFORCE=true`, `ICEA_DEV_ALLOW_INSECURE=false`, and a dedicated JWT/JWKS key source is configured.
 
+#### Endpoint/role matrix
+
+| Surface | Allowed roles | Throttle scope | Export/write behavior |
+|---|---|---|---|
+| `/models/` | researcher, admin, service | `icea_read` | model/evidence metadata only |
+| `/models/train/`, `/pipeline/train/` | researcher, admin | `icea_train` | creates model; audited |
+| `/icea/compute/`, `/icea-plus/score/` | researcher, admin, service | `icea_compute` | legacy/individual outputs redacted |
+| `/icea-plus/aggregate/` | viewer_aggregate, researcher, admin, service | `icea_compute` | aggregate-only; low support suppressed |
+| `/icea-plus/followup/*` | admin, service | `icea_read`, `icea_compute`, or `icea_writeback` | patient score always suppressed |
+| `/icea-plus/writeback/summary/` | admin, service | `icea_export` | aggregate-only; evidence and support gated |
+| `/icea-plus/writeback/patient/` | admin, service | `icea_writeback` | state/lineage only; no numeric score |
+| `/predict/conformal/` | researcher, admin, service | `icea_compute` | identifier and prediction suppressed |
+| `/causal/*` | researcher, admin, service | `icea_compute` or `icea_export` | research/shadow only |
+| `/pipeline/build-dataset/`, `/pipeline/build-windows/` | admin, service | `icea_compute` | mutating and audited |
+| `/dashboard/summary/` | viewer_aggregate, researcher, admin, service | `icea_read` | detailed summaries redacted; counts below 10 are null |
+| `/fhir/writeback/list/` | admin, service | `icea_export` | aggregate-only; cells below 10 suppressed |
+| `/fhir/writeback/riskassessment/` | admin, service | `icea_writeback` | individual numeric writeback blocked |
+| `/governance/*` | admin | `icea_export` or `icea_writeback` | protected audit/governance surface |
+
+Scoped throttling is enabled by default. Operators can override
+`ICEA_THROTTLE_SCOPE_ICEA_READ`, `ICEA_THROTTLE_SCOPE_ICEA_COMPUTE`,
+`ICEA_THROTTLE_SCOPE_ICEA_TRAIN`, `ICEA_THROTTLE_SCOPE_ICEA_EXPORT`, and
+`ICEA_THROTTLE_SCOPE_ICEA_WRITEBACK`.
+
 ### Logging and lineage
 
-ICEA+ requests are added to the audit chain without storing PHI in the audit payload.
+ICEA+ requests, blocks, exports, training, causal runs, suppression, and writeback
+requests are added to the audit chain. The API audit helper uses an explicit
+allowlist and drops clinical rows, FHIR payloads, patient identifiers, and
+episode identifiers before hashing the event.
 Lineage in the response identifies:
 
 - formula version/hash
@@ -519,6 +548,11 @@ Lineage in the response identifies:
 - causal spec hash when used
 - request hash
 - source grain
+
+Legacy `/icea/compute/`, `/predict/conformal/`, FHIR RiskAssessment, and
+`/fhir/writeback/list/` remain available for compatibility but are censored,
+evidence-gated, permission-gated, throttled, audited, and not valid bypasses for
+individual scoring or export governance.
 
 ## Intended HANDOVER consumption
 
