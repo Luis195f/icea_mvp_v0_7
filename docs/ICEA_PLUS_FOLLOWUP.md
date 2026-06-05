@@ -100,6 +100,20 @@ redacted row so later follow-up summaries can calculate supported aggregate
 cells. Patient-facing summaries never expose that internal row or an individual
 numeric score, and aggregate outputs still apply minimum-cell suppression.
 
+## Operational smoke
+
+Before demoing follow-up/writeback behavior, run:
+
+```bash
+cd backend
+python manage.py icea_readiness_check
+python manage.py icea_smoke_test
+```
+
+The smoke contract checks protected endpoint behavior, model-evidence blocking,
+audit pseudonymization, and continued suppression of numeric patient/episode
+score fields. It is an operational regression check, not clinical validation.
+
 ## Prudence and governance
 
 - Follow-up rescoring remains observational and exploratory.
