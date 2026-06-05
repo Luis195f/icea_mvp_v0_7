@@ -67,6 +67,22 @@ def _check(code: str, ok: bool, detail: str, *, warn: bool = False) -> Operation
     return OperationalCheck(code=code, status=WARN if warn else FAIL, detail=detail)
 
 
+def _http_detail(path: str, expected: str, response: Any, *, extra: str = "") -> str:
+    status_code = getattr(response, "status_code", "unavailable")
+    suffix = f" {extra}" if extra else ""
+    return f"Expected {expected} for {path}; got status_code={status_code}.{suffix}"
+
+
+def canonical_api_path(name: str, fallback: str) -> str:
+    try:
+        path = reverse(name)
+    except NoReverseMatch:
+        path = fallback
+    if not path.endswith("/"):
+        path = f"{path}/"
+    return path
+
+
 def _summarize(checks: list[OperationalCheck]) -> dict[str, Any]:
     failures = [check.to_dict() for check in checks if check.status == FAIL]
     warnings = [check.to_dict() for check in checks if check.status == WARN]
@@ -371,6 +387,33 @@ def _smoke_client() -> APIClient:
     return client
 
 
+def _smoke_secure_requests() -> bool:
+    return _setting_bool("ICEA_SECURE_MODE") or not _setting_bool("DEBUG")
+
+
+def _canonical_smoke_path(path: str) -> str:
+    return path if path.endswith("/") else f"{path}/"
+
+
+def smoke_get(client: APIClient, path: str, data: dict[str, Any] | None = None, headers: dict[str, Any] | None = None):
+    return client.get(
+        _canonical_smoke_path(path),
+        data or {},
+        secure=_smoke_secure_requests(),
+        **(headers or {}),
+    )
+
+
+def smoke_post(client: APIClient, path: str, data: dict[str, Any] | None = None, headers: dict[str, Any] | None = None):
+    return client.post(
+        _canonical_smoke_path(path),
+        json.dumps(data or {}),
+        content_type="application/json",
+        secure=_smoke_secure_requests(),
+        **(headers or {}),
+    )
+
+
 def _client_for_role(role: str) -> APIClient:
     group, _ = Group.objects.get_or_create(name=role)
     user, _ = get_user_model().objects.get_or_create(username=f"icea-smoke-{role}")
@@ -385,6 +428,15 @@ def _response_json(response) -> Any:
         return response.json()
     except Exception:
         return {}
+
+
+def _audit_actor_is_safe(actor: Any) -> bool:
+    value = str(actor)
+    return bool(_PSEUDONYMOUS_ACTOR_RE.fullmatch(value)) or value.startswith("system:")
+
+
+def _audit_events_have_safe_actors(events: Iterable[dict[str, Any]]) -> bool:
+    return all(_audit_actor_is_safe(event.get("actor")) for event in events)
 
 
 @contextmanager
@@ -407,10 +459,19 @@ def build_smoke_report() -> dict[str, Any]:
         initial_audit_count = AuditEvent.objects.count()
         initial_audit_ids = set(AuditEvent.objects.values_list("id", flat=True))
 
-        health = unauth.get("/api/v1/health/")
+        health_path = canonical_api_path("health", "/api/v1/health/")
+        models_path = canonical_api_path("models-list", "/api/v1/models/")
+        train_path = canonical_api_path("models-train", "/api/v1/models/train/")
+        score_path = canonical_api_path("icea-plus-score", "/api/v1/icea-plus/score/")
+        aggregate_path = canonical_api_path("icea-plus-aggregate", "/api/v1/icea-plus/aggregate/")
+        legacy_path = canonical_api_path("icea-compute", "/api/v1/icea/compute/")
+        summary_path = canonical_api_path("icea-plus-writeback-summary", "/api/v1/icea-plus/writeback/summary/")
+        patient_path = canonical_api_path("icea-plus-writeback-patient", "/api/v1/icea-plus/writeback/patient/")
+
+        health = smoke_get(unauth, health_path)
         auth_health = None
         if health.status_code in {401, 403}:
-            auth_health = researcher.get("/api/v1/health/")
+            auth_health = smoke_get(researcher, health_path)
         health_body = _response_json(auth_health or health)
         health_ok = (
             health.status_code == 200
@@ -425,7 +486,12 @@ def build_smoke_report() -> dict[str, Any]:
             _check(
                 "smoke.health",
                 health_ok,
-                "Health endpoint responds with status ok without requiring insecure anonymous access.",
+                _http_detail(
+                    health_path,
+                    "200 ok or 401/403 anonymous plus 200 authenticated ok",
+                    auth_health or health,
+                    extra=f"anonymous_status_code={health.status_code}",
+                ),
             )
         )
 
@@ -457,10 +523,22 @@ def build_smoke_report() -> dict[str, Any]:
             )
         )
 
-        anon_models = unauth.get("/api/v1/models/")
-        checks.append(_check("smoke.models.unauth_blocked", anon_models.status_code in {401, 403}, "Models endpoint blocks unauthenticated access."))
-        auth_models = researcher.get("/api/v1/models/")
-        checks.append(_check("smoke.models.auth_responds", auth_models.status_code == 200, "Models endpoint responds for researcher role."))
+        anon_models = smoke_get(unauth, models_path)
+        checks.append(
+            _check(
+                "smoke.models.unauth_blocked",
+                anon_models.status_code in {401, 403},
+                _http_detail(models_path, "401/403 unauthenticated block", anon_models),
+            )
+        )
+        auth_models = smoke_get(researcher, models_path)
+        checks.append(
+            _check(
+                "smoke.models.auth_responds",
+                auth_models.status_code == 200,
+                _http_detail(models_path, "200 for researcher role", auth_models),
+            )
+        )
 
         first_feature_row = EpisodeFeatureRow.objects.select_related("episode").order_by("episode_id").first()
         checks.append(
@@ -473,27 +551,40 @@ def build_smoke_report() -> dict[str, Any]:
         )
 
         if model is not None:
-            score = researcher.post(
-                "/api/v1/icea-plus/score/",
+            score = smoke_post(
+                researcher,
+                score_path,
                 {"model_id": str(model.id), "grain": "episode", "from_db": True},
-                format="json",
             )
             score_body = _response_json(score)
-            checks.append(_check("smoke.score.responds", score.status_code == 200, "ICEA+ score endpoint responds for researcher role."))
+            checks.append(
+                _check(
+                    "smoke.score.responds",
+                    score.status_code == 200,
+                    _http_detail(score_path, "200 for researcher role", score),
+                )
+            )
             checks.append(
                 _check(
                     "smoke.score.no_individual_numeric_score",
                     score.status_code == 200 and _redacted_score_payload(score_body),
-                    "ICEA+ score response keeps individual score/raw_score/prediction numeric fields suppressed.",
+                    _http_detail(score_path, "200 with score/raw_score/prediction suppressed", score),
                 )
             )
 
-            aggregate = viewer.get(
-                "/api/v1/icea-plus/aggregate/",
+            aggregate = smoke_get(
+                viewer,
+                aggregate_path,
                 {"model_id": str(model.id), "grain": "episode", "group_by": "unit"},
             )
             aggregate_body = _response_json(aggregate)
-            checks.append(_check("smoke.aggregate.responds", aggregate.status_code == 200, "Aggregate endpoint responds for aggregate viewer role."))
+            checks.append(
+                _check(
+                    "smoke.aggregate.responds",
+                    aggregate.status_code == 200,
+                    _http_detail(aggregate_path, "200 for viewer_aggregate role", aggregate),
+                )
+            )
             checks.append(
                 _check(
                     "smoke.aggregate.aggregate_only",
@@ -501,15 +592,15 @@ def build_smoke_report() -> dict[str, Any]:
                     and aggregate_body.get("non_individual_use") is True
                     and aggregate_body.get("shadow_mode") is True
                     and aggregate_body.get("results") is not None,
-                    "Aggregate endpoint returns only governed aggregate/shadow metadata.",
+                    _http_detail(aggregate_path, "200 aggregate-only shadow metadata", aggregate),
                 )
             )
 
             if first_feature_row is not None:
-                legacy = researcher.post(
-                    "/api/v1/icea/compute/",
+                legacy = smoke_post(
+                    researcher,
+                    legacy_path,
                     {"model_id": str(model.id), "data": [first_feature_row.features], "nurse_cols": ["nurse_hppd"]},
-                    format="json",
                 )
                 legacy_body = _response_json(legacy)
                 checks.append(
@@ -520,27 +611,40 @@ def build_smoke_report() -> dict[str, Any]:
                         and legacy_body.get("results") == {}
                         and legacy_body.get("score_summary") is None
                         and legacy_body.get("score_summary_redacted") is True,
-                        "Legacy compute remains present but redacted/censored.",
+                        _http_detail(legacy_path, "200 censored legacy shadow_only response", legacy),
                     )
                 )
 
-            blocked = unauth.post("/api/v1/models/train/", {}, format="json")
-            checks.append(_check("smoke.protected_without_auth.blocked", blocked.status_code in {401, 403}, "Protected training endpoint blocks unauthenticated access."))
+            blocked = smoke_post(unauth, train_path, {})
+            checks.append(
+                _check(
+                    "smoke.protected_without_auth.blocked",
+                    blocked.status_code in {401, 403},
+                    _http_detail(train_path, "401/403 unauthenticated block", blocked),
+                )
+            )
 
-            summary_unauth = unauth.get("/api/v1/icea-plus/writeback/summary/", {"model_id": str(model.id)})
-            checks.append(_check("smoke.writeback_summary.unauth_blocked", summary_unauth.status_code in {401, 403}, "Writeback summary blocks unauthenticated access."))
-            summary = admin.get("/api/v1/icea-plus/writeback/summary/", {"model_id": str(model.id)})
+            summary_unauth = smoke_get(unauth, summary_path, {"model_id": str(model.id)})
+            checks.append(
+                _check(
+                    "smoke.writeback_summary.unauth_blocked",
+                    summary_unauth.status_code in {401, 403},
+                    _http_detail(summary_path, "401/403 unauthenticated block", summary_unauth),
+                )
+            )
+            summary = smoke_get(admin, summary_path, {"model_id": str(model.id)})
             checks.append(
                 _check(
                     "smoke.writeback_summary.protected_redacted",
                     summary.status_code in {200, 400} and "episode_id" not in json.dumps(_response_json(summary), default=str).lower(),
-                    "Writeback summary is protected and does not expose episode identifiers.",
+                    _http_detail(summary_path, "200/400 governed response without episode_id", summary),
                 )
             )
 
             if first_feature_row is not None:
-                patient = admin.get(
-                    "/api/v1/icea-plus/writeback/patient/",
+                patient = smoke_get(
+                    admin,
+                    patient_path,
                     {"model_id": str(model.id), "episode_id": int(first_feature_row.episode_id)},
                 )
                 patient_body = _response_json(patient)
@@ -548,7 +652,7 @@ def build_smoke_report() -> dict[str, Any]:
                     _check(
                         "smoke.writeback_patient.no_numeric_score",
                         patient.status_code in {200, 400} and _redacted_score_payload(patient_body),
-                        "Patient writeback surface suppresses score/raw_score numeric fields.",
+                        _http_detail(patient_path, "200/400 governed response with score/raw_score suppressed", patient),
                     )
                 )
 
@@ -561,22 +665,22 @@ def build_smoke_report() -> dict[str, Any]:
                 model_path=model.model_path,
                 metrics={},
             )
-            blocked_model = researcher.post(
-                "/api/v1/icea-plus/score/",
+            blocked_model = smoke_post(
+                researcher,
+                score_path,
                 {"model_id": str(bad_model.id), "grain": "episode", "from_db": True},
-                format="json",
             )
             checks.append(
                 _check(
                     "smoke.non_defensible_model.blocked",
                     blocked_model.status_code == 400 and _response_json(blocked_model).get("detail") == "model_not_defensible",
-                    "Non-defensible model is blocked before row results are emitted.",
+                    _http_detail(score_path, "400 model_not_defensible without row results", blocked_model),
                 )
             )
-            blocked_baseline = researcher.post(
-                "/api/v1/icea-plus/score/",
+            blocked_baseline = smoke_post(
+                researcher,
+                score_path,
                 {"model_id": str(model.id), "baseline_model_id": str(bad_model.id), "grain": "episode", "from_db": True},
-                format="json",
             )
             blocked_baseline_body = _response_json(blocked_baseline)
             checks.append(
@@ -585,7 +689,7 @@ def build_smoke_report() -> dict[str, Any]:
                     blocked_baseline.status_code == 400
                     and blocked_baseline_body.get("detail") == "baseline_model_not_defensible"
                     and "results" not in blocked_baseline_body,
-                    "Non-defensible baseline is blocked before numeric benefit/scoring output.",
+                    _http_detail(score_path, "400 baseline_model_not_defensible without row results", blocked_baseline),
                 )
             )
 
@@ -605,10 +709,7 @@ def build_smoke_report() -> dict[str, Any]:
             _check(
                 "smoke.audit.actor_pseudonymous",
                 final_audit_count > initial_audit_count
-                and all(
-                    bool(_PSEUDONYMOUS_ACTOR_RE.fullmatch(str(event["actor"]))) or str(event["actor"]).startswith("system:")
-                    for event in smoke_events
-                ),
+                and _audit_events_have_safe_actors(smoke_events),
                 "Audit actors are pseudonymous/system identifiers, not raw usernames, emails, or primary keys.",
                 warn=model is None,
             )

@@ -11,7 +11,17 @@ from django.conf import settings
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 
-from icea_core.operational_readiness import FAIL, PASS, WARN, build_readiness_report, build_smoke_report
+from icea_core.operational_readiness import (
+    FAIL,
+    PASS,
+    WARN,
+    _audit_events_have_safe_actors,
+    build_readiness_report,
+    build_smoke_report,
+    canonical_api_path,
+    smoke_get,
+    smoke_post,
+)
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 
 
@@ -65,6 +75,30 @@ class ICEAReadinessCommandTests(ICEAPlusFixtureMixin, TestCase):
 
     def _codes(self, report):
         return {check["code"]: check for check in report["checks"]}
+
+    def test_smoke_request_helpers_use_https_in_secure_mode_and_canonical_paths(self):
+        class RecordingClient:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, path, payload=None, **kwargs):
+                self.calls.append(("get", path, payload, kwargs))
+                return object()
+
+            def post(self, path, payload=None, **kwargs):
+                self.calls.append(("post", path, payload, kwargs))
+                return object()
+
+        client = RecordingClient()
+        with override_settings(ICEA_SECURE_MODE=True, DEBUG=False):
+            smoke_get(client, "/api/v1/models")
+            smoke_post(client, "/api/v1/models/train", {"x": 1})
+
+        self.assertEqual(client.calls[0][1], "/api/v1/models/")
+        self.assertTrue(client.calls[0][3]["secure"])
+        self.assertEqual(client.calls[1][1], "/api/v1/models/train/")
+        self.assertTrue(client.calls[1][3]["secure"])
+        self.assertEqual(client.calls[1][3]["content_type"], "application/json")
 
     def test_readiness_check_passes_with_secure_minimal_configuration(self):
         with self._safe_settings(), mock.patch.dict(os.environ, SAFE_ENV, clear=False):
@@ -156,6 +190,19 @@ class ICEASmokeCommandTests(ICEAPlusFixtureMixin, TestCase):
     def _codes(self, report):
         return {check["code"]: check for check in report["checks"]}
 
+    def test_smoke_uses_canonical_routes_and_does_not_observe_redirects(self):
+        with (
+            override_settings(**SAFE_SETTINGS),
+            mock.patch.dict(os.environ, SAFE_ENV, clear=False),
+        ):
+            report = build_smoke_report()
+
+        details = " ".join(check["detail"] for check in report["checks"])
+        self.assertEqual(canonical_api_path("models-list", "/api/v1/models/"), "/api/v1/models/")
+        self.assertEqual(canonical_api_path("icea-plus-score", "/api/v1/icea-plus/score/"), "/api/v1/icea-plus/score/")
+        self.assertNotIn("status_code=301", details)
+        self.assertIn("status_code=", details)
+
     def test_smoke_test_no_individual_score_legacy_block_and_audit_guards(self):
         with (
             override_settings(**SAFE_SETTINGS),
@@ -214,3 +261,46 @@ class ICEASmokeCommandTests(ICEAPlusFixtureMixin, TestCase):
 
         self.assertEqual(report["status"], FAIL)
         self.assertEqual(self._codes(report)["smoke.score.no_individual_numeric_score"]["status"], FAIL)
+        self.assertIn("status_code=200", self._codes(report)["smoke.score.no_individual_numeric_score"]["detail"])
+
+    def test_smoke_fails_if_protected_endpoint_is_open_without_auth(self):
+        class FakeResponse:
+            def __init__(self, status_code, body=None):
+                self.status_code = status_code
+                self._body = body or {}
+
+            def json(self):
+                return self._body
+
+        class FakeClient:
+            raise_request_exception = False
+
+            def force_authenticate(self, user=None):
+                return None
+
+            def get(self, path, payload=None, **kwargs):
+                if path == "/api/v1/health/":
+                    return FakeResponse(200, {"status": "ok"})
+                if path == "/api/v1/models/":
+                    return FakeResponse(200, [])
+                return FakeResponse(404, {})
+
+            def post(self, path, payload=None, content_type=None, **kwargs):
+                return FakeResponse(404, {})
+
+        with (
+            override_settings(**SAFE_SETTINGS),
+            mock.patch.dict(os.environ, SAFE_ENV, clear=False),
+            mock.patch("icea_core.operational_readiness._governed_demo_artifacts", return_value=[]),
+            mock.patch("icea_core.operational_readiness._smoke_client", return_value=FakeClient()),
+        ):
+            report = build_smoke_report()
+
+        check = self._codes(report)["smoke.models.unauth_blocked"]
+        self.assertEqual(report["status"], FAIL)
+        self.assertEqual(check["status"], FAIL)
+        self.assertIn("status_code=200", check["detail"])
+
+    def test_audit_actor_raw_identity_is_not_safe(self):
+        self.assertFalse(_audit_events_have_safe_actors([{"actor": "clinician@example.test"}]))
+        self.assertTrue(_audit_events_have_safe_actors([{"actor": "authenticated_user:" + "a" * 64}]))
