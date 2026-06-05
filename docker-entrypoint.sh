@@ -35,6 +35,10 @@ if [ "${ICEA_SEED_DEMO:-false}" = "true" ]; then
   python manage.py seed_demo --rows "${ICEA_DEMO_ROWS:-800}" --name "${ICEA_DEMO_NAME:-icea-demo}" --model-version "${ICEA_DEMO_VERSION:-v1}"
 fi
 
+if [ "${ICEA_RUN_READINESS_CHECK:-false}" = "true" ]; then
+  python manage.py icea_readiness_check --strict-exit
+fi
+
 # Default: WSGI (gunicorn). Enterprise option: ASGI (daphne/uvicorn) for realtime.
 if [ "${ICEA_RUN_ASGI:-false}" = "true" ]; then
   if command -v daphne >/dev/null 2>&1; then

@@ -538,6 +538,27 @@ When `ICEA_ENABLE_THROTTLING=true`, global anonymous/user throttles and scoped
 throttles are enabled together. This keeps unscoped surfaces, including JWT
 token and refresh endpoints, under the configured global rate limits.
 
+### Operational readiness and smoke
+
+Run these from `backend/` before a demo rehearsal:
+
+```bash
+python manage.py icea_readiness_check
+python manage.py icea_smoke_test
+```
+
+The commands emit parseable JSON with `status=pass|warn|fail`; use
+`--strict-exit` when a shell wrapper should exit with code `1` on `fail`. They
+verify secure configuration coherence, governed demo model evidence, protected
+endpoints, legacy compute censorship, score redaction, non-defensible
+model/baseline blocking, throttling, and pseudonymous audit behavior. They must
+not print secrets, clinical payloads, PHI, raw audit actors, or individual score
+claims.
+
+Passing readiness/smoke does not mean clinical validation, MDR production
+readiness, individual decision support approval, punitive-use permission, or a
+production deployment sign-off. See `docs/OPERATIONS.md`.
+
 ### Logging and lineage
 
 ICEA+ requests, blocks, exports, training, causal runs, suppression, and writeback

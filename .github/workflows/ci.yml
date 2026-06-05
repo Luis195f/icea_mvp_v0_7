@@ -171,6 +171,17 @@ jobs:
             icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_spoofed_service_role_header_does_not_grant_service_access \
             icea_core.tests.test_security_fail_closed.ICEAFailClosedSecurityTests.test_secure_mode_blocks_dev_insecure_bypass_for_authenticated_user
 
+      - name: Run operational readiness and smoke command contracts
+        working-directory: backend
+        env:
+          ICEA_DEV_ALLOW_INSECURE: "false"
+          ICEA_AUTH_REQUIRED: "true"
+          ICEA_RBAC_ENFORCE: "true"
+          ICEA_SECURE_MODE: "true"
+          JWT_SIGNING_KEY: ci-risk-jwt-signing-key-not-for-production
+          AUDIT_LOG_SECRET: ci-risk-audit-secret-not-for-production
+        run: python manage.py test -v 2 icea_core.tests.test_operational_readiness
+
   frontend-check:
     name: Frontend build and lint
     runs-on: ubuntu-latest

@@ -75,6 +75,19 @@ All writeback/export endpoints require `admin` or `service`, are evidence-gated,
 use `icea_writeback` or `icea_export` throttling, and emit audit events without
 clinical payloads or patient/episode identifiers.
 
+Before demoing writeback/export behavior, run:
+
+```bash
+cd backend
+python manage.py icea_readiness_check
+python manage.py icea_smoke_test
+```
+
+The smoke contract checks that writeback/export surfaces block unauthenticated
+requests and do not expose episode identifiers or numeric patient/episode scores.
+Passing smoke does not make the writeback layer clinically validated or
+production-ready.
+
 ## HANDOVER guidance
 
 HANDOVER should consume this contract as prudent analytic support:

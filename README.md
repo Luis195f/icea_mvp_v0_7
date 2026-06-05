@@ -29,6 +29,7 @@ See:
 - `docs/ICEA_PLUS_API.md`
 - `docs/ICEA_PLUS_FOLLOWUP.md`
 - `docs/ICEA_PLUS_WRITEBACK.md`
+- `docs/OPERATIONS.md`
 - `docs/CI.md`
 
 ---
@@ -51,6 +52,19 @@ usable only as `shadow_aggregate_research`; it is not clinically validated, MDR
 production-ready, or suitable for individual decisioning. Demo seeding fails
 closed if the generated evidence pack cannot satisfy the normal model-evidence
 gate.
+
+Operational readiness and demo smoke can be checked from `backend/`:
+
+```bash
+python manage.py icea_readiness_check
+python manage.py icea_smoke_test
+```
+
+Both commands emit structured JSON with `status=pass|warn|fail`; add
+`--strict-exit` when a shell wrapper should exit with code `1` on `fail`. They
+do not print secrets, clinical payloads, PHI, or raw audit actors. See
+`docs/OPERATIONS.md` for the secure minimum configuration, endpoint matrix, and
+demo limitations.
 
 ---
 
@@ -256,6 +270,19 @@ Legacy compute, conformal prediction, RiskAssessment writeback, dashboard
 summary, and writeback listing remain available only as censored,
 evidence-gated compatibility surfaces. They do not expose an individual score,
 nurse ranking, or unsuppressed low-support export.
+
+Before any demo rehearsal, run:
+
+```bash
+cd backend
+python manage.py icea_readiness_check
+python manage.py icea_smoke_test
+```
+
+These checks verify configuration, governed demo model evidence, protected
+endpoints, redaction of individual score surfaces, throttling configuration, and
+pseudonymous audit behavior. Passing them does not mean clinical validation or
+production regulatory readiness.
 
 ```json
 { "episode_id": 1, "model_id": "<uuid>", "alpha": 0.05 }
