@@ -5,6 +5,7 @@ import json
 import pandas as pd
 from django.conf import settings
 from django.core.management.base import BaseCommand
+from django.db import transaction
 
 from icea_core.evidence import build_training_evidence_metadata, summarize_model_evidence
 from icea_core.ml import train_xgb_regressor
@@ -107,32 +108,33 @@ class Command(BaseCommand):
             case_mix_spec=case_mix_spec,
         )
 
-        artifact = ModelArtifact.objects.create(
-            name=name,
-            version=version,
-            target=result.target,
-            features=result.features,
-            model_type="xgboost",
-            model_path=result.model_path,
-            metrics=result.metrics,
-        )
-        evidence = summarize_model_evidence(artifact)
-        if not evidence.defensible:
-            artifact.governance_status = "quarantine"
-            artifact.save(update_fields=["governance_status"])
+        with transaction.atomic():
+            artifact = ModelArtifact.objects.create(
+                name=name,
+                version=version,
+                target=result.target,
+                features=result.features,
+                model_type="xgboost",
+                model_path=result.model_path,
+                metrics=result.metrics,
+            )
             evidence = summarize_model_evidence(artifact)
+            if not evidence.defensible:
+                artifact.governance_status = "quarantine"
+                artifact.save(update_fields=["governance_status"])
+                evidence = summarize_model_evidence(artifact)
 
-        TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
-        append_audit_event(
-            event_type="model_train_completed",
-            payload={
-                "action": "train",
-                "model_id": str(artifact.id),
-                "row_count": int(len(df)),
-                "status": "completed" if evidence.defensible else "quarantine",
-            },
-            context="management/train_from_db",
-            actor="management_command",
-        )
+            TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
+            append_audit_event(
+                event_type="model_train_completed",
+                payload={
+                    "action": "train",
+                    "model_id": str(artifact.id),
+                    "row_count": int(len(df)),
+                    "status": "completed" if evidence.defensible else "quarantine",
+                },
+                context="management/train_from_db",
+                actor="management_command",
+            )
 
         self.stdout.write(self.style.SUCCESS(f"Trained and registered model: {artifact.id} ({name}:{version})"))

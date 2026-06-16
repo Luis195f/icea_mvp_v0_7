@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.db.models import Model
 from django.utils import timezone
 from rest_framework.response import Response
@@ -210,33 +211,34 @@ class ICEAPlusScoreView(APIView):
             request_hash = str(
                 ((((public_result["results"][0] or {}).get("lineage") or {}).get("source") or {}).get("request_hash") or "")
             )
-        computation = ICEAPlusComputation.objects.create(
-            formula_version=result["formula_version"],
-            model=artifact,
-            grain=str(payload.get("grain") or "episode"),
-            rows=int(summary.get("rows_requested") or 0),
-            status="ok",
-            summary=summary,
-            request_hash=request_hash,
-        )
-        append_audit_event(
-            event_type="icea_plus_score",
-            payload={
-                "model_id": str(artifact.id),
-                "baseline_model_id": str(payload.get("baseline_model_id") or ""),
-                "formula_version": result["formula_version"],
-                "grain": str(payload.get("grain") or "episode"),
-                "rows": int(summary.get("rows_requested") or 0),
-            },
-            context="icea-plus/score",
-        )
-        if bool(payload.get("from_db", True)) and str(payload.get("grain") or "episode") == "episode":
-            persist_initial_followup_records(
-                artifact=artifact,
-                result=result,
-                computation=computation,
-                request_config=dict(payload),
+        with transaction.atomic():
+            computation = ICEAPlusComputation.objects.create(
+                formula_version=result["formula_version"],
+                model=artifact,
+                grain=str(payload.get("grain") or "episode"),
+                rows=int(summary.get("rows_requested") or 0),
+                status="ok",
+                summary=summary,
+                request_hash=request_hash,
             )
+            append_audit_event(
+                event_type="icea_plus_score",
+                payload={
+                    "model_id": str(artifact.id),
+                    "baseline_model_id": str(payload.get("baseline_model_id") or ""),
+                    "formula_version": result["formula_version"],
+                    "grain": str(payload.get("grain") or "episode"),
+                    "rows": int(summary.get("rows_requested") or 0),
+                },
+                context="icea-plus/score",
+            )
+            if bool(payload.get("from_db", True)) and str(payload.get("grain") or "episode") == "episode":
+                persist_initial_followup_records(
+                    artifact=artifact,
+                    result=result,
+                    computation=computation,
+                    request_config=dict(payload),
+                )
         return Response(public_result)
 
 
@@ -409,21 +411,22 @@ class ICEAPlusCalibrateView(APIView):
         ser.is_valid(raise_exception=True)
         payload = ser.validated_data
 
-        formula = upsert_formula_version(
-            version=str(payload.get("version") or "icea_plus_v1"),
-            spec_override=payload.get("spec") or {},
-            notes=str(payload.get("notes") or ""),
-            activate=bool(payload.get("activate", True)),
-        )
+        with transaction.atomic():
+            formula = upsert_formula_version(
+                version=str(payload.get("version") or "icea_plus_v1"),
+                spec_override=payload.get("spec") or {},
+                notes=str(payload.get("notes") or ""),
+                activate=bool(payload.get("activate", True)),
+            )
 
-        append_audit_event(
-            event_type="icea_plus_calibrate",
-            payload={
-                "formula_version": formula.version,
-                "activate": bool(payload.get("activate", True)),
-            },
-            context="icea-plus/calibrate",
-        )
+            append_audit_event(
+                event_type="icea_plus_calibrate",
+                payload={
+                    "formula_version": formula.version,
+                    "activate": bool(payload.get("activate", True)),
+                },
+                context="icea-plus/calibrate",
+            )
         return Response(
             {
                 "formula_version": formula.version,

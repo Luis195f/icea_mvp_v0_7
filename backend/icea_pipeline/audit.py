@@ -32,9 +32,7 @@ def _get_secret() -> str:
     - If ICEA_SECURE_MODE=true -> fail-closed unless a strong, non-default secret is provided.
     - Else -> allow a dev fallback for local testing.
     """
-    secure_mode = bool(getattr(settings, "ICEA_SECURE_MODE", False)) or os.environ.get(
-        "ICEA_SECURE_MODE", "false"
-    ).lower() == "true"
+    secure_mode = bool(getattr(settings, "ICEA_SECURE_MODE", False))
 
     # Prefer Django settings, but allow an alias env var for deployments that centralize secrets.
     secret = getattr(settings, "AUDIT_LOG_SECRET", "") or os.environ.get("ICEA_AUDIT_SECRET", "")
@@ -62,9 +60,7 @@ def _get_secret() -> str:
 
 
 def _secure_mode_enabled() -> bool:
-    return bool(getattr(settings, "ICEA_SECURE_MODE", False)) or os.environ.get(
-        "ICEA_SECURE_MODE", "false"
-    ).lower() == "true"
+    return bool(getattr(settings, "ICEA_SECURE_MODE", False))
 
 
 def append_audit_event(*, event_type: str, payload: Any, context: str = "", actor: str = "api") -> str | None:

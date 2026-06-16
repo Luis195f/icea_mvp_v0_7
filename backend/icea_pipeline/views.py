@@ -969,45 +969,46 @@ class PipelineTrainFromDBView(APIView):
             case_mix_spec=payload.get("case_mix_spec"),
         )
 
-        artifact = ModelArtifact.objects.create(
-            name=name,
-            version=version,
-            target=result.target,
-            features=result.features,
-            model_type="xgboost",
-            model_path=result.model_path,
-            metrics=result.metrics,
-        )
-        evidence = summarize_model_evidence(artifact)
-        if not evidence.defensible:
-            artifact.governance_status = "quarantine"
-            artifact.save(update_fields=["governance_status"])
+        with transaction.atomic():
+            artifact = ModelArtifact.objects.create(
+                name=name,
+                version=version,
+                target=result.target,
+                features=result.features,
+                model_type="xgboost",
+                model_path=result.model_path,
+                metrics=result.metrics,
+            )
             evidence = summarize_model_evidence(artifact)
+            if not evidence.defensible:
+                artifact.governance_status = "quarantine"
+                artifact.save(update_fields=["governance_status"])
+                evidence = summarize_model_evidence(artifact)
 
-        TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
-        append_audit_event(
-            event_type="train_model",
-            payload={
-                "model_id": str(artifact.id),
-                "name": name,
-                "version": version,
-                "target": target,
-                "rows": int(len(df)),
-                "dataset_grain": dataset_grain,
-            },
-            context="pipeline/train",
-        )
-        append_icea_api_audit(
-            request=request,
-            event_type="model_train_completed",
-            context="pipeline/train",
-            action="train",
-            model_id=str(artifact.id),
-            row_count=int(len(df)),
-            grain=dataset_grain,
-            evidence_status=evidence.evidence_status,
-            status="completed" if evidence.defensible else "quarantine",
-        )
+            TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
+            append_audit_event(
+                event_type="train_model",
+                payload={
+                    "model_id": str(artifact.id),
+                    "name": name,
+                    "version": version,
+                    "target": target,
+                    "rows": int(len(df)),
+                    "dataset_grain": dataset_grain,
+                },
+                context="pipeline/train",
+            )
+            append_icea_api_audit(
+                request=request,
+                event_type="model_train_completed",
+                context="pipeline/train",
+                action="train",
+                model_id=str(artifact.id),
+                row_count=int(len(df)),
+                grain=dataset_grain,
+                evidence_status=evidence.evidence_status,
+                status="completed" if evidence.defensible else "quarantine",
+            )
         return Response(
             {
                 "model_id": str(artifact.id),
@@ -1218,23 +1219,24 @@ class GovernanceDecisionView(APIView):
         if p.get("writeback_id"):
             wb = FHIRWritebackRecord.objects.filter(id=p["writeback_id"]).first()
 
-        gd = GovernanceDecision.objects.create(
-            decision_type=p.get("decision_type") or "override",
-            actor=p.get("actor") or "",
-            rationale=p.get("rationale") or "",
-            model=model,
-            episode=ep,
-            causal_run=cr,
-            writeback=wb,
-            payload=p.get("payload") or {},
-        )
+        with transaction.atomic():
+            gd = GovernanceDecision.objects.create(
+                decision_type=p.get("decision_type") or "override",
+                actor=p.get("actor") or "",
+                rationale=p.get("rationale") or "",
+                model=model,
+                episode=ep,
+                causal_run=cr,
+                writeback=wb,
+                payload=p.get("payload") or {},
+            )
 
-        append_audit_event(
-            event_type="governance_decision",
-            payload={"decision_id": str(gd.id), "decision_type": gd.decision_type, "actor": gd.actor},
-            context="governance/decision",
-            actor=gd.actor or "api",
-        )
+            append_audit_event(
+                event_type="governance_decision",
+                payload={"decision_id": str(gd.id), "decision_type": gd.decision_type, "actor": gd.actor},
+                context="governance/decision",
+                actor=gd.actor or "api",
+            )
 
         return Response({"decision_id": str(gd.id)})
 
@@ -2170,33 +2172,34 @@ class RiskAssessmentWritebackView(APIView):
             "note": [{"text": note_txt}],
         }
 
-        rec = FHIRWritebackRecord.objects.create(
-            episode=ep,
-            model_id=artifact.id,
-            payload=risk_assessment,
-            attempted_writeback=False,
-        )
+        with transaction.atomic():
+            rec = FHIRWritebackRecord.objects.create(
+                episode=ep,
+                model_id=artifact.id,
+                payload=risk_assessment,
+                attempted_writeback=False,
+            )
 
-        if writeback and (str(os.environ.get("FHIR_WRITEBACK_ENABLED", "false")).lower() in {"1", "true", "yes"}):
-            rec.attempted_writeback = True
-            rec.save(update_fields=["attempted_writeback"])
-            rec.writeback_ok = False
-            rec.writeback_response = {
-                "detail": "individual_riskassessment_writeback_blocked_in_shadow_mode",
-                "non_individual_use": True,
-                "shadow_mode": True,
-            }
-            rec.save(update_fields=["writeback_ok", "writeback_response"])
+            if writeback and (str(os.environ.get("FHIR_WRITEBACK_ENABLED", "false")).lower() in {"1", "true", "yes"}):
+                rec.attempted_writeback = True
+                rec.save(update_fields=["attempted_writeback"])
+                rec.writeback_ok = False
+                rec.writeback_response = {
+                    "detail": "individual_riskassessment_writeback_blocked_in_shadow_mode",
+                    "non_individual_use": True,
+                    "shadow_mode": True,
+                }
+                rec.save(update_fields=["writeback_ok", "writeback_response"])
 
-        append_icea_api_audit(
-            request=request,
-            event_type="writeback_patient_completed",
-            context="fhir/writeback/riskassessment",
-            action="writeback",
-            model_id=str(artifact.id),
-            status="shadow_only",
-            suppressed=True,
-        )
+            append_icea_api_audit(
+                request=request,
+                event_type="writeback_patient_completed",
+                context="fhir/writeback/riskassessment",
+                action="writeback",
+                model_id=str(artifact.id),
+                status="shadow_only",
+                suppressed=True,
+            )
 
         return Response(
             {

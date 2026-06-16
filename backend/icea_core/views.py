@@ -4,6 +4,7 @@ import hashlib
 
 import pandas as pd
 from django.conf import settings
+from django.db import transaction
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from icea_pipeline.temporal import validate_temporal_frame
@@ -103,30 +104,31 @@ class ModelTrainView(APIView):
         )
         result.metrics["evidence_pack"] = evidence_pack
 
-        artifact = ModelArtifact.objects.create(
-            name=payload.get("name", "icea-xgb"),
-            version=payload.get("version", "v1"),
-            target=result.target,
-            features=result.features,
-            model_type="xgboost",
-            model_path=result.model_path,
-            metrics=result.metrics,
-        )
-        evidence = summarize_model_evidence(artifact)
-        if not evidence.defensible:
-            artifact.governance_status = "quarantine"
-            artifact.save(update_fields=["governance_status"])
+        with transaction.atomic():
+            artifact = ModelArtifact.objects.create(
+                name=payload.get("name", "icea-xgb"),
+                version=payload.get("version", "v1"),
+                target=result.target,
+                features=result.features,
+                model_type="xgboost",
+                model_path=result.model_path,
+                metrics=result.metrics,
+            )
             evidence = summarize_model_evidence(artifact)
-        append_icea_api_audit(
-            request=request,
-            event_type="model_train_completed",
-            context="models/train",
-            action="train",
-            model_id=str(artifact.id),
-            row_count=int(len(df)),
-            evidence_status=evidence.evidence_status,
-            status="completed" if evidence.defensible else "quarantine",
-        )
+            if not evidence.defensible:
+                artifact.governance_status = "quarantine"
+                artifact.save(update_fields=["governance_status"])
+                evidence = summarize_model_evidence(artifact)
+            append_icea_api_audit(
+                request=request,
+                event_type="model_train_completed",
+                context="models/train",
+                action="train",
+                model_id=str(artifact.id),
+                row_count=int(len(df)),
+                evidence_status=evidence.evidence_status,
+                status="completed" if evidence.defensible else "quarantine",
+            )
         return Response(ModelArtifactSerializer(artifact).data, status=201)
 
 

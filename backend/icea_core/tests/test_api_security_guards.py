@@ -21,13 +21,13 @@ from icea_core.icea_plus_views import (
     ICEAPlusWritebackPatientView,
     ICEAPlusWritebackSummaryView,
 )
-from icea_core.models import ICEAComputation, ModelArtifact
+from icea_core.models import ICEAComputation, ICEAPlusComputation, ModelArtifact
 from icea_core.permissions import _audit_permission_denial, _safe_caller_audit_identity
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
 from icea_core.throttling import IceaAnonRateThrottle, IceaScopedRateThrottle, IceaUserRateThrottle
 from icea_core.views import ICEAComputeView, ModelTrainView
 from icea_pipeline.audit import append_audit_event
-from icea_pipeline.models import AuditEvent, FHIRWritebackRecord
+from icea_pipeline.models import AuditEvent, FHIRWritebackRecord, TrainingRun
 from icea_pipeline.views import (
     CausalRunView,
     ConformalPredictView,
@@ -77,6 +77,18 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
 
     def _post(self, path: str, payload: dict, **extra):
         return self.client.post(self._canonical_path(path), payload, format="json", secure=True, **extra)
+
+    def _audit_create_fails_after(self, *, allowed_creates: int):
+        original_create = AuditEvent.objects.create
+        calls = {"count": 0}
+
+        def create_or_fail(**kwargs):
+            calls["count"] += 1
+            if calls["count"] <= allowed_creates:
+                return original_create(**kwargs)
+            raise RuntimeError("audit-storage-failed")
+
+        return create_or_fail
 
     def test_security_request_helpers_use_canonical_https_paths(self):
         with mock.patch.object(self.client, "get") as get:
@@ -308,7 +320,7 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
 
     def test_append_audit_event_dev_mode_warns_without_breaking_flow(self):
         with (
-            override_settings(ICEA_SECURE_MODE=False, AUDIT_LOG_SECRET=""),
+            override_settings(ICEA_SECURE_MODE=False, ICEA_DEV_ALLOW_INSECURE=True, AUDIT_LOG_SECRET=""),
             mock.patch("icea_pipeline.audit.AuditEvent.objects.create", side_effect=RuntimeError("patient-secret")),
             self.assertLogs("icea_pipeline.audit", level="WARNING") as logs,
         ):
@@ -323,6 +335,170 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         self.assertIn("dev_failure", logged)
         self.assertIn("RuntimeError", logged)
         self.assertNotIn("patient-secret", logged)
+
+    def test_external_model_train_rolls_back_when_mandatory_audit_fails_in_secure_mode(self):
+        self.client.force_authenticate(user=self._user_with_role("researcher"))
+        before_count = ModelArtifact.objects.count()
+        train_result = SimpleNamespace(
+            model_path="mock-secure-audit-model.json",
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            metrics={
+                "rmse": 0.1,
+                "mae": 0.1,
+                "conformal": {"method": "split_abs_residual", "calibration_size": 2},
+            },
+        )
+        payload = {
+            "name": "secure-audit-rollback-external",
+            "version": "v-test",
+            "target": "delta_ri",
+            "features": ["ri_initial", "nurse_hppd"],
+            "dataset": [
+                {
+                    "ri_initial": 50.0 + idx,
+                    "nurse_hppd": 3.0 + idx,
+                    "delta_ri": 1.0,
+                    "temporal_spec": {
+                        "temporal_spec_version": "icea_temporal_v1",
+                        "index_time": "2026-03-01T08:00:00Z",
+                        "feature_window_start": "2026-03-01T08:00:00Z",
+                        "feature_window_end": "2026-03-01T20:00:00Z",
+                        "outcome_window_start": "2026-03-01T20:00:00Z",
+                        "outcome_window_end": "2026-03-02T08:00:00Z",
+                    },
+                }
+                for idx in range(4)
+            ],
+        }
+
+        with (
+            override_settings(ICEA_SECURE_MODE=True, AUDIT_LOG_SECRET="secure-audit-secret-value-32-chars"),
+            mock.patch("icea_core.views.train_xgb_regressor", return_value=train_result),
+            mock.patch(
+                "icea_pipeline.audit.AuditEvent.objects.create",
+                side_effect=self._audit_create_fails_after(allowed_creates=1),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            self._post("/api/v1/models/train/", payload)
+
+        self.assertEqual(ModelArtifact.objects.count(), before_count)
+        self.assertFalse(ModelArtifact.objects.filter(name="secure-audit-rollback-external").exists())
+
+    def test_pipeline_train_rolls_back_model_and_training_run_when_mandatory_audit_fails_in_secure_mode(self):
+        self.client.force_authenticate(user=self._user_with_role("researcher"))
+        before_models = ModelArtifact.objects.count()
+        before_runs = TrainingRun.objects.count()
+        train_result = SimpleNamespace(
+            model_path="mock-pipeline-secure-audit-model.json",
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            metrics={
+                "rmse": 0.1,
+                "mae": 0.1,
+                "conformal": {"method": "split_abs_residual", "calibration_size": 2},
+            },
+        )
+
+        with (
+            override_settings(ICEA_SECURE_MODE=True, AUDIT_LOG_SECRET="secure-audit-secret-value-32-chars"),
+            mock.patch("icea_pipeline.views.train_xgb_regressor", return_value=train_result),
+            mock.patch(
+                "icea_pipeline.audit.AuditEvent.objects.create",
+                side_effect=self._audit_create_fails_after(allowed_creates=1),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            self._post(
+                "/api/v1/pipeline/train/",
+                {"name": "secure-audit-rollback-db", "version": "v-test", "target": "delta_ri", "grain": "episode"},
+            )
+
+        self.assertEqual(ModelArtifact.objects.count(), before_models)
+        self.assertEqual(TrainingRun.objects.count(), before_runs)
+        self.assertFalse(ModelArtifact.objects.filter(name="secure-audit-rollback-db").exists())
+
+    def test_train_from_db_command_rolls_back_model_and_training_run_when_mandatory_audit_fails_in_secure_mode(self):
+        from icea_pipeline.management.commands.train_from_db import Command as TrainFromDBCommand
+
+        before_models = ModelArtifact.objects.count()
+        before_runs = TrainingRun.objects.count()
+        train_result = SimpleNamespace(
+            model_path="mock-command-secure-audit-model.json",
+            features=["ri_initial", "nurse_hppd"],
+            target="delta_ri",
+            metrics={
+                "rmse": 0.1,
+                "mae": 0.1,
+                "conformal": {"method": "split_abs_residual", "calibration_size": 2},
+            },
+        )
+
+        with (
+            override_settings(ICEA_SECURE_MODE=True, AUDIT_LOG_SECRET="secure-audit-secret-value-32-chars"),
+            mock.patch("icea_pipeline.management.commands.train_from_db.train_xgb_regressor", return_value=train_result),
+            mock.patch(
+                "icea_pipeline.audit.AuditEvent.objects.create",
+                side_effect=self._audit_create_fails_after(allowed_creates=1),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            TrainFromDBCommand().handle(
+                name="secure-audit-rollback-command",
+                version="v-test",
+                target="delta_ri",
+                case_mix_spec_json="",
+            )
+
+        self.assertEqual(ModelArtifact.objects.count(), before_models)
+        self.assertEqual(TrainingRun.objects.count(), before_runs)
+        self.assertFalse(ModelArtifact.objects.filter(name="secure-audit-rollback-command").exists())
+
+    def test_fhir_writeback_rolls_back_record_when_mandatory_audit_fails_in_secure_mode(self):
+        episode = self.episodes[0]
+        episode.fhir_patient_id = "patient-secure-rollback"
+        episode.fhir_encounter_id = "encounter-secure-rollback"
+        episode.save(update_fields=["fhir_patient_id", "fhir_encounter_id"])
+        self.client.force_authenticate(user=self._user_with_role("admin"))
+        before_records = FHIRWritebackRecord.objects.count()
+
+        with (
+            override_settings(ICEA_SECURE_MODE=True, AUDIT_LOG_SECRET="secure-audit-secret-value-32-chars"),
+            mock.patch(
+                "icea_pipeline.audit.AuditEvent.objects.create",
+                side_effect=self._audit_create_fails_after(allowed_creates=1),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            self._post(
+                "/api/v1/fhir/writeback/riskassessment/",
+                {"episode_id": int(episode.id), "model_id": str(self.episode_artifact.id), "writeback": False},
+            )
+
+        self.assertEqual(FHIRWritebackRecord.objects.count(), before_records)
+        self.assertFalse(
+            FHIRWritebackRecord.objects.filter(episode=episode, model_id=self.episode_artifact.id).exists()
+        )
+
+    def test_icea_plus_score_rolls_back_computation_when_mandatory_audit_fails_in_secure_mode(self):
+        self.client.force_authenticate(user=self._user_with_role("researcher"))
+        before_computations = ICEAPlusComputation.objects.count()
+
+        with (
+            override_settings(ICEA_SECURE_MODE=True, AUDIT_LOG_SECRET="secure-audit-secret-value-32-chars"),
+            mock.patch(
+                "icea_pipeline.audit.AuditEvent.objects.create",
+                side_effect=self._audit_create_fails_after(allowed_creates=1),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            self._post(
+                "/api/v1/icea-plus/score/",
+                {"model_id": str(self.episode_artifact.id), "grain": "episode", "from_db": True},
+            )
+
+        self.assertEqual(ICEAPlusComputation.objects.count(), before_computations)
 
     def test_authenticated_audit_actor_is_stable_pseudonymous_and_distinct(self):
         user_a = get_user_model().objects.create_user(
