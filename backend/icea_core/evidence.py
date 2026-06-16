@@ -13,6 +13,7 @@ from icea_pipeline.temporal import CASE_MIX_REQUIRED_DOMAINS, validate_case_mix_
 
 
 INTENDED_USE_SHADOW_AGGREGATE = "shadow_aggregate_research"
+USABLE_GOVERNANCE_STATUSES = frozenset({"candidate"})
 REQUIRED_MODEL_LIMITATIONS = frozenset(
     {
         "shadow_aggregate_research_only",
@@ -470,6 +471,7 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
 
     pack = {
         "model_id": str(artifact.id) if artifact.id else None,
+        "governance_status": str(getattr(artifact, "governance_status", "candidate") or "candidate"),
         "artifact_created_at": artifact.created_at.isoformat() if artifact.created_at else None,
         "dataset_fingerprint": dataset_fingerprint,
         "training_row_count": training_row_count,
@@ -559,6 +561,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
         )
     if not pack.get("provenance") and not pack.get("source_commit") and not pack.get("source_commit_unavailable_reason"):
         missing.append("provenance_or_source_commit_or_unavailable_reason")
+    if pack.get("governance_status") not in USABLE_GOVERNANCE_STATUSES:
+        missing.append("artifact_governance_status_usable")
 
     statuses: list[str] = []
     if missing:
@@ -590,6 +594,8 @@ def summarize_model_evidence(artifact: ModelArtifact) -> ModelEvidenceSummary:
     validation_available = bool(pack.get("validation_metrics")) and valid_validation_row_count is not None
     if not validation_available:
         statuses.append("validation_unavailable")
+    if pack.get("governance_status") not in USABLE_GOVERNANCE_STATUSES:
+        statuses.append(f"model_artifact_{pack.get('governance_status')}")
 
     evidence_status = "evidence_complete" if not missing else "evidence_incomplete"
     blocking = set(statuses) - {"calibration_unavailable", "validation_unavailable"}

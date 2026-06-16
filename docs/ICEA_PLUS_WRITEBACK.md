@@ -75,6 +75,12 @@ All writeback/export endpoints require `admin` or `service`, are evidence-gated,
 use `icea_writeback` or `icea_export` throttling, and emit audit events without
 clinical payloads or patient/episode identifiers.
 
+`FHIRWritebackRecord.payload` is encrypted at rest. This protects legacy FHIR
+RiskAssessment compatibility payloads that may contain `Patient/{id}` or
+`Encounter/{id}` references. Secure mode requires explicit
+`PHI_ENCRYPTION_KEYS`; the development fallback is allowed only when
+`ICEA_DEV_ALLOW_INSECURE=true`.
+
 Before demoing writeback/export behavior, run:
 
 ```bash

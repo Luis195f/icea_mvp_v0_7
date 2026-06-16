@@ -128,6 +128,24 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-ci.txt
 
+      - name: Generate ephemeral secure-mode test keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Ephemeral CI/test keys only. These are generated per job and are not real secrets.
+          python <<'PY'
+          import os
+          import secrets
+          from cryptography.fernet import Fernet
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"SECRET_KEY={secrets.token_urlsafe(64)}\n")
+              env.write(f"PHI_ENCRYPTION_KEYS={Fernet.generate_key().decode()}\n")
+              env.write(f"JWT_SIGNING_KEY={secrets.token_urlsafe(64)}\n")
+              env.write(f"AUDIT_LOG_SECRET={secrets.token_urlsafe(64)}\n")
+              env.write("ALLOWED_HOSTS=localhost,127.0.0.1,testserver\n")
+          PY
+
       - name: Run contract, aggregation, and non-individualization guardrails
         working-directory: backend
         env:
@@ -157,8 +175,6 @@ jobs:
           ICEA_AUTH_REQUIRED: "true"
           ICEA_RBAC_ENFORCE: "true"
           ICEA_SECURE_MODE: "true"
-          JWT_SIGNING_KEY: ci-risk-jwt-signing-key-not-for-production
-          AUDIT_LOG_SECRET: ci-risk-audit-secret-not-for-production
         run: |
           python manage.py test -v 2 \
             icea_core.tests.test_api_security_guards.ICEAApiSecurityGuardTests \
@@ -178,8 +194,6 @@ jobs:
           ICEA_AUTH_REQUIRED: "true"
           ICEA_RBAC_ENFORCE: "true"
           ICEA_SECURE_MODE: "true"
-          JWT_SIGNING_KEY: ci-risk-jwt-signing-key-not-for-production
-          AUDIT_LOG_SECRET: ci-risk-audit-secret-not-for-production
         run: python manage.py test -v 2 icea_core.tests.test_operational_readiness
 
   frontend-check:

@@ -16,14 +16,22 @@ django.setup()
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.conf import settings
-from django.test import TestCase
+from django.core.exceptions import ImproperlyConfigured
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from icea_core.tests.helpers import ICEAPlusFixtureMixin
+from icea_pipeline.fields import _get_keys
+
+
+TEST_PHI_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 
 class ICEAFailClosedSecurityTests(ICEAPlusFixtureMixin, TestCase):
     def setUp(self):
+        self.phi_settings = override_settings(PHI_ENCRYPTION_KEYS=[TEST_PHI_KEY])
+        self.phi_settings.enable()
+        self.addCleanup(self.phi_settings.disable)
         self.env = mock.patch.dict(
             os.environ,
             {
@@ -193,6 +201,7 @@ class ICEAFailClosedSecurityTests(ICEAPlusFixtureMixin, TestCase):
                 "ICEA_RBAC_ENFORCE": "true",
                 "ICEA_DEV_ALLOW_INSECURE": "false",
                 "SECRET_KEY": "strong-test-secret-not-for-prod",
+                "PHI_ENCRYPTION_KEYS": TEST_PHI_KEY,
             }
         )
         for key in ("JWT_SIGNING_KEY", "JWT_VERIFYING_KEY", "OIDC_JWKS_URL"):
@@ -209,6 +218,71 @@ class ICEAFailClosedSecurityTests(ICEAPlusFixtureMixin, TestCase):
 
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("ICEA_SECURE_MODE=true requires JWT_SIGNING_KEY", proc.stdout + proc.stderr)
+
+    def test_secure_mode_without_phi_encryption_keys_fails_closed(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "DJANGO_SETTINGS_MODULE": "config.settings",
+                "DJANGO_DEBUG": "false",
+                "ICEA_SECURE_MODE": "true",
+                "ICEA_AUTH_REQUIRED": "true",
+                "ICEA_RBAC_ENFORCE": "true",
+                "ICEA_DEV_ALLOW_INSECURE": "false",
+                "SECRET_KEY": "strong-test-secret-not-for-prod",
+                "JWT_SIGNING_KEY": "strong-jwt-signing-key-not-for-prod",
+                "AUDIT_LOG_SECRET": "strong-audit-secret-not-for-prod-32",
+            }
+        )
+        env.pop("PHI_ENCRYPTION_KEYS", None)
+
+        proc = subprocess.run(
+            [sys.executable, "manage.py", "check"],
+            cwd=str(Path(settings.BASE_DIR)),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ICEA_SECURE_MODE=true requires PHI_ENCRYPTION_KEYS", proc.stdout + proc.stderr)
+
+    def test_secure_mode_with_strong_phi_encryption_keys_passes_configuration(self):
+        env = os.environ.copy()
+        env.update(
+            {
+                "DJANGO_SETTINGS_MODULE": "config.settings",
+                "DJANGO_DEBUG": "false",
+                "ICEA_SECURE_MODE": "true",
+                "ICEA_AUTH_REQUIRED": "true",
+                "ICEA_RBAC_ENFORCE": "true",
+                "ICEA_DEV_ALLOW_INSECURE": "false",
+                "SECRET_KEY": "strong-test-secret-not-for-prod",
+                "JWT_SIGNING_KEY": "strong-jwt-signing-key-not-for-prod",
+                "AUDIT_LOG_SECRET": "strong-audit-secret-not-for-prod-32",
+                "PHI_ENCRYPTION_KEYS": TEST_PHI_KEY,
+            }
+        )
+
+        proc = subprocess.run(
+            [sys.executable, "manage.py", "check"],
+            cwd=str(Path(settings.BASE_DIR)),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_phi_secret_key_fallback_requires_explicit_dev_mode(self):
+        with override_settings(PHI_ENCRYPTION_KEYS=[], ICEA_SECURE_MODE=False, ICEA_DEV_ALLOW_INSECURE=False):
+            with self.assertRaises(ImproperlyConfigured):
+                _get_keys()
+
+        with override_settings(PHI_ENCRYPTION_KEYS=[], ICEA_SECURE_MODE=False, ICEA_DEV_ALLOW_INSECURE=True):
+            self.assertTrue(_get_keys())
 
     def test_explicit_dev_mode_keeps_local_compatibility(self):
         with mock.patch.dict(os.environ, {"ICEA_DEV_ALLOW_INSECURE": "true", "ICEA_AUTH_REQUIRED": "false", "ICEA_RBAC_ENFORCE": "false"}, clear=False):

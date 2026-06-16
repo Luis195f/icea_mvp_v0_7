@@ -62,6 +62,7 @@ ICEA_AUTH_REQUIRED=true
 ICEA_RBAC_ENFORCE=true
 JWT_SIGNING_KEY=<dedicated JWT key>
 AUDIT_LOG_SECRET=<strong audit secret>
+PHI_ENCRYPTION_KEYS=<fernet key or comma-separated rotation keys>
 ICEA_ENABLE_THROTTLING=true
 ```
 
@@ -88,6 +89,42 @@ python manage.py seed_demo --rows 800 --name icea-demo --model-version v1
 The demo model remains synthetic and shadow-only. It is not clinically
 validated, not MDR production-ready, not an individual score, not punitive, and
 not a clinical decision tool.
+
+## No Paid Services Required For This Hardening
+
+This hardening uses local Django/DRF code, the existing database, existing test
+fixtures, and open-source dependencies already present in the project. It does
+not require Sentry, Datadog, AWS, Azure, GCP, a paid FHIR server, a paid
+terminology server, or any SaaS control plane.
+
+## Still Not Clinically Validated
+
+These controls improve security, traceability, and governance for the pilot
+surface. They do not validate ICEA/ICEA+ clinically, authorize individual
+decision support, make the system MDR production-ready, or permit operational
+patient, staff, punitive, or staffing decisions from individual scores.
+
+## PHI Only With Secure Mode And Explicit PHI_ENCRYPTION_KEYS
+
+Secure/institutional runs must set `ICEA_SECURE_MODE=true` and explicit
+`PHI_ENCRYPTION_KEYS`. Secure mode fails closed if `PHI_ENCRYPTION_KEYS` is
+missing, and encrypted PHI fields must not derive encryption material from
+`SECRET_KEY` in secure mode. The `SECRET_KEY`-derived fallback exists only for
+explicit local development with `ICEA_DEV_ALLOW_INSECURE=true`.
+
+## Writeback Payload Encryption/Minimization
+
+`FHIRWritebackRecord.payload` is encrypted at the Django field layer because
+FHIR references such as `Patient/{id}`, `Encounter/{id}`, and
+`Practitioner/{id}` can be PHI or linkable identifiers. The writeback API stays
+shadow-only, stores no individual score, `raw_score`, or numeric prediction in
+the response contract, and export/list surfaces remain aggregate-only with
+support suppression.
+
+Legacy plaintext writeback rows remain readable for compatibility until they
+are re-saved. Do not add new writeback payload fields containing direct
+patient, encounter, practitioner, score, raw score, or prediction values unless
+they are encrypted and covered by evidence-gated tests.
 
 ## Smoke Contract
 

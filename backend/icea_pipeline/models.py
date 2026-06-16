@@ -206,7 +206,9 @@ class FHIRWritebackRecord(models.Model):
     model_id = models.UUIDField()
 
     resource_type = models.CharField(max_length=64, default="RiskAssessment")
-    payload = models.JSONField(default=dict)
+    # PHI hardening: FHIR references can contain Patient/Encounter identifiers.
+    # Keep the model API JSON-compatible while encrypting the stored value.
+    payload = EncryptedJSONField(default=dict)
     attempted_writeback = models.BooleanField(default=False)
     writeback_ok = models.BooleanField(default=False)
     writeback_response = models.JSONField(default=dict, blank=True)

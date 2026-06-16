@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 from typing import Any
 
@@ -12,6 +13,8 @@ from django.utils import timezone
 
 from icea_core.audit_identity import safe_stored_audit_actor
 from icea_pipeline.models import AuditEvent
+
+logger = logging.getLogger(__name__)
 
 
 def _stable_dumps(obj: Any) -> str:
@@ -29,7 +32,7 @@ def _get_secret() -> str:
     - If ICEA_SECURE_MODE=true -> fail-closed unless a strong, non-default secret is provided.
     - Else -> allow a dev fallback for local testing.
     """
-    secure_mode = os.environ.get("ICEA_SECURE_MODE", "false").lower() == "true"
+    secure_mode = bool(getattr(settings, "ICEA_SECURE_MODE", False))
 
     # Prefer Django settings, but allow an alias env var for deployments that centralize secrets.
     secret = getattr(settings, "AUDIT_LOG_SECRET", "") or os.environ.get("ICEA_AUDIT_SECRET", "")
@@ -56,11 +59,15 @@ def _get_secret() -> str:
     return secret
 
 
+def _secure_mode_enabled() -> bool:
+    return bool(getattr(settings, "ICEA_SECURE_MODE", False))
+
 
 def append_audit_event(*, event_type: str, payload: Any, context: str = "", actor: str = "api") -> str | None:
     """Append an audit event with hash chaining.
 
-    Best-effort: never raises to avoid breaking clinical pipelines.
+    In secure mode audit append is mandatory and fails closed. Outside secure
+    mode it remains best-effort for local development and tests.
     Returns created event id as string.
     """
 
@@ -94,5 +101,13 @@ def append_audit_event(*, event_type: str, payload: Any, context: str = "", acto
             hmac_sig=sig,
         )
         return str(ev.id)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "ICEA audit append failed event_type=%s context=%s error_class=%s",
+            str(event_type)[:64],
+            str(context)[:255],
+            exc.__class__.__name__,
+        )
+        if _secure_mode_enabled():
+            raise
         return None

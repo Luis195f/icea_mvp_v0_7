@@ -57,12 +57,13 @@ class ModelArtifact(models.Model):
     features = models.JSONField(default=list)
     model_type = models.CharField(max_length=64, default="xgboost")
     model_path = models.CharField(max_length=512)
+    governance_status = models.CharField(max_length=32, default="candidate")
 
     metrics = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [models.Index(fields=["name", "version"])]
+        indexes = [models.Index(fields=["name", "version"]), models.Index(fields=["governance_status"])]
 
     def __str__(self) -> str:
         return f"{self.name}:{self.version} ({self.id})"

@@ -18,9 +18,9 @@ If a row is plaintext (legacy), it is returned as-is.
 Key management:
   - settings.PHI_ENCRYPTION_KEYS: comma-separated list of Fernet keys
     (urlsafe_b64encode(32 bytes)). First key is used for new writes.
-  - In dev, if no keys are provided, a deterministic key is derived from
-    SECRET_KEY to keep local bootstrap working. In production, always set
-    PHI_ENCRYPTION_KEYS.
+  - In explicit local/dev mode only (ICEA_DEV_ALLOW_INSECURE=true), if no keys
+    are provided, a deterministic key is derived from SECRET_KEY to keep local
+    bootstrap working. Secure mode always requires PHI_ENCRYPTION_KEYS.
 """
 
 from __future__ import annotations
@@ -28,8 +28,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 from typing import Any
 
+from django.core.exceptions import ImproperlyConfigured
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
 from django.db import models
@@ -50,7 +52,18 @@ def _get_keys() -> list[str]:
     keys = list(getattr(settings, "PHI_ENCRYPTION_KEYS", []) or [])
     keys = [k.strip() for k in keys if k and str(k).strip()]
     if not keys:
-        # dev fallback
+        secure_mode = bool(getattr(settings, "ICEA_SECURE_MODE", False)) or os.environ.get(
+            "ICEA_SECURE_MODE", "false"
+        ).lower() in {"1", "true", "yes"}
+        dev_insecure = bool(getattr(settings, "ICEA_DEV_ALLOW_INSECURE", False)) or os.environ.get(
+            "ICEA_DEV_ALLOW_INSECURE", "false"
+        ).lower() in {"1", "true", "yes"}
+        if secure_mode or not dev_insecure:
+            raise ImproperlyConfigured(
+                "PHI_ENCRYPTION_KEYS is required for encrypted PHI fields. "
+                "SECRET_KEY-derived fallback is allowed only when ICEA_DEV_ALLOW_INSECURE=true."
+            )
+        # Explicit local/dev fallback only.
         keys = [_derive_dev_key()]
     return keys
 
