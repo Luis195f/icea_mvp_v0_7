@@ -12,6 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import dj_database_url
+from cryptography.fernet import Fernet
 from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -355,6 +356,16 @@ PHI_RETENTION_ACTION = os.environ.get("PHI_RETENTION_ACTION", "delete").strip().
 # --- PHI encryption keys (Fernet-compatible; base64 urlsafe 32-byte keys)
 # Provide one or more keys for rotation: "key1,key2,..." (key1 = newest).
 PHI_ENCRYPTION_KEYS = [k.strip() for k in os.environ.get("PHI_ENCRYPTION_KEYS", "").split(",") if k.strip()]
+if ICEA_SECURE_MODE and not PHI_ENCRYPTION_KEYS:
+    raise ImproperlyConfigured(
+        "ICEA_SECURE_MODE=true requires PHI_ENCRYPTION_KEYS. "
+        "Do not derive PHI encryption keys from SECRET_KEY in secure mode."
+    )
+for _phi_key in PHI_ENCRYPTION_KEYS:
+    try:
+        Fernet(_phi_key.encode("ascii"))
+    except Exception as exc:
+        raise ImproperlyConfigured("PHI_ENCRYPTION_KEYS must contain Fernet-compatible keys.") from exc
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "ICEA Platform MVP",

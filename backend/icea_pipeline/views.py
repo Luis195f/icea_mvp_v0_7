@@ -978,6 +978,11 @@ class PipelineTrainFromDBView(APIView):
             model_path=result.model_path,
             metrics=result.metrics,
         )
+        evidence = summarize_model_evidence(artifact)
+        if not evidence.defensible:
+            artifact.governance_status = "quarantine"
+            artifact.save(update_fields=["governance_status"])
+            evidence = summarize_model_evidence(artifact)
 
         TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
         append_audit_event(
@@ -1000,8 +1005,8 @@ class PipelineTrainFromDBView(APIView):
             model_id=str(artifact.id),
             row_count=int(len(df)),
             grain=dataset_grain,
-            evidence_status=summarize_model_evidence(artifact).evidence_status,
-            status="completed",
+            evidence_status=evidence.evidence_status,
+            status="completed" if evidence.defensible else "quarantine",
         )
         return Response(
             {

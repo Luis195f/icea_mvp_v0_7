@@ -6,7 +6,7 @@ import pandas as pd
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from icea_core.evidence import build_training_evidence_metadata
+from icea_core.evidence import build_training_evidence_metadata, summarize_model_evidence
 from icea_core.ml import train_xgb_regressor
 from icea_core.models import ModelArtifact
 from icea_pipeline.audit import append_audit_event
@@ -116,6 +116,11 @@ class Command(BaseCommand):
             model_path=result.model_path,
             metrics=result.metrics,
         )
+        evidence = summarize_model_evidence(artifact)
+        if not evidence.defensible:
+            artifact.governance_status = "quarantine"
+            artifact.save(update_fields=["governance_status"])
+            evidence = summarize_model_evidence(artifact)
 
         TrainingRun.objects.create(dataset_rows=len(df), model_artifact_id=artifact.id)
         append_audit_event(
@@ -124,7 +129,7 @@ class Command(BaseCommand):
                 "action": "train",
                 "model_id": str(artifact.id),
                 "row_count": int(len(df)),
-                "status": "completed",
+                "status": "completed" if evidence.defensible else "quarantine",
             },
             context="management/train_from_db",
             actor="management_command",

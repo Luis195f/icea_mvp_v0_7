@@ -29,6 +29,7 @@ class ModelArtifactSerializer(serializers.ModelSerializer):
             "features",
             "model_type",
             "model_path",
+            "governance_status",
             "metrics",
             "created_at",
             "evidence_status",
@@ -43,7 +44,7 @@ class ModelArtifactSerializer(serializers.ModelSerializer):
             "calibration_status",
             "validation_status",
         ]
-        read_only_fields = ["id", "created_at"]
+        read_only_fields = ["id", "created_at", "governance_status"]
 
     def _evidence(self, obj):
         return summarize_model_evidence(obj)

@@ -8,7 +8,8 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.core.cache import cache
-from django.test import TestCase
+from django.db import connection
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
@@ -38,9 +39,14 @@ from icea_pipeline.views import (
     WritebackListView,
 )
 
+TEST_PHI_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
 
 class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
     def setUp(self):
+        self.phi_settings = override_settings(PHI_ENCRYPTION_KEYS=[TEST_PHI_KEY])
+        self.phi_settings.enable()
+        self.addCleanup(self.phi_settings.disable)
         self.env = mock.patch.dict(
             os.environ,
             {
@@ -208,6 +214,36 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         self.assertNotIn("patient_id", str(body))
         self.assertNotIn('"score"', str(body))
 
+    def test_fhir_writeback_payload_is_encrypted_at_rest_and_response_stays_redacted(self):
+        episode = self.episodes[0]
+        episode.fhir_patient_id = "patient-sensitive-123"
+        episode.fhir_encounter_id = "encounter-sensitive-456"
+        episode.save(update_fields=["fhir_patient_id", "fhir_encounter_id"])
+        self.client.force_authenticate(user=self._user_with_role("admin"))
+
+        response = self._post(
+            "/api/v1/fhir/writeback/riskassessment/",
+            {"episode_id": int(episode.id), "model_id": str(self.episode_artifact.id), "writeback": False},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["identifier_suppressed"])
+        serialized_body = str(body)
+        for forbidden in ("raw_score", "Patient/", "Encounter/", "patient-sensitive-123", "encounter-sensitive-456"):
+            self.assertNotIn(forbidden, serialized_body)
+        self.assertIsNone(body["prediction"]["pred"])
+
+        with connection.cursor() as cursor:
+            cursor.execute("select payload from icea_pipeline_fhirwritebackrecord order by created_at desc limit 1")
+            stored_payload = cursor.fetchone()[0]
+        stored_text = str(stored_payload)
+        self.assertIn("__enc__", stored_text)
+        self.assertNotIn("Patient/patient-sensitive-123", stored_text)
+        self.assertNotIn("Encounter/encounter-sensitive-456", stored_text)
+        self.assertNotIn("patient-sensitive-123", stored_text)
+        self.assertNotIn("encounter-sensitive-456", stored_text)
+
     def test_dashboard_redacts_detailed_summaries(self):
         ICEAComputation.objects.create(
             model=self.episode_artifact,
@@ -250,6 +286,43 @@ class ICEAApiSecurityGuardTests(ICEAPlusFixtureMixin, TestCase):
         self.assertNotIn("rows", audit_payload)
         self.assertNotIn("payload", audit_payload)
         self.assertRegex(append.call_args.kwargs["actor"], r"^anonymous_unknown:[0-9a-f]{64}$")
+
+    def test_append_audit_event_fails_closed_in_secure_mode(self):
+        with (
+            override_settings(ICEA_SECURE_MODE=True, AUDIT_LOG_SECRET="secure-audit-secret-value-32-chars"),
+            mock.patch("icea_pipeline.audit.AuditEvent.objects.create", side_effect=RuntimeError("patient-secret")),
+            self.assertLogs("icea_pipeline.audit", level="WARNING") as logs,
+        ):
+            with self.assertRaises(RuntimeError):
+                append_audit_event(
+                    event_type="secure_failure",
+                    payload={"patient": "patient-secret"},
+                    context="security/test",
+                )
+
+        logged = "\n".join(logs.output)
+        self.assertIn("secure_failure", logged)
+        self.assertIn("security/test", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("patient-secret", logged)
+
+    def test_append_audit_event_dev_mode_warns_without_breaking_flow(self):
+        with (
+            override_settings(ICEA_SECURE_MODE=False, AUDIT_LOG_SECRET=""),
+            mock.patch("icea_pipeline.audit.AuditEvent.objects.create", side_effect=RuntimeError("patient-secret")),
+            self.assertLogs("icea_pipeline.audit", level="WARNING") as logs,
+        ):
+            event_id = append_audit_event(
+                event_type="dev_failure",
+                payload={"patient": "patient-secret"},
+                context="security/test",
+            )
+
+        self.assertIsNone(event_id)
+        logged = "\n".join(logs.output)
+        self.assertIn("dev_failure", logged)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("patient-secret", logged)
 
     def test_authenticated_audit_actor_is_stable_pseudonymous_and_distinct(self):
         user_a = get_user_model().objects.create_user(

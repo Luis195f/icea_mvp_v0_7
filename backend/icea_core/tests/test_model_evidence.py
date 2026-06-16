@@ -937,10 +937,36 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(response.status_code, 201)
         body = response.json()
         self.assertFalse(body["defensible"])
+        self.assertEqual(body["governance_status"], "quarantine")
         self.assertEqual(body["evidence_status"], "evidence_incomplete")
         self.assertEqual(body["temporal_guardrail_status"], "insufficient_temporal_spec")
         self.assertIn("temporal_spec_required", body["missing_evidence"])
-        self.assertIn("model_not_defensible", summarize_model_evidence(ModelArtifact.objects.get(id=body["id"])).statuses)
+        artifact = ModelArtifact.objects.get(id=body["id"])
+        evidence = summarize_model_evidence(artifact)
+        self.assertIn("model_not_defensible", evidence.statuses)
+        self.assertIn("model_artifact_quarantine", evidence.statuses)
+
+        score_response = self.client.post(
+            "/api/v1/icea-plus/score/",
+            {"model_id": body["id"], "grain": "episode", "from_db": True},
+            format="json",
+        )
+        self.assertEqual(score_response.status_code, 400)
+        self.assertEqual(score_response.json()["detail"], "model_not_defensible")
+
+        aggregate_response = self.client.get(
+            "/api/v1/icea-plus/aggregate/",
+            {"model_id": body["id"], "grain": "episode", "group_by": "unit"},
+        )
+        self.assertEqual(aggregate_response.status_code, 400)
+        self.assertEqual(aggregate_response.json()["detail"], "model_not_defensible")
+
+        writeback_response = self.client.get(
+            "/api/v1/icea-plus/writeback/summary/",
+            {"model_id": body["id"], "group_by": "unit"},
+        )
+        self.assertEqual(writeback_response.status_code, 400)
+        self.assertEqual(writeback_response.json()["detail"], "model_not_defensible")
 
     def test_models_train_with_invalid_temporal_spec_is_not_defensible_not_500(self):
         with mock.patch("icea_core.views.train_xgb_regressor", return_value=self._mock_external_train_result()):
@@ -953,6 +979,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(response.status_code, 201)
         body = response.json()
         self.assertFalse(body["defensible"])
+        self.assertEqual(body["governance_status"], "quarantine")
         self.assertEqual(body["temporal_guardrail_status"], "temporal_leakage_blocked")
         self.assertIn("temporal_guardrail_not_passed:temporal_leakage_blocked", body["missing_evidence"])
 
@@ -967,6 +994,7 @@ class ModelEvidenceAPITests(ICEAPlusFixtureMixin, TestCase):
         self.assertEqual(response.status_code, 201)
         body = response.json()
         self.assertTrue(body["defensible"])
+        self.assertEqual(body["governance_status"], "candidate")
         self.assertEqual(body["evidence_status"], "evidence_complete")
         self.assertEqual(body["temporal_guardrail_status"], "temporal_guardrails_passed")
         self.assertEqual(body["limitations_status"], "limitations_complete")

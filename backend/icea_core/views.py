@@ -112,6 +112,11 @@ class ModelTrainView(APIView):
             model_path=result.model_path,
             metrics=result.metrics,
         )
+        evidence = summarize_model_evidence(artifact)
+        if not evidence.defensible:
+            artifact.governance_status = "quarantine"
+            artifact.save(update_fields=["governance_status"])
+            evidence = summarize_model_evidence(artifact)
         append_icea_api_audit(
             request=request,
             event_type="model_train_completed",
@@ -119,8 +124,8 @@ class ModelTrainView(APIView):
             action="train",
             model_id=str(artifact.id),
             row_count=int(len(df)),
-            evidence_status=summarize_model_evidence(artifact).evidence_status,
-            status="completed",
+            evidence_status=evidence.evidence_status,
+            status="completed" if evidence.defensible else "quarantine",
         )
         return Response(ModelArtifactSerializer(artifact).data, status=201)
 
