@@ -1,6 +1,8 @@
 # ICEA Platform — Pilot MVP (v0.7.4)
 
-This version is a **pilot-grade + trial-emulation kit** with an **enterprise-ready, feature-flagged** architecture:
+> ICEA/ICEA+ is shadow-only, aggregate-only, non-individual, non-punitive, not clinically validated, not MDR production-ready, and not a clinical decision tool.
+
+This version is a **pilot-grade + trial-emulation demo kit** with a limited, feature-flagged architecture:
 
 **FHIR ingestion (encounter‑centered) → normalization (deterministic nursing labels) → dataset builder (roster‑aware) → scheduled training → causal runs (bootstrap + sensitivity + CONSORT emulation + cohort-flow stages) → explicitly opted-in policy learning/fairness audit → dashboard → optional FHIR writeback (RiskAssessment)**
 
@@ -13,14 +15,14 @@ Core principles:
   outcome window, case-mix evidence, intended use, validation/calibration
   evidence or explicit unavailable reasons, limitations, and provenance/source
   traceability.
-- **Graceful degradation**: enterprise features are activated via flags and optional dependencies.
+- **Graceful degradation**: optional demo features are activated via flags and optional dependencies.
 - **Shadow aggregate governance**: ICEA/ICEA+ dashboard and export surfaces are aggregate-only, non-punitive, and suppress low-support cells.
 - **Fail-closed high-risk APIs**: scoring, causal, writeback, federated, simulate, policy learning, and fairness require explicit auth/RBAC and feature flags outside dev-only mode.
 - **Temporal leakage guards**: defensible datasets, scoring, training, and causal runs require an explicit temporal spec with index time, feature window, outcome window, censoring, and case-mix warnings for aggregate comparisons.
 
 ## ICEA vs ICEA+
 
-- **ICEA** remains the legacy predictive nursing attribution based mainly on SHAP/group nursing.
+- **ICEA** remains a legacy exploratory aggregate nursing-attribution signal based mainly on predictive model explanations.
 - **ICEA+ v1** is the new official mathematical core exposed in this repo through dedicated endpoints and versioned governance.
 - **ICEA+** integrates risk-adjusted benefit, relative nursing attribution, causal effect when defensible, process quality, and explicit uncertainty penalties for aggregate shadow monitoring; it is not an individual causal or labor-performance score.
 
@@ -30,6 +32,7 @@ See:
 - `docs/ICEA_PLUS_FOLLOWUP.md`
 - `docs/ICEA_PLUS_WRITEBACK.md`
 - `docs/OPERATIONS.md`
+- `docs/DEMO_CLAIMS_MATRIX.md`
 - `docs/CI.md`
 
 ---
@@ -45,6 +48,10 @@ Services:
 - Backend API: `http://localhost:8000/api/v1/`
 - Swagger docs: `http://localhost:8000/api/v1/docs/`
 - Dashboard (Streamlit): `http://localhost:8501/`
+
+No paid services are required for this demo hardening. It does not require
+Sentry, Datadog, AWS, Azure, GCP, a paid FHIR server, a paid terminology
+server, or any SaaS control plane.
 
 When `ICEA_SEED_DEMO=true`, the Docker entrypoint creates a governed synthetic
 demo model and enough observed demo rows for aggregate exploration. The model is
@@ -223,7 +230,7 @@ The report JSON includes:
 }
 ```
 
-### 5.3) Counterfactual Digital Twin simulation (optional)
+### 5.3) Exploratory counterfactual simulation (optional, not clinically validated)
 
 `POST /api/v1/causal/simulate/`
 
@@ -292,7 +299,7 @@ The endpoint is retained for governed research compatibility, but command-center
 
 ---
 
-## Enterprise mode (feature flags)
+## Optional feature-flag mode
 
 ### Install optional dependencies
 

@@ -9,7 +9,7 @@
 - New endpoint `POST /api/v1/causal/discover/` to suggest `dag_edges` using a lightweight PC algorithm.
 - Optional `spec.dag_discovery` block in `POST /api/v1/causal/run/` to attach suggestions and (optionally) auto-update `dag_edges`.
 
-### Digital Twin (Counterfactual Simulation)
+### Exploratory Counterfactual Simulation
 - New endpoint `POST /api/v1/causal/simulate/` to simulate outcome changes under staffing scenarios.
 - Optionally attaches conformal intervals when an XGBoost ModelArtifact with conformal calibration is provided.
 

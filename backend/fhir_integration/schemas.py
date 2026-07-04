@@ -2,11 +2,29 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 from datetime import datetime
 from typing import Any
 
 from dateutil import parser as dateparser
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+
+FHIR_ID_RE = re.compile(r"^[A-Za-z0-9\-.]{1,64}$")
+REFERENCE_RE = re.compile(
+    r"^(Patient|Encounter|Observation|Condition|Procedure|Practitioner|PractitionerRole|RiskAssessment)/[A-Za-z0-9\-.]{1,64}$"
+)
+SUPPORTED_LOCAL_RESOURCE_TYPES = {
+    "Bundle",
+    "Patient",
+    "Encounter",
+    "Observation",
+    "Condition",
+    "Procedure",
+    "Practitioner",
+    "PractitionerRole",
+    "RiskAssessment",
+}
 
 
 def _bool_env(name: str, default: str = "false") -> bool:
@@ -20,6 +38,93 @@ def _parse_dt(s: str | None) -> datetime | None:
         return dateparser.parse(s)
     except Exception:
         return None
+
+
+def _issue(loc: list[Any], msg: str, type_: str, *, severity: str = "error", layer: str = "basic") -> dict[str, Any]:
+    return {"loc": loc, "msg": msg, "type": type_, "severity": severity, "layer": layer}
+
+
+def _secure_references_required() -> bool:
+    return _bool_env("ICEA_SECURE_MODE") or _bool_env("FHIR_REQUIRE_SECURE_REFERENCES")
+
+
+def _iter_references(value: Any, path: list[Any] | None = None):
+    path = path or []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = [*path, key]
+            if key == "reference" and isinstance(child, str):
+                yield child_path, child
+            else:
+                yield from _iter_references(child, child_path)
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            yield from _iter_references(child, [*path, idx])
+
+
+def _validate_fhir_id(resource_id: str | None, loc: list[Any]) -> list[dict[str, Any]]:
+    if resource_id and not FHIR_ID_RE.match(str(resource_id)):
+        return [_issue(loc, "FHIR id is malformed or too long", "value_error.fhir_id")]
+    return []
+
+
+def _validate_reference(reference: str, loc: list[Any], *, secure_mode: bool) -> list[dict[str, Any]]:
+    ref = str(reference or "").strip()
+    if not ref:
+        return []
+    if ref.startswith(("http://", "https://")) or ".." in ref:
+        return [_issue(loc, "FHIR reference is not an allowed local relative reference", "value_error.fhir_reference")]
+    if ref.startswith(("urn:uuid:", "urn:oid:", "#")):
+        return []
+    if REFERENCE_RE.match(ref):
+        return []
+    if secure_mode or "/" not in ref:
+        return [_issue(loc, "FHIR reference is unsafe or uses a raw identifier", "value_error.fhir_reference")]
+    return []
+
+
+def _validate_local_resource_invariants(payload: dict[str, Any], *, secure_mode: bool) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    rt = str(payload.get("resourceType") or "").strip()
+    if not rt:
+        return [_issue(["resourceType"], "Missing resourceType", "value_error.missing")]
+    if rt not in SUPPORTED_LOCAL_RESOURCE_TYPES:
+        issues.append(_issue(["resourceType"], "Unsupported resourceType for local demo validation", "value_error.resourceType"))
+
+    issues.extend(_validate_fhir_id(payload.get("id"), ["id"]))
+    for loc, reference in _iter_references(payload):
+        issues.extend(_validate_reference(reference, loc, secure_mode=secure_mode))
+
+    if rt == "Observation":
+        coding = ((payload.get("code") or {}).get("coding") or [])
+        if not coding:
+            issues.append(_issue(["code", "coding"], "Observation requires code.coding for local validation", "value_error.missing"))
+    elif rt in {"Condition", "Procedure"}:
+        code = payload.get("code") or {}
+        if not isinstance(code, dict) or not (code.get("coding") or code.get("text")):
+            issues.append(_issue(["code"], f"{rt} requires a coded or textual code", "value_error.missing"))
+    elif rt == "RiskAssessment":
+        text_parts: list[str] = []
+        for note in payload.get("note") or []:
+            if isinstance(note, dict):
+                text_parts.append(str(note.get("text") or ""))
+        text_parts.append(str((payload.get("text") or {}).get("div") or ""))
+        mentions_shadow_only = "shadow-only" in " ".join(text_parts).lower()
+        prediction = payload.get("prediction") or []
+        has_individual_probability = any(
+            isinstance(item, dict) and any(k in item for k in ("probabilityDecimal", "probabilityRange", "qualitativeRisk"))
+            for item in prediction
+        )
+        if not mentions_shadow_only or has_individual_probability:
+            issues.append(
+                _issue(
+                    ["RiskAssessment"],
+                    "RiskAssessment must remain shadow-only and must not expose individual risk probability",
+                    "value_error.shadow_only",
+                )
+            )
+
+    return issues
 
 
 class FHIRMeta(BaseModel):
@@ -75,7 +180,7 @@ def _strict_validate_fhir_resources(payload: dict[str, Any], *, required_profile
     issues: list[dict[str, Any]] = []
     rt = str(payload.get("resourceType") or "").strip()
     if not rt:
-        return [{"loc": ["resourceType"], "msg": "Missing resourceType", "type": "value_error", "severity": "error", "layer": "strict"}]
+        return [_issue(["resourceType"], "Missing resourceType", "value_error", layer="strict")]
 
     # Dynamic import: fhir.resources.<lowercase>
     # Examples: Observation -> fhir.resources.observation.Observation
@@ -98,13 +203,12 @@ def _strict_validate_fhir_resources(payload: dict[str, Any], *, required_profile
         missing = [p for p in required_profiles if p not in profiles]
         if missing:
             issues.append(
-                {
-                    "loc": ["meta", "profile"],
-                    "msg": f"Missing required profile(s): {', '.join(missing)}",
-                    "type": "value_error.profile",
-                    "severity": "error",
-                    "layer": "strict",
-                }
+                _issue(
+                    ["meta", "profile"],
+                    f"Missing required profile(s): {', '.join(missing)}",
+                    "value_error.profile",
+                    layer="strict",
+                )
             )
 
     return issues
@@ -133,23 +237,17 @@ def validate_resource(
         else list(required_profiles)
     )
     fail_closed = _bool_env("FHIR_STRICT_FAIL_CLOSED", "false") if fail_closed is None else bool(fail_closed)
+    secure_mode = _secure_references_required()
 
     try:
         res = FHIRResource.model_validate(payload)
         if expected_type and res.resourceType != expected_type:
             issues.append(
-                {
-                    "loc": ["resourceType"],
-                    "msg": f"Expected '{expected_type}' got '{res.resourceType}'",
-                    "type": "value_error.resourceType",
-                    "severity": "error",
-                    "layer": "basic",
-                }
+                _issue(["resourceType"], f"Expected '{expected_type}' got '{res.resourceType}'", "value_error.resourceType")
             )
         if not res.id and res.resourceType not in {"Bundle"}:
-            issues.append(
-                {"loc": ["id"], "msg": "Missing 'id'", "type": "value_error.missing", "severity": "error", "layer": "basic"}
-            )
+            issues.append(_issue(["id"], "Missing 'id'", "value_error.missing"))
+        issues.extend(_validate_local_resource_invariants(payload, secure_mode=secure_mode))
 
         # Optional strict validation (enterprise)
         if strict_mode and res.resourceType not in {"Bundle"}:
@@ -159,13 +257,13 @@ def validate_resource(
             except Exception as e:
                 # Graceful degradation: if strict deps are missing, do NOT break MVP by default.
                 issues.append(
-                    {
-                        "loc": ["_strict"],
-                        "msg": f"Strict validation unavailable: {e.__class__.__name__}: {str(e)}",
-                        "type": "warning.strict_unavailable",
-                        "severity": "error" if fail_closed else "warning",
-                        "layer": "strict",
-                    }
+                    _issue(
+                        ["_strict"],
+                        f"Strict validation unavailable: {e.__class__.__name__}",
+                        "warning.strict_unavailable",
+                        severity="error" if fail_closed else "warning",
+                        layer="strict",
+                    )
                 )
 
         last = res.meta.last_updated_dt() if res.meta else None
@@ -175,38 +273,51 @@ def validate_resource(
     except ValidationError as e:
         for err in e.errors():
             issues.append(
-                {
-                    "loc": list(err.get("loc", [])),
-                    "msg": err.get("msg", "validation error"),
-                    "type": err.get("type", ""),
-                    "severity": "error",
-                    "layer": "basic",
-                }
+                _issue(list(err.get("loc", [])), err.get("msg", "validation error"), err.get("type", ""))
             )
         return False, issues, None
 
 
-def validate_bundle(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def validate_bundle(
+    payload: dict[str, Any],
+    *,
+    require_encounter_context: bool = False,
+    secure_mode: bool | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Validate a bundle; returns (resources, bundle_issues)."""
 
     issues: list[dict[str, Any]] = []
+    secure_refs = _secure_references_required() if secure_mode is None else bool(secure_mode)
     try:
         b = Bundle.model_validate(payload)
         if b.resourceType != "Bundle":
-            issues.append({"loc": ["resourceType"], "msg": "Not a Bundle", "type": "value_error.bundle", "severity": "error", "layer": "basic"})
+            issues.append(_issue(["resourceType"], "Not a Bundle", "value_error.bundle"))
             return [], issues
-        resources = [e.resource for e in b.entry if isinstance(e.resource, dict) and e.resource]
+        resources: list[dict[str, Any]] = []
+        has_encounter = False
+        for idx, entry in enumerate(b.entry):
+            if not isinstance(entry.resource, dict) or not entry.resource:
+                issues.append(_issue(["entry", idx, "resource"], "Bundle.entry.resource is required", "value_error.missing"))
+                continue
+            resource = entry.resource
+            rt = str(resource.get("resourceType") or "").strip()
+            if rt == "Encounter":
+                has_encounter = True
+            local_issues = _validate_local_resource_invariants(resource, secure_mode=secure_refs)
+            for local_issue in local_issues:
+                issues.append({**local_issue, "loc": ["entry", idx, "resource", *local_issue.get("loc", [])]})
+            if require_encounter_context and rt in {"Observation", "Condition", "Procedure", "RiskAssessment"}:
+                encounter_ref = ((resource.get("encounter") or {}).get("reference") or "").strip()
+                if not encounter_ref:
+                    issues.append(_issue(["entry", idx, "resource", "encounter"], "Encounter-centered flow requires encounter.reference", "value_error.missing"))
+            resources.append(resource)
+        if require_encounter_context and not has_encounter:
+            issues.append(_issue(["entry"], "Encounter-centered flow requires an Encounter resource", "value_error.missing"))
         return resources, issues
     except ValidationError as e:
         for err in e.errors():
             issues.append(
-                {
-                    "loc": list(err.get("loc", [])),
-                    "msg": err.get("msg", "validation error"),
-                    "type": err.get("type", ""),
-                    "severity": "error",
-                    "layer": "basic",
-                }
+                _issue(list(err.get("loc", [])), err.get("msg", "validation error"), err.get("type", ""))
             )
         return [], issues
 

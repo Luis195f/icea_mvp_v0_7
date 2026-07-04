@@ -1,6 +1,6 @@
 # ICEA+ Nursing Command Center (Frontend) — Next.js (App Router)
 
-Frontend enterprise-grade (white-label) para ICEA+ v0.7.x, diseñado como **Backend-for-Frontend (BFF)** para preservar
+Frontend demo/pilot-readiness limitada (white-label) para ICEA+ v0.7.x, diseñado como **Backend-for-Frontend (BFF)** para preservar
 la postura **Zero-Trust / ENS Alto**: el navegador **nunca** ve secretos HMAC.
 
 ## Requisitos
@@ -26,10 +26,12 @@ Abrir: `http://localhost:3000`
 
 ## Funcionalidad (MVP comercial)
 - **Centro de mando**: KPIs y estado operacional (Donabedian: estructura/proceso/resultado)
-- **Pacientes**: predicción conformal on-demand + explicación tipo SHAP (vía `/icea/compute/`)
+- **Pacientes**: estado y gobernanza shadow-only; sin predicciones, scores ni contribuciones individuales
 - **Dotación**: resumen de roster + subida de CSV (si backend habilitado)
-- **Causal**: descubrir DAG, ejecutar análisis causal y simular gemelo digital
+- **Causal**: análisis exploratorio agregado y simulación no validada clínicamente, si los flags lo habilitan
 - **Gobernanza**: auditoría, decisiones HITL, writebacks
+
+ICEA/ICEA+ is shadow-only, aggregate-only, non-individual, non-punitive, not clinically validated, not MDR production-ready, and not a clinical decision tool. No paid services are required for this demo hardening.
 
 ## White-label
 - Tokens por CSS variables en `app/globals.css`
