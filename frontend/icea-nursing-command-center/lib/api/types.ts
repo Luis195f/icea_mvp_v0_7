@@ -121,17 +121,56 @@ export const ConformalPredictResponseSchema = z.object({
 });
 export type ConformalPredictResponse = z.infer<typeof ConformalPredictResponseSchema>;
 
+const IndividualOutputKeys = new Set([
+  "prediction",
+  "predictions",
+  "raw_score",
+  "score",
+  "contributions",
+  "icea",
+  "patient_id",
+  "episode_id",
+]);
+
+function rejectIndividualOutputs(value: unknown, ctx: z.RefinementCtx, path: Array<string | number> = []) {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => rejectIndividualOutputs(item, ctx, [...path, index]));
+    return;
+  }
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (IndividualOutputKeys.has(key)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [...path, key],
+        message: `Individual ICEA output field '${key}' is not allowed in the legacy compute contract`,
+      });
+      continue;
+    }
+    rejectIndividualOutputs(child, ctx, [...path, key]);
+  }
+}
+
 export const ICEAComputeResponseSchema = z.object({
   model: ModelArtifactSchema,
   summary: z.record(z.string(), z.unknown()),
   rows: z.number().int(),
-  results: z.object({
-    predictions: z.array(z.number()),
-    base_value: z.number(),
-    icea: z.array(z.number()),
-    contributions: z.record(z.string(), z.array(z.number())),
-  }),
-});
+  results: z.record(z.string(), z.unknown()),
+  status: z.literal("shadow_only"),
+  detail: z.string().optional(),
+  redacted: z.boolean().optional(),
+  shadow_mode: z.literal(true).optional(),
+  non_individual_use: z.literal(true).optional(),
+  score_summary: z.null().optional(),
+  score_summary_redacted: z.literal(true),
+  warnings: z.array(z.string()).optional(),
+  model_evidence_status: z.string().optional(),
+  defensible: z.boolean().optional(),
+  intended_use: z.string().optional(),
+}).superRefine((value, ctx) => rejectIndividualOutputs(value, ctx));
 export type ICEAComputeResponse = z.infer<typeof ICEAComputeResponseSchema>;
 
 export const CausalDiscoverResponseSchema = z.object({

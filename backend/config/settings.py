@@ -369,7 +369,7 @@ for _phi_key in PHI_ENCRYPTION_KEYS:
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "ICEA Platform MVP",
-    "DESCRIPTION": "Minimal API to train ICEA models and compute nursing contribution (ICEA) via SHAP.",
+    "DESCRIPTION": "Minimal API for shadow-only aggregate ICEA/ICEA+ exploratory analytics; not clinically validated.",
     "VERSION": os.environ.get("ICEA_VERSION", "0.7.3"),
 }
 

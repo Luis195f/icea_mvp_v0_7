@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test": "npm run test:contracts",
+    "test:contracts": "node scripts/run-typescript-contract.cjs tests/icea-compute-contract.ts"
   },
   "dependencies": {
     "@carbon/react": "^1.77.0",

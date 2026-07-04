@@ -79,7 +79,7 @@ New endpoint:
 
 # ICEA+ Platform MVP — v0.5.2 (super)
 
-v0.5.2 is an **enterprise-ready, feature-flagged upgrade** that preserves all v0.5.1/v0.5.0/v0.4 endpoint contracts.
+v0.5.2 is a **limited demo/pilot-readiness, feature-flagged upgrade** that preserves all v0.5.1/v0.5.0/v0.4 endpoint contracts.
 
 ## Enterprise flags (Graceful Degradation)
 
@@ -193,7 +193,7 @@ without breaking backward compatibility.
 - `POST /api/v1/causal/run/` attaches a `summary.fairness_audit` block.
 - Computes selection rates by subgroup and the disparate impact ratio, intended for governance.
 
-### 4) Conformal prediction (individual-risk interval)
+### 4) Conformal prediction (shadow-only interval; individual prediction suppressed)
 
 - Training stores a calibration quantile in `ModelArtifact.metrics.conformal`.
 - New endpoint: `POST /api/v1/predict/conformal/` returns `{pred, interval}`.

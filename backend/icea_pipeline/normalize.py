@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Callable
 
@@ -11,14 +12,84 @@ from terminology.mappings import (
     map_procedure_system_code,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _codings(codeable: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not codeable:
+        return []
+    coding = codeable.get("coding") or []
+    return [c for c in coding if isinstance(c, dict) and (c.get("code") or c.get("system") or c.get("display"))]
+
 
 def _get_first_coding(codeable: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not codeable:
-        return None
-    coding = codeable.get("coding") or []
+    codings = _codings(codeable)
+    return codings[0] if codings else None
+
+
+def _system_key(system: str | None) -> str:
+    return (system or "").strip().lower()
+
+
+def _coding_matches(coding: dict[str, Any], needles: tuple[str, ...]) -> bool:
+    system = _system_key(coding.get("system"))
+    return any(needle in system for needle in needles)
+
+
+def _canonical_or_unmapped(
+    coding: dict[str, Any] | None,
+    *,
+    mapper: Callable[[str, str], tuple[str, str] | None],
+    nnn_needles: tuple[str, ...],
+    domain: str,
+) -> tuple[str, str, str, str, str, str]:
     if not coding:
-        return None
-    return coding[0] or None
+        logger.warning("FHIR %s coding missing; normalized as unknown without clinical inference", domain)
+        return "unknown", "unknown", "", "", "", ""
+
+    src_system = str(coding.get("system") or "")
+    src_code = str(coding.get("code") or "")
+    src_display = str(coding.get("display") or "")
+    mapped = mapper(src_system, src_code)
+    if mapped:
+        return mapped[0], mapped[1], src_display, src_system, src_code, src_display
+    if _coding_matches(coding, nnn_needles):
+        logger.warning("FHIR %s NNN coding has no approved mapping; normalized as unmapped", domain)
+        return "unmapped", src_code or "unmapped", src_display, src_system, src_code, src_display
+    return src_system or "unknown", src_code or "unknown", src_display, src_system, src_code, src_display
+
+
+def _select_observation_coding(codeable: dict[str, Any] | None) -> tuple[str, str, str, str, str, str]:
+    codings = _codings(codeable)
+    loinc = next((c for c in codings if _coding_matches(c, ("loinc",))), None)
+    if loinc:
+        return _canonical_or_unmapped(loinc, mapper=map_observation_system_code, nnn_needles=("noc",), domain="Observation")
+    noc_mapped = next((c for c in codings if map_observation_system_code(str(c.get("system") or ""), str(c.get("code") or ""))), None)
+    if noc_mapped:
+        return _canonical_or_unmapped(noc_mapped, mapper=map_observation_system_code, nnn_needles=("noc",), domain="Observation")
+    return _canonical_or_unmapped(_get_first_coding(codeable), mapper=map_observation_system_code, nnn_needles=("noc",), domain="Observation")
+
+
+def _select_condition_coding(codeable: dict[str, Any] | None) -> tuple[str, str, str, str, str, str]:
+    codings = _codings(codeable)
+    snomed = next((c for c in codings if _coding_matches(c, ("snomed", "sct"))), None)
+    if snomed:
+        return _canonical_or_unmapped(snomed, mapper=map_condition_system_code, nnn_needles=("nanda",), domain="Condition")
+    nanda_mapped = next((c for c in codings if map_condition_system_code(str(c.get("system") or ""), str(c.get("code") or ""))), None)
+    if nanda_mapped:
+        return _canonical_or_unmapped(nanda_mapped, mapper=map_condition_system_code, nnn_needles=("nanda",), domain="Condition")
+    return _canonical_or_unmapped(_get_first_coding(codeable), mapper=map_condition_system_code, nnn_needles=("nanda",), domain="Condition")
+
+
+def _select_procedure_coding(codeable: dict[str, Any] | None) -> tuple[str, str, str, str, str, str]:
+    codings = _codings(codeable)
+    snomed = next((c for c in codings if _coding_matches(c, ("snomed", "sct"))), None)
+    if snomed:
+        return _canonical_or_unmapped(snomed, mapper=map_procedure_system_code, nnn_needles=("nic",), domain="Procedure")
+    nic_mapped = next((c for c in codings if map_procedure_system_code(str(c.get("system") or ""), str(c.get("code") or ""))), None)
+    if nic_mapped:
+        return _canonical_or_unmapped(nic_mapped, mapper=map_procedure_system_code, nnn_needles=("nic",), domain="Procedure")
+    return _canonical_or_unmapped(_get_first_coding(codeable), mapper=map_procedure_system_code, nnn_needles=("nic",), domain="Procedure")
 
 
 def _parse_dt(s: str | None) -> datetime | None:
@@ -31,15 +102,7 @@ def _parse_dt(s: str | None) -> datetime | None:
 
 
 def normalize_observation(resource: dict[str, Any]) -> dict[str, Any]:
-    coding = _get_first_coding(resource.get("code"))
-    system = (coding or {}).get("system", "")
-    code = (coding or {}).get("code", "")
-    display = (coding or {}).get("display", "")
-
-    src_system, src_code, src_display = system, code, display
-    mapped = map_observation_system_code(system, code)
-    if mapped:
-        system, code = mapped
+    system, code, display, src_system, src_code, src_display = _select_observation_coding(resource.get("code"))
 
     value_num = None
     value_text = ""
@@ -72,15 +135,7 @@ def normalize_observation(resource: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_condition(resource: dict[str, Any]) -> dict[str, Any]:
-    coding = _get_first_coding(resource.get("code"))
-    system = (coding or {}).get("system", "")
-    code = (coding or {}).get("code", "")
-    display = (coding or {}).get("display", "")
-
-    src_system, src_code, src_display = system, code, display
-    mapped = map_condition_system_code(system, code)
-    if mapped:
-        system, code = mapped
+    system, code, display, src_system, src_code, src_display = _select_condition_coding(resource.get("code"))
 
     onset = resource.get("onsetDateTime")
     recorded = resource.get("recordedDate")
@@ -105,15 +160,7 @@ def normalize_condition(resource: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_procedure(resource: dict[str, Any]) -> dict[str, Any]:
-    coding = _get_first_coding(resource.get("code"))
-    system = (coding or {}).get("system", "")
-    code = (coding or {}).get("code", "")
-    display = (coding or {}).get("display", "")
-
-    src_system, src_code, src_display = system, code, display
-    mapped = map_procedure_system_code(system, code)
-    if mapped:
-        system, code = mapped
+    system, code, display, src_system, src_code, src_display = _select_procedure_coding(resource.get("code"))
 
     performed = resource.get("performedDateTime")
     if not performed and isinstance(resource.get("performedPeriod"), dict):

@@ -2,6 +2,9 @@
 
 ## Endpoints
 
+For demo claim boundaries, supported/not-supported status, and prohibited
+claims, see `docs/DEMO_CLAIMS_MATRIX.md`.
+
 ### POST `/api/v1/icea-plus/score/`
 
 Scores episode- or window-grain rows for governed research/service flows. Dashboard and export surfaces must treat row-level output as shadow-only and must not expose it as an operational patient, episode, nurse, team, or shift score.
@@ -509,6 +512,13 @@ Expected status codes:
 - `/calibrate/`, governance audit/change exports, roster upload, and governance decisions are `admin` only.
 - `policy_learning`, `fairness`, `causal_discover`, `simulate`, and `federated` remain disabled until explicitly enabled with `ICEA_POLICY_LEARNING_ENABLED`, `ICEA_FAIRNESS_ENABLED`, `ICEA_CAUSAL_DISCOVER_ENABLED`, `ICEA_SIMULATE_ENABLED`, and `ICEA_FEDERATED_ENABLED`.
 - In `ICEA_SECURE_MODE=true`, startup fails unless `ICEA_AUTH_REQUIRED=true`, `ICEA_RBAC_ENFORCE=true`, `ICEA_DEV_ALLOW_INSECURE=false`, and a dedicated JWT/JWKS key source is configured.
+
+### Local FHIR validation scope
+
+FHIR local validation is basic and free. It rejects clearly malformed synthetic
+bundles and unsafe references without requiring a paid FHIR server. It does not
+replace hospital profile validation, approved ValueSet checks, or terminology
+server validation.
 
 #### Endpoint/role matrix
 

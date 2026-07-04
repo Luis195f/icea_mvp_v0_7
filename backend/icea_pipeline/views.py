@@ -2376,7 +2376,7 @@ class WritebackListView(APIView):
         )
 
 
-class FHIROpisodeQualityView(APIView):
+class FHIREpisodeQualityView(APIView):
     """Quality/validation summary for ingested FHIR resources (per episode).
 
     v0.5.1: exposes validation statistics produced by the FHIR Facade.
@@ -2412,7 +2412,7 @@ class FHIROpisodeQualityView(APIView):
             top_issues.append(
                 {
                     "resource_type": r.resource_type,
-                    "resource_id": r.resource_id,
+                    "resource_id_sha256": hashlib.sha256(str(r.resource_id or "").encode("utf-8")).hexdigest(),
                     "issues": r.validation_issues,
                 }
             )
@@ -2427,6 +2427,10 @@ class FHIROpisodeQualityView(APIView):
                 "examples": top_issues,
             }
         )
+
+
+# Deprecated typo retained for route/import compatibility.
+FHIROpisodeQualityView = FHIREpisodeQualityView
 
 
 class EntityChangeLogListView(APIView):

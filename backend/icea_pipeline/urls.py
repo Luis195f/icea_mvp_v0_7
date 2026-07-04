@@ -22,7 +22,7 @@ from icea_pipeline.views import (
     WritebackListView,
     AuditEventsListView,
     GovernanceDecisionView,
-    FHIROpisodeQualityView,
+    FHIREpisodeQualityView,
     ConformalPredictView,
     EntityChangeLogListView,
 )
@@ -53,7 +53,7 @@ urlpatterns = [
 
     path("fhir/writeback/riskassessment/", RiskAssessmentWritebackView.as_view()),
     path("fhir/writeback/list/", WritebackListView.as_view()),
-    path("fhir/quality/episode/", FHIROpisodeQualityView.as_view()),
+    path("fhir/quality/episode/", FHIREpisodeQualityView.as_view()),
 
     path("predict/conformal/", ConformalPredictView.as_view()),
 ]
