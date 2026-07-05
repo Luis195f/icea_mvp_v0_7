@@ -43,17 +43,42 @@ for (const forbiddenKey of [
   "patient_id",
   "episode_id",
 ]) {
-  const unsafe = {
-    ...redactedResponse,
-    results: {
+  for (const [location, unsafe] of Object.entries({
+    topLevel: {
+      ...redactedResponse,
       [forbiddenKey]: forbiddenKey === "predictions" ? [0.42] : "must-not-pass",
     },
-  };
-  assert.equal(
-    ICEAComputeResponseSchema.safeParse(unsafe).success,
-    false,
-    `Expected schema to reject ${forbiddenKey}`,
-  );
+    results: {
+      ...redactedResponse,
+      results: {
+        [forbiddenKey]: forbiddenKey === "predictions" ? [0.42] : "must-not-pass",
+      },
+    },
+    summary: {
+      ...redactedResponse,
+      summary: {
+        ...redactedResponse.summary,
+        [forbiddenKey]: forbiddenKey === "predictions" ? [0.42] : "must-not-pass",
+      },
+    },
+    nested: {
+      ...redactedResponse,
+      summary: {
+        ...redactedResponse.summary,
+        governance: {
+          nested: {
+            [forbiddenKey]: forbiddenKey === "predictions" ? [0.42] : "must-not-pass",
+          },
+        },
+      },
+    },
+  })) {
+    assert.equal(
+      ICEAComputeResponseSchema.safeParse(unsafe).success,
+      false,
+      `Expected schema to reject ${forbiddenKey} in ${location}`,
+    );
+  }
 }
 
 console.log("ICEA compute contract accepts redacted shadow-only responses and rejects individual outputs.");

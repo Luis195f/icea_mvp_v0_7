@@ -96,9 +96,13 @@ def _validate_local_resource_invariants(payload: dict[str, Any], *, secure_mode:
         issues.extend(_validate_reference(reference, loc, secure_mode=secure_mode))
 
     if rt == "Observation":
-        coding = ((payload.get("code") or {}).get("coding") or [])
-        if not coding:
-            issues.append(_issue(["code", "coding"], "Observation requires code.coding for local validation", "value_error.missing"))
+        code = payload.get("code") or {}
+        if not isinstance(code, dict):
+            issues.append(_issue(["code"], "Observation.code must be an object for local validation", "value_error.code"))
+        else:
+            coding = code.get("coding")
+            if not isinstance(coding, list) or not coding:
+                issues.append(_issue(["code", "coding"], "Observation requires code.coding for local validation", "value_error.missing"))
     elif rt in {"Condition", "Procedure"}:
         code = payload.get("code") or {}
         if not isinstance(code, dict) or not (code.get("coding") or code.get("text")):
