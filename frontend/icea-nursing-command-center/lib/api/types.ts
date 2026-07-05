@@ -170,7 +170,7 @@ export const ICEAComputeResponseSchema = z.object({
   model_evidence_status: z.string().optional(),
   defensible: z.boolean().optional(),
   intended_use: z.string().optional(),
-}).superRefine((value, ctx) => rejectIndividualOutputs(value, ctx));
+}).passthrough().superRefine((value, ctx) => rejectIndividualOutputs(value, ctx));
 export type ICEAComputeResponse = z.infer<typeof ICEAComputeResponseSchema>;
 
 export const CausalDiscoverResponseSchema = z.object({

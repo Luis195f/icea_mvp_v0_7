@@ -81,6 +81,35 @@ class FHIRLocalValidationTests(SimpleTestCase):
         self.assertFalse(ok)
         self.assertTrue(any(issue["loc"] == ["code", "coding"] for issue in issues))
 
+    def test_observation_with_malformed_code_returns_controlled_issue(self):
+        observation = {
+            "resourceType": "Observation",
+            "id": "demo-observation",
+            "subject": {"reference": "Patient/demo-patient"},
+            "encounter": {"reference": "Encounter/demo-encounter"},
+            "code": "bad-code",
+        }
+
+        ok, issues, _ = validate_resource(observation, expected_type="Observation")
+
+        self.assertFalse(ok)
+        self.assertTrue(any(issue["loc"] == ["code"] and issue["type"] == "value_error.code" for issue in issues))
+        self.assertNotIn("bad-code", json.dumps(issues))
+
+    def test_bundle_observation_with_malformed_code_returns_controlled_issue(self):
+        bundle = self._synthetic_bundle()
+        bundle["entry"][2]["resource"]["code"] = "bad-code"
+
+        _, issues = validate_bundle(bundle, require_encounter_context=True, secure_mode=True)
+
+        self.assertTrue(
+            any(
+                issue["loc"] == ["entry", 2, "resource", "code"] and issue["type"] == "value_error.code"
+                for issue in issues
+            )
+        )
+        self.assertNotIn("bad-code", json.dumps(issues))
+
     def test_encounter_centered_bundle_requires_encounter_resource(self):
         bundle = self._synthetic_bundle()
         bundle["entry"] = [entry for entry in bundle["entry"] if entry["resource"]["resourceType"] != "Encounter"]
