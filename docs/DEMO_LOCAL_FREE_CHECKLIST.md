@@ -104,12 +104,15 @@ The script:
 - prefers `.\.venv\Scripts\python.exe` when it exists
 - generates ephemeral process-local values for `SECRET_KEY`, `JWT_SIGNING_KEY`, `AUDIT_LOG_SECRET`, and `PHI_ENCRYPTION_KEYS`
 - sets `ALLOWED_HOSTS=localhost,127.0.0.1,testserver`
+- isolates generated demo state under a unique OS temp directory (`db`, `data`, `models`, and `tmp`)
+- points `DATABASE_URL`, `ICEA_MODEL_DIR`, `ICEA_DATA_DIR`, `TMP`, `TEMP`, and `TMPDIR` at that temp state for the run
 - runs migrations, synthetic seed, backend tests, readiness, smoke, frontend tests, lint, and build
 - runs backend unit tests in the repo's normal test posture, then restores strict demo secure mode for readiness and smoke
-- removes generated `backend/data/` demo artifacts when it created them
+- removes only script-owned temp state, plus unexpected repo-local `backend/data/` artifacts only when it can prove they were created during the run
 - prints final `git status --short --branch`
 
 It does not print secrets, require cloud, call paid services, install dependencies, commit, push, change branches, merge, or use real data.
+It should not create or mutate repo-local `backend/db.sqlite3`, `backend/models`, or `backend/data`.
 
 If `npm` is unavailable but dependencies are already present, the script can use
 a `node` fallback for the local contract, lint, and build entrypoints. Set
@@ -139,7 +142,9 @@ a `node` fallback for the local contract, lint, and build entrypoints. Set
 
 ## 8. Local Cleanup
 
-After a rehearsal, remove generated local artifacts only:
+The demo verifier stores its generated database, dataset, model, and temp files under an OS temp directory and removes that script-owned directory at exit, even if a step fails. It should not contaminate repo-local `backend/db.sqlite3`, `backend/models`, or `backend/data`.
+
+After manual rehearsal steps, remove generated local artifacts only:
 
 ```powershell
 Remove-Item -Recurse -Force backend\data -ErrorAction SilentlyContinue
