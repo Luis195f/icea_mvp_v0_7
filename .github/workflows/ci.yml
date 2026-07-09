@@ -50,7 +50,7 @@ jobs:
             exit 1
           fi
 
-          real_env_files="$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -Ev '(^|/)\.env(\.[A-Za-z0-9_-]+)?\.example$' || true)"
+          real_env_files="$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -Ev '(^|/)\.env(\.[A-Za-z0-9_-]+)*\.example$' || true)"
           if [[ -n "$real_env_files" ]]; then
             echo "Real .env files must not be versioned; commit only .env*.example templates:"
             echo "$real_env_files"
