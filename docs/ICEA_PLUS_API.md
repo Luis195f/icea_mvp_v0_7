@@ -2,8 +2,9 @@
 
 ## Endpoints
 
-For demo claim boundaries, supported/not-supported status, and prohibited
-claims, see `docs/DEMO_CLAIMS_MATRIX.md`.
+For demo claim boundaries, supported/not-supported status, prohibited claims,
+and the local/free rehearsal path, see `docs/DEMO_CLAIMS_MATRIX.md`,
+`docs/DEMO_LOCAL_FREE_CHECKLIST.md`, and `docs/DEMO_SAFE_NARRATIVE.md`.
 
 ### POST `/api/v1/icea-plus/score/`
 
@@ -566,8 +567,9 @@ not print secrets, clinical payloads, PHI, raw audit actors, or individual score
 claims.
 
 Passing readiness/smoke does not mean clinical validation, MDR production
-readiness, individual decision support approval, punitive-use permission, or a
-production deployment sign-off. See `docs/OPERATIONS.md`.
+readiness, individual decision support approval, punitive-use permission, ROI
+proof, or a production deployment sign-off. See `docs/OPERATIONS.md` and
+`docs/DEMO_LOCAL_FREE_CHECKLIST.md`.
 
 ### Logging and lineage
 
