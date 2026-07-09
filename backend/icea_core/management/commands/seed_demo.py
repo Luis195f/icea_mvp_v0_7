@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -183,7 +184,7 @@ class Command(BaseCommand):
             )
 
         # Save a demo dataset file so the API can be tested quickly.
-        data_dir = settings.BASE_DIR / "data"
+        data_dir = Path(settings.ICEA_DATA_DIR)
         data_dir.mkdir(parents=True, exist_ok=True)
         demo_path = data_dir / "demo_dataset.json"
         demo_path.write_text(df.head(200).to_json(orient="records"), encoding="utf-8")
