@@ -4,7 +4,17 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $OriginalLocation = Get-Location
 $BackendDataPath = Join-Path $RepoRoot "backend\data"
+$BackendDemoDatasetPath = Join-Path $BackendDataPath "demo_dataset.json"
 $BackendDataPreexisted = Test-Path -LiteralPath $BackendDataPath
+$BackendDemoDatasetPreexisted = Test-Path -LiteralPath $BackendDemoDatasetPath
+$OriginalTempRoot = [System.IO.Path]::GetTempPath()
+$DemoTempRoot = Join-Path $OriginalTempRoot ("icea_demo_verify_" + [guid]::NewGuid().ToString("N"))
+$DemoDbDir = Join-Path $DemoTempRoot "db"
+$DemoDataDir = Join-Path $DemoTempRoot "data"
+$DemoModelsDir = Join-Path $DemoTempRoot "models"
+$DemoTmpDir = Join-Path $DemoTempRoot "tmp"
+$DemoTempRootCreated = $false
+$EnvVarSnapshot = @{}
 $PythonExe = $null
 $PythonArgsPrefix = @()
 $NpmExe = $null
@@ -38,6 +48,76 @@ function Test-PythonCommand {
     catch {
         return $false
     }
+}
+
+function Set-DemoEnvVar {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    if (-not $script:EnvVarSnapshot.ContainsKey($Name)) {
+        $script:EnvVarSnapshot[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
+    }
+    Set-Item -Path "Env:$Name" -Value $Value
+}
+
+function Remove-DemoEnvVar {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not $script:EnvVarSnapshot.ContainsKey($Name)) {
+        $script:EnvVarSnapshot[$Name] = [Environment]::GetEnvironmentVariable($Name, "Process")
+    }
+    Remove-Item -Path "Env:$Name" -ErrorAction SilentlyContinue
+}
+
+function Restore-DemoEnvVars {
+    foreach ($name in @($script:EnvVarSnapshot.Keys)) {
+        $previous = $script:EnvVarSnapshot[$name]
+        if ($null -eq $previous) {
+            Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+        }
+        else {
+            Set-Item -Path "Env:$name" -Value $previous
+        }
+    }
+}
+
+function Initialize-DemoTempState {
+    # Generated demo state is isolated in a temp directory.
+    New-Item -ItemType Directory -Path $DemoDbDir, $DemoDataDir, $DemoModelsDir, $DemoTmpDir -Force | Out-Null
+    $script:DemoTempRootCreated = $true
+
+    $demoDbPath = Join-Path $DemoDbDir "demo.sqlite3"
+    $databaseUrlPath = $demoDbPath.Replace("\", "/")
+
+    Set-DemoEnvVar "DATABASE_URL" "sqlite:///$databaseUrlPath"
+    Set-DemoEnvVar "ICEA_MODEL_DIR" $DemoModelsDir
+    Set-DemoEnvVar "ICEA_DATA_DIR" $DemoDataDir
+    Set-DemoEnvVar "TMP" $DemoTmpDir
+    Set-DemoEnvVar "TEMP" $DemoTmpDir
+    Set-DemoEnvVar "TMPDIR" $DemoTmpDir
+
+    Write-Host "Generated demo state will use OS temp path icea_demo_verify_*."
+    Write-Host "No repo-local db/model/data artifacts should be produced by this verifier."
+}
+
+function Test-DemoTempRootIsSafe {
+    if (-not $DemoTempRootCreated) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $DemoTempRoot)) {
+        return $false
+    }
+
+    $resolvedDemoRoot = (Resolve-Path -LiteralPath $DemoTempRoot).Path
+    $resolvedTempRoot = (Resolve-Path -LiteralPath $OriginalTempRoot).Path.TrimEnd("\", "/")
+    $demoParent = (Split-Path -Parent $resolvedDemoRoot).TrimEnd("\", "/")
+    $demoLeaf = Split-Path -Leaf $resolvedDemoRoot
+
+    return (($demoParent -ieq $resolvedTempRoot) -and $demoLeaf.StartsWith("icea_demo_verify_"))
 }
 
 function Resolve-DemoPython {
@@ -151,40 +231,40 @@ print(json.dumps({
     }
     $generated = $json | ConvertFrom-Json
 
-    $env:DJANGO_DEBUG = "false"
-    $env:SECRET_KEY = $generated.SECRET_KEY
-    $env:ALLOWED_HOSTS = "localhost,127.0.0.1,testserver"
-    $env:ICEA_SECURE_MODE = "true"
-    $env:ICEA_DEV_ALLOW_INSECURE = "false"
-    $env:ICEA_AUTH_REQUIRED = "true"
-    $env:ICEA_RBAC_ENFORCE = "true"
-    $env:JWT_SIGNING_KEY = $generated.JWT_SIGNING_KEY
-    $env:AUDIT_LOG_SECRET = $generated.AUDIT_LOG_SECRET
-    $env:PHI_ENCRYPTION_KEYS = $generated.PHI_ENCRYPTION_KEYS
-    $env:ICEA_ENABLE_THROTTLING = "true"
-    $env:CORS_ALLOW_ALL_ORIGINS = "false"
+    Set-DemoEnvVar "DJANGO_DEBUG" "false"
+    Set-DemoEnvVar "SECRET_KEY" $generated.SECRET_KEY
+    Set-DemoEnvVar "ALLOWED_HOSTS" "localhost,127.0.0.1,testserver"
+    Set-DemoEnvVar "ICEA_SECURE_MODE" "true"
+    Set-DemoEnvVar "ICEA_DEV_ALLOW_INSECURE" "false"
+    Set-DemoEnvVar "ICEA_AUTH_REQUIRED" "true"
+    Set-DemoEnvVar "ICEA_RBAC_ENFORCE" "true"
+    Set-DemoEnvVar "JWT_SIGNING_KEY" $generated.JWT_SIGNING_KEY
+    Set-DemoEnvVar "AUDIT_LOG_SECRET" $generated.AUDIT_LOG_SECRET
+    Set-DemoEnvVar "PHI_ENCRYPTION_KEYS" $generated.PHI_ENCRYPTION_KEYS
+    Set-DemoEnvVar "ICEA_ENABLE_THROTTLING" "true"
+    Set-DemoEnvVar "CORS_ALLOW_ALL_ORIGINS" "false"
 
     Write-Host "Ephemeral values are set for this process only; values were not printed."
 }
 
 function Set-DemoStrictMode {
-    $env:DJANGO_DEBUG = "false"
-    $env:ALLOWED_HOSTS = "localhost,127.0.0.1,testserver"
-    $env:ICEA_SECURE_MODE = "true"
-    $env:ICEA_DEV_ALLOW_INSECURE = "false"
-    $env:ICEA_AUTH_REQUIRED = "true"
-    $env:ICEA_RBAC_ENFORCE = "true"
-    $env:ICEA_ENABLE_THROTTLING = "true"
-    $env:CORS_ALLOW_ALL_ORIGINS = "false"
+    Set-DemoEnvVar "DJANGO_DEBUG" "false"
+    Set-DemoEnvVar "ALLOWED_HOSTS" "localhost,127.0.0.1,testserver"
+    Set-DemoEnvVar "ICEA_SECURE_MODE" "true"
+    Set-DemoEnvVar "ICEA_DEV_ALLOW_INSECURE" "false"
+    Set-DemoEnvVar "ICEA_AUTH_REQUIRED" "true"
+    Set-DemoEnvVar "ICEA_RBAC_ENFORCE" "true"
+    Set-DemoEnvVar "ICEA_ENABLE_THROTTLING" "true"
+    Set-DemoEnvVar "CORS_ALLOW_ALL_ORIGINS" "false"
 }
 
 function Set-BackendTestMode {
-    $env:DJANGO_DEBUG = "false"
-    $env:ICEA_SECURE_MODE = "false"
-    Remove-Item Env:\ICEA_DEV_ALLOW_INSECURE -ErrorAction SilentlyContinue
-    Remove-Item Env:\ICEA_AUTH_REQUIRED -ErrorAction SilentlyContinue
-    Remove-Item Env:\ICEA_RBAC_ENFORCE -ErrorAction SilentlyContinue
-    Remove-Item Env:\SECURE_SSL_REDIRECT -ErrorAction SilentlyContinue
+    Set-DemoEnvVar "DJANGO_DEBUG" "false"
+    Set-DemoEnvVar "ICEA_SECURE_MODE" "false"
+    Remove-DemoEnvVar "ICEA_DEV_ALLOW_INSECURE"
+    Remove-DemoEnvVar "ICEA_AUTH_REQUIRED"
+    Remove-DemoEnvVar "ICEA_RBAC_ENFORCE"
+    Remove-DemoEnvVar "SECURE_SSL_REDIRECT"
     Write-Host "Backend unit tests will run in the repo's normal test posture; strict demo mode is restored for readiness/smoke."
 }
 
@@ -195,6 +275,7 @@ try {
     Invoke-Native "Whitespace/conflict-marker check" "git" @("diff", "--check")
     Resolve-DemoPython
     Resolve-DemoNode
+    Initialize-DemoTempState
     Set-DemoSecrets
 
     Push-Location -LiteralPath (Join-Path $RepoRoot "backend")
@@ -225,17 +306,30 @@ finally {
     Set-Location -LiteralPath $OriginalLocation
 
     Write-Host ""
-    Write-Host "== Cleaning generated backend demo data"
-    if ((Test-Path -LiteralPath $BackendDataPath) -and (-not $BackendDataPreexisted)) {
-        Remove-Item -LiteralPath $BackendDataPath -Recurse -Force
-        Write-Host "Removed backend\data created during this run."
+    Write-Host "== Cleaning generated temp demo state"
+    try {
+        if (Test-DemoTempRootIsSafe) {
+            Remove-Item -LiteralPath $DemoTempRoot -Recurse -Force
+            Write-Host "Removed temp demo state created during this run."
+        }
+        else {
+            Write-Host "No script-owned temp demo state found to remove."
+        }
+
+        if ((Test-Path -LiteralPath $BackendDataPath) -and (-not $BackendDataPreexisted)) {
+            Remove-Item -LiteralPath $BackendDataPath -Recurse -Force
+            Write-Host "Removed unexpected backend\data created during this run."
+        }
+        elseif ((Test-Path -LiteralPath $BackendDemoDatasetPath) -and (-not $BackendDemoDatasetPreexisted)) {
+            Remove-Item -LiteralPath $BackendDemoDatasetPath -Force
+            Write-Host "Removed unexpected backend\data\demo_dataset.json created during this run."
+        }
+        else {
+            Write-Host "No repo-local backend demo data was created."
+        }
     }
-    elseif (Test-Path -LiteralPath (Join-Path $BackendDataPath "demo_dataset.json")) {
-        Remove-Item -LiteralPath (Join-Path $BackendDataPath "demo_dataset.json") -Force
-        Write-Host "Removed backend\data\demo_dataset.json; preserved pre-existing backend\data."
-    }
-    else {
-        Write-Host "No generated backend demo data found."
+    finally {
+        Restore-DemoEnvVars
     }
 
     Set-Location -LiteralPath $RepoRoot
