@@ -33,6 +33,8 @@ See:
 - `docs/ICEA_PLUS_WRITEBACK.md`
 - `docs/OPERATIONS.md`
 - `docs/DEMO_CLAIMS_MATRIX.md`
+- `docs/DEMO_LOCAL_FREE_CHECKLIST.md`
+- `docs/DEMO_SAFE_NARRATIVE.md`
 - `docs/CI.md`
 
 ---
@@ -72,6 +74,10 @@ Both commands emit structured JSON with `status=pass|warn|fail`; add
 do not print secrets, clinical payloads, PHI, or raw audit actors. See
 `docs/OPERATIONS.md` for the secure minimum configuration, endpoint matrix, and
 demo limitations.
+
+For a no-cloud, no-paid-service, synthetic-data local rehearsal, use
+`.env.demo.local.example`, `docs/DEMO_LOCAL_FREE_CHECKLIST.md`, and
+`scripts/verify_demo_local.ps1`.
 
 ---
 

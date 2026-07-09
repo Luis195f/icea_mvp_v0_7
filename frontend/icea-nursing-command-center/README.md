@@ -33,6 +33,10 @@ Abrir: `http://localhost:3000`
 
 ICEA/ICEA+ is shadow-only, aggregate-only, non-individual, non-punitive, not clinically validated, not MDR production-ready, and not a clinical decision tool. No paid services are required for this demo hardening.
 
+For the repo-level local/free demo rehearsal, use `../../.env.demo.local.example`,
+`../../docs/DEMO_LOCAL_FREE_CHECKLIST.md`, `../../docs/DEMO_SAFE_NARRATIVE.md`,
+and `../../scripts/verify_demo_local.ps1`.
+
 ## White-label
 - Tokens por CSS variables en `app/globals.css`
 - Tenants de ejemplo en `public/tenants/*.json`

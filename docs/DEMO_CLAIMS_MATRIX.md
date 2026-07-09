@@ -4,6 +4,11 @@
 
 No paid services are required for this demo hardening. The local hardening uses Django/DRF, the existing database, existing test tooling, synthetic fixtures, and open-source dependencies already present in the project. It does not require Sentry, Datadog, AWS, Azure, GCP, a paid FHIR server, a paid terminology server, or any SaaS control plane.
 
+Related local demo controls:
+
+- [Local free demo checklist](DEMO_LOCAL_FREE_CHECKLIST.md)
+- [Safe demo narrative](DEMO_SAFE_NARRATIVE.md)
+
 ## Capability Status
 
 | Capability | Status | Safe demo claim |
@@ -83,3 +88,6 @@ La normalizacion actual es exploratoria y no validada clinicamente.
 - Formal clinical safety case, risk management file, usability validation, monitoring plan, and regulatory classification.
 - Data protection impact assessment and institutional security review.
 - Explicit policy prohibiting punitive or individual performance use in operational deployment.
+- External penetration test.
+- Real EHR integration.
+- Demonstrated ROI.

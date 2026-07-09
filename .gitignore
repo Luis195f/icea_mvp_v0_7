@@ -27,6 +27,7 @@ env/
 .env.*
 !.env.example
 !.env.dev.example
+!.env.demo.local.example
 !.env.prod.example
 
 # Secrets / certificates / keys
@@ -43,6 +44,7 @@ secrets/
 # ---------------------------------------------------------
 *.log
 logs/
+backend/data/
 local_settings.py
 db.sqlite3
 *.sqlite3
