@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
@@ -27,6 +28,7 @@ class SeedDemoGovernanceTests(TestCase):
         cls._settings_override = override_settings(
             BASE_DIR=Path(cls._temp_dir.name),
             ICEA_MODEL_DIR=str(Path(cls._temp_dir.name) / "models"),
+            ICEA_DATA_DIR=str(Path(cls._temp_dir.name) / "data"),
         )
         cls._settings_override.enable()
         super().setUpClass()
@@ -86,6 +88,11 @@ class SeedDemoGovernanceTests(TestCase):
             repeated.metrics["evidence_pack"]["dataset_fingerprint"],
             self.artifact.metrics["evidence_pack"]["dataset_fingerprint"],
         )
+
+    def test_seed_demo_writes_dataset_to_configured_data_dir(self):
+        demo_path = Path(settings.ICEA_DATA_DIR) / "demo_dataset.json"
+
+        self.assertTrue(demo_path.exists())
 
     def test_seed_demo_rejects_insufficient_demo_support(self):
         with self.assertRaises(CommandError):

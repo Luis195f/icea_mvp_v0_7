@@ -373,8 +373,9 @@ SPECTACULAR_SETTINGS = {
     "VERSION": os.environ.get("ICEA_VERSION", "0.7.3"),
 }
 
-# --- File storage for model artifacts
+# --- File storage for model and demo dataset artifacts
 ICEA_MODEL_DIR = os.environ.get("ICEA_MODEL_DIR", str(BASE_DIR / "models"))
+ICEA_DATA_DIR = os.environ.get("ICEA_DATA_DIR", str(BASE_DIR / "data"))
 
 # --- Governance / Audit (v0.5)
 AUDIT_LOG_SECRET = os.environ.get("AUDIT_LOG_SECRET", "")
